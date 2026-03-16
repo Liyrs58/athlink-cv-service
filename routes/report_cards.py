@@ -3,7 +3,7 @@ from typing import Dict, Any
 import logging
 
 from services.report_card_service import generate_player_report, generate_team_report
-from services.storage_service import _base_job_id, _load_json
+from services.pass_network_service import _base_job_id, _load_json
 from pathlib import Path
 
 router = APIRouter()
