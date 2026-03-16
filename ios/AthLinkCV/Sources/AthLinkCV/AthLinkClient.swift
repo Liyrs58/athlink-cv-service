@@ -39,8 +39,8 @@ public enum AthLinkError: Error, LocalizedError, Sendable {
 /// ```
 public final class AthLinkClient: Sendable {
 
-    private let baseURL: String
-    private let session: URLSession
+    internal let baseURL: String
+    internal let session: URLSession
     private let prefix: String
 
     /// Create a new client.
@@ -173,6 +173,158 @@ public final class AthLinkClient: Sendable {
 
         // Step 4: Export
         return try await export(jobId: jobId)
+    }
+
+    // MARK: - Full Match Pipeline
+
+    public func runFullMatch(jobId: String, videoPath: String,
+                           frameStride: Int, forceRestart: Bool) async throws -> QueuedJobResponse {
+        let req = FullMatchRequest(jobId: jobId, videoPath: videoPath,
+                                 frameStride: frameStride, forceRestart: forceRestart)
+        return try await post("\(prefix)/match/run", body: req)
+    }
+
+    public func getMatchProgress(jobId: String) async throws -> MatchProgress {
+        return try await get("\(prefix)/match/progress/\(jobId)")
+    }
+
+    public func uploadJobResults(jobId: String) async throws -> UploadResult {
+        return try await post("\(prefix)/storage/upload/\(jobId)", body: EmptyRequest())
+    }
+
+    public func getStorageURL(jobId: String, bucket: String,
+                             path: String) async throws -> StorageURL {
+        let req = StorageURLRequest(bucket: bucket, path: path)
+        return try await post("\(prefix)/storage/url/\(jobId)", body: req)
+    }
+
+    // MARK: - Analytics
+
+    public func getPassNetwork(jobId: String) async throws -> PassNetwork {
+        return try await get("\(prefix)/pass-network/\(jobId)")
+    }
+
+    public func getXG(jobId: String) async throws -> XGResult {
+        return try await get("\(prefix)/xg/\(jobId)")
+    }
+
+    public func getHeatmap(jobId: String,
+                          trackId: Int?) async throws -> HeatmapResult {
+        let url: String
+        if let trackId = trackId {
+            url = "\(prefix)/heatmap/\(jobId)?trackId=\(trackId)"
+        } else {
+            url = "\(prefix)/heatmap/\(jobId)"
+        }
+        return try await get(url)
+    }
+
+    public func getPressing(jobId: String) async throws -> PressingResult {
+        return try await get("\(prefix)/pressing/\(jobId)")
+    }
+
+    public func getFormation(jobId: String) async throws -> FormationResult {
+        return try await get("\(prefix)/formation/\(jobId)")
+    }
+
+    // MARK: - Phase 3 Intelligence
+
+    public func getEvents(jobId: String, type: EventType?,
+                         team: Int?, fromSeconds: Double?,
+                         toSeconds: Double?) async throws -> EventResult {
+        var components = URLComponents(string: "\(prefix)/events/\(jobId)")!
+        var queryItems: [URLQueryItem] = []
+        
+        if let type = type {
+            queryItems.append(URLQueryItem(name: "type", value: type.rawValue))
+        }
+        if let team = team {
+            queryItems.append(URLQueryItem(name: "team", value: "\(team)"))
+        }
+        if let fromSeconds = fromSeconds {
+            queryItems.append(URLQueryItem(name: "from", value: "\(fromSeconds)"))
+        }
+        if let toSeconds = toSeconds {
+            queryItems.append(URLQueryItem(name: "to", value: "\(toSeconds)"))
+        }
+        
+        if !queryItems.isEmpty {
+            components.queryItems = queryItems
+        }
+        
+        return try await get(components.url?.absoluteString ?? "\(prefix)/events/\(jobId)")
+    }
+
+    public func getEventSummary(jobId: String) async throws -> EventSummary {
+        return try await get("\(prefix)/events/\(jobId)/summary")
+    }
+
+    public func getDefensiveLine(jobId: String,
+                                team: Int?,
+                                summaryOnly: Bool) async throws -> DefensiveLineResult {
+        var components = URLComponents(string: "\(prefix)/defensive-line/\(jobId)")!
+        var queryItems: [URLQueryItem] = []
+        
+        if let team = team {
+            queryItems.append(URLQueryItem(name: "team", value: "\(team)"))
+        }
+        queryItems.append(URLQueryItem(name: "summary", value: "\(summaryOnly)"))
+        
+        components.queryItems = queryItems
+        
+        return try await get(components.url?.absoluteString ?? "\(prefix)/defensive-line/\(jobId)")
+    }
+
+    public func getCounterPress(jobId: String,
+                               team: Int?,
+                               intensity: PressIntensity?,
+                               outcome: PressOutcome?) async throws -> CounterPressResult {
+        var components = URLComponents(string: "\(prefix)/counter-press/\(jobId)")!
+        var queryItems: [URLQueryItem] = []
+        
+        if let team = team {
+            queryItems.append(URLQueryItem(name: "team", value: "\(team)"))
+        }
+        if let intensity = intensity {
+            queryItems.append(URLQueryItem(name: "intensity", value: intensity.rawValue))
+        }
+        if let outcome = outcome {
+            queryItems.append(URLQueryItem(name: "outcome", value: outcome.rawValue))
+        }
+        
+        components.queryItems = queryItems
+        
+        return try await get(components.url?.absoluteString ?? "\(prefix)/counter-press/\(jobId)")
+    }
+
+    public func getSetPieces(jobId: String,
+                            type: SetPieceType?,
+                            team: Int?) async throws -> SetPieceResult {
+        var components = URLComponents(string: "\(prefix)/set-pieces/\(jobId)")!
+        var queryItems: [URLQueryItem] = []
+        
+        if let type = type {
+            queryItems.append(URLQueryItem(name: "type", value: type.rawValue))
+        }
+        if let team = team {
+            queryItems.append(URLQueryItem(name: "team", value: "\(team)"))
+        }
+        
+        components.queryItems = queryItems
+        
+        return try await get(components.url?.absoluteString ?? "\(prefix)/set-pieces/\(jobId)")
+    }
+
+    public func getAnalytics(jobId: String) async throws -> AnalyticsReport {
+        return try await get("\(prefix)/analytics/\(jobId)")
+    }
+
+    public func getAvailableServices(jobId: String) async throws -> AvailableServices {
+        return try await get("\(prefix)/analytics/\(jobId)/available")
+    }
+
+    public func getAvailableReports(jobId: String) async throws -> AvailableReports {
+        return try await get("\(prefix)/reports/\(jobId)/available")
     }
 
     // MARK: - Private Helpers

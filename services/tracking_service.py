@@ -90,6 +90,57 @@ def _compute_histogram(frame, bbox):
     return hist
 
 
+def get_pitch_mask(frame_bgr):
+    """
+    Returns a uint8 mask highlighting the green pitch area.
+    Uses HSV green range tuned for grass colour.
+    """
+    hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
+    lower = np.array([30, 40, 40])
+    upper = np.array([90, 255, 255])
+    mask = cv2.inRange(hsv, lower, upper)
+    kernel = np.ones((15, 15), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+    return mask
+
+
+def estimate_camera_motion(prev_gray, curr_gray, pitch_mask=None):
+    """
+    Returns (M, method) where M is a 2x3 affine matrix
+    mapping prev coords -> curr coords, and method is
+    "orb", "farneback", or "farneback_fallback".
+    Returns (None, "none") if motion cannot be estimated.
+    """
+    orb = cv2.ORB_create(nfeatures=500)
+    kp1, des1 = orb.detectAndCompute(prev_gray, pitch_mask)
+    kp2, des2 = orb.detectAndCompute(curr_gray, pitch_mask)
+
+    if des1 is not None and des2 is not None and len(des1) >= 8 and len(des2) >= 8:
+        bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+        matches = bf.match(des1, des2)
+        matches = sorted(matches, key=lambda m: m.distance)[:50]
+
+        if len(matches) >= 8:
+            src_pts = np.float32([kp1[m.queryIdx].pt for m in matches]).reshape(-1, 1, 2)
+            dst_pts = np.float32([kp2[m.trainIdx].pt for m in matches]).reshape(-1, 1, 2)
+            H, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
+            inliers = int(mask.sum()) if mask is not None else 0
+
+            if H is not None and inliers >= 6:
+                M = H[:2, :]
+                return M, "orb"
+
+    # Fallback: Farneback optical flow
+    flow = cv2.calcOpticalFlowFarneback(
+        prev_gray, curr_gray, None, 0.5, 3, 15, 3, 5, 1.2, 0
+    )
+    dx = float(np.median(flow[..., 0]))
+    dy = float(np.median(flow[..., 1]))
+    M = np.array([[1, 0, dx], [0, 1, dy]], dtype=np.float32)
+    return M, "farneback"
+
+
 def is_pitch_shot(frame, threshold=0.12):
     """Check if frame shows the pitch (enough green) vs closeup/crowd/bench."""
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
@@ -193,94 +244,58 @@ def run_tracking(
             scale = 1.0
             detect_frame = detection_frame
 
-        # FIX 1: Camera motion compensation via homography (ORB keypoints)
+        # FIX 1: Camera motion compensation via ORB homography (Farneback fallback)
         curr_gray = cv2.cvtColor(detect_frame, cv2.COLOR_BGR2GRAY)
-        homography_found = False
-        dx_cam, dy_cam = 0.0, 0.0
 
         if prev_gray is not None and prev_gray.shape == curr_gray.shape:
-            # Build green pitch mask for keypoint filtering
-            hsv_comp = cv2.cvtColor(detect_frame, cv2.COLOR_BGR2HSV)
-            pitch_mask = cv2.inRange(hsv_comp, np.array([35, 40, 40]), np.array([85, 255, 255]))
+            pitch_mask = get_pitch_mask(detect_frame)
+            M, method = estimate_camera_motion(prev_gray, curr_gray, pitch_mask)
 
-            # Detect ORB keypoints in pitch region only
-            orb = cv2.ORB_create(nfeatures=500)
-            kp_prev, des_prev = orb.detectAndCompute(prev_gray, pitch_mask)
-            kp_curr, des_curr = orb.detectAndCompute(curr_gray, pitch_mask)
-
-            if des_prev is not None and des_curr is not None and len(des_prev) >= 8 and len(des_curr) >= 8:
-                bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
-                matches = bf.match(des_prev, des_curr)
-                matches = sorted(matches, key=lambda m: m.distance)
-
-                if len(matches) >= 8:
-                    prev_pts = np.float32([kp_prev[m.queryIdx].pt for m in matches]).reshape(-1, 1, 2)
-                    curr_pts = np.float32([kp_curr[m.trainIdx].pt for m in matches]).reshape(-1, 1, 2)
-                    H, mask = cv2.findHomography(prev_pts, curr_pts, cv2.RANSAC, 5.0)
-
-                    if H is not None:
-                        homography_found = True
-                        # Estimate pan magnitude from homography translation
-                        dx_cam = float(H[0, 2])
-                        dy_cam = float(H[1, 2])
-                        magnitude = np.sqrt(dx_cam ** 2 + dy_cam ** 2)
-
-                        # FIX 2: adaptive stride — process next frame if pan is fast
-                        if adaptive_stride and magnitude > 8.0:
-                            force_next_frame = True
-                            logger.info(
-                                f"Frame {current_frame_idx}: fast pan detected "
-                                f"(magnitude={magnitude:.1f}px), forcing next frame"
-                            )
-
-                        # Transform active track bboxes using homography
-                        # H is in detect_frame (scaled) coords — scale back to original
-                        for _tid, _track in active_tracks.items():
-                            if _track["trajectory"]:
-                                _b = _track["trajectory"][-1]["bbox"]
-                                # Convert bbox corners to scaled coords, transform, scale back
-                                corners = np.float32([
-                                    [_b[0] * scale, _b[1] * scale],
-                                    [_b[2] * scale, _b[1] * scale],
-                                    [_b[2] * scale, _b[3] * scale],
-                                    [_b[0] * scale, _b[3] * scale],
-                                ]).reshape(-1, 1, 2)
-                                transformed = cv2.perspectiveTransform(corners, H)
-                                transformed = transformed.reshape(-1, 2)
-                                # New bbox from transformed corners, scaled back
-                                new_x1 = float(np.min(transformed[:, 0])) / scale
-                                new_y1 = float(np.min(transformed[:, 1])) / scale
-                                new_x2 = float(np.max(transformed[:, 0])) / scale
-                                new_y2 = float(np.max(transformed[:, 1])) / scale
-                                _track["_cam_pred_bbox"] = [new_x1, new_y1, new_x2, new_y2]
-
-            # Fallback: median optical flow if homography failed
-            if not homography_found:
-                flow = cv2.calcOpticalFlowFarneback(
-                    prev_gray, curr_gray, None, 0.5, 3, 15, 3, 5, 1.2, 0
-                )
-                dx_cam = float(np.median(flow[..., 0]))
-                dy_cam = float(np.median(flow[..., 1]))
-
+            if M is not None:
+                dx_cam = float(M[0, 2])
+                dy_cam = float(M[1, 2])
                 magnitude = np.sqrt(dx_cam ** 2 + dy_cam ** 2)
+
+                # FIX 2: adaptive stride — process next frame if pan is fast
                 if adaptive_stride and magnitude > 8.0:
                     force_next_frame = True
                     logger.info(
                         f"Frame {current_frame_idx}: fast pan detected "
-                        f"(magnitude={magnitude:.1f}px), forcing next frame [flow fallback]"
+                        f"(magnitude={magnitude:.1f}px), forcing next frame [{method}]"
                     )
 
-                dx_orig = dx_cam / scale if scale != 1.0 else dx_cam
-                dy_orig = dy_cam / scale if scale != 1.0 else dy_cam
-                for _tid, _track in active_tracks.items():
-                    if _track["trajectory"]:
-                        _b = _track["trajectory"][-1]["bbox"]
-                        _track["_cam_pred_bbox"] = [
-                            _b[0] + dx_orig,
-                            _b[1] + dy_orig,
-                            _b[2] + dx_orig,
-                            _b[3] + dy_orig,
-                        ]
+                if method == "orb":
+                    # Full affine: transform bbox corners through the 2x3 matrix
+                    H_full = np.vstack([M, [0, 0, 1]])  # 3x3 for perspectiveTransform
+                    for _tid, _track in active_tracks.items():
+                        if _track["trajectory"]:
+                            _b = _track["trajectory"][-1]["bbox"]
+                            corners = np.float32([
+                                [_b[0] * scale, _b[1] * scale],
+                                [_b[2] * scale, _b[1] * scale],
+                                [_b[2] * scale, _b[3] * scale],
+                                [_b[0] * scale, _b[3] * scale],
+                            ]).reshape(-1, 1, 2)
+                            transformed = cv2.perspectiveTransform(corners, H_full)
+                            transformed = transformed.reshape(-1, 2)
+                            new_x1 = float(np.min(transformed[:, 0])) / scale
+                            new_y1 = float(np.min(transformed[:, 1])) / scale
+                            new_x2 = float(np.max(transformed[:, 0])) / scale
+                            new_y2 = float(np.max(transformed[:, 1])) / scale
+                            _track["_cam_pred_bbox"] = [new_x1, new_y1, new_x2, new_y2]
+                else:
+                    # Farneback fallback: simple translation shift
+                    dx_orig = dx_cam / scale if scale != 1.0 else dx_cam
+                    dy_orig = dy_cam / scale if scale != 1.0 else dy_cam
+                    for _tid, _track in active_tracks.items():
+                        if _track["trajectory"]:
+                            _b = _track["trajectory"][-1]["bbox"]
+                            _track["_cam_pred_bbox"] = [
+                                _b[0] + dx_orig,
+                                _b[1] + dy_orig,
+                                _b[2] + dx_orig,
+                                _b[3] + dy_orig,
+                            ]
 
         prev_gray = curr_gray  # keep for next iteration
 

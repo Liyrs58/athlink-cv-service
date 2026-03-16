@@ -51,6 +51,22 @@ def _run_teams_job(req: TrackPlayersRequest) -> dict:
     team1_count = sum(1 for t in tracks_with_teams if t.get("teamId") == 1)
     team2_count = sum(1 for t in tracks_with_teams if t.get("teamId") == 2)
 
+    # Upload to Supabase if configured
+    try:
+        from services.storage_service import upload_file_from_path, BUCKET_RESULTS
+        upload_file_from_path(
+            BUCKET_RESULTS,
+            f"{req.jobId}/track_results.json",
+            f"temp/{req.jobId}/tracking/track_results.json"
+        )
+        upload_file_from_path(
+            BUCKET_RESULTS,
+            f"{req.jobId}/team_results.json",
+            f"temp/{req.jobId}/tracking/team_results.json"
+        )
+    except Exception:
+        pass
+
     return {
         "jobId": result["jobId"],
         "videoPath": result["videoPath"],

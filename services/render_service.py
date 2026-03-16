@@ -179,11 +179,24 @@ def run_render(job_id: str, include_minimap: bool = False) -> dict:
     cap.release()
     writer.release()
 
+    # Upload to Supabase if configured
+    render_url = None
+    try:
+        from services.storage_service import upload_file_from_path, BUCKET_RENDERS
+        render_url = upload_file_from_path(
+            BUCKET_RENDERS,
+            "{}/output.mp4".format(job_id),
+            out_path
+        )
+    except Exception:
+        pass
+
     return {
         "jobId":          job_id,
         "outputPath":     out_path,
         "framesRendered": frames_rendered,
         "fps":            fps,
+        "render_url":     render_url,
     }
 
 

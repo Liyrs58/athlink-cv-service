@@ -13,6 +13,20 @@ from routes.export import router as export_router
 from routes.render import router as render_router
 from routes.spotlight import router as spotlight_router
 from routes.highlight import router as highlight_router
+from routes.pass_network import router as pass_network_router
+from routes.xg import router as xg_router
+from routes.heatmap import router as heatmap_router
+from routes.formation import router as formation_router
+from routes.pressing import router as pressing_router
+from routes.events import router as events_router
+from routes.defensive_line import router as defensive_line_router
+from routes.counter_press import router as counter_press_router
+from routes.set_pieces import router as set_pieces_router
+from routes.report_cards import router as report_cards_router
+from routes.storage import router as storage_router
+from routes.analytics import router as analytics_router
+from routes.match_pipeline import router as match_pipeline_router
+from routes.analytics_overlay import router as analytics_overlay_router
 
 TAGS_METADATA = [
     {"name": "health", "description": "Service health and device info"},
@@ -28,6 +42,15 @@ TAGS_METADATA = [
     {"name": "render", "description": "Annotated video render with overlays and minimap"},
     {"name": "spotlight", "description": "Player selection, spotlight rendering, and clip export"},
     {"name": "highlight", "description": "Automatic highlight detection from player movements"},
+    {"name": "pass-network", "description": "Pass network graph analysis"},
+    {"name": "xg", "description": "Expected goals (xG) model from shot analysis"},
+    {"name": "heatmap", "description": "Player distance heatmaps and sprint analysis"},
+    {"name": "formation", "description": "Tactical formation detection and shape shifts"},
+    {"name": "pressing", "description": "Pressing intensity, PPDA, and recovery time"},
+    {"name": "storage", "description": "Supabase storage upload and URL retrieval"},
+    {"name": "analytics", "description": "Unified EPL analytics report"},
+    {"name": "match", "description": "Full match pipeline with checkpointing"},
+    {"name": "analytics-overlay", "description": "Analytics overlay video rendering"},
 ]
 
 app = FastAPI(
@@ -66,6 +89,20 @@ app.include_router(export_router, prefix="/api/v1/export", tags=["export"])
 app.include_router(render_router, prefix="/api/v1/render", tags=["render"])
 app.include_router(spotlight_router, prefix="/api/v1/spotlight", tags=["spotlight"])
 app.include_router(highlight_router, prefix="/api/v1/highlight", tags=["highlight"])
+app.include_router(pass_network_router, prefix="/api/v1", tags=["pass-network"])
+app.include_router(xg_router, prefix="/api/v1", tags=["xg"])
+app.include_router(heatmap_router, prefix="/api/v1", tags=["heatmap"])
+app.include_router(formation_router, prefix="/api/v1", tags=["formation"])
+app.include_router(pressing_router, prefix="/api/v1", tags=["pressing"])
+app.include_router(events_router, prefix="/api/v1/events", tags=["events"])
+app.include_router(defensive_line_router, prefix="/api/v1/defensive-line", tags=["defensive-line"])
+app.include_router(counter_press_router, prefix="/api/v1/counter-press", tags=["counter-press"])
+app.include_router(set_pieces_router, prefix="/api/v1/set-pieces", tags=["set-pieces"])
+app.include_router(report_cards_router, prefix="/api/v1/reports", tags=["reports"])
+app.include_router(storage_router, prefix="/api/v1/storage", tags=["storage"])
+app.include_router(analytics_router, prefix="/api/v1", tags=["analytics"])
+app.include_router(match_pipeline_router, prefix="/api/v1/match", tags=["match"])
+app.include_router(analytics_overlay_router, prefix="/api/v1/analytics-overlay", tags=["analytics-overlay"])
 
 @app.get("/")
 async def root():

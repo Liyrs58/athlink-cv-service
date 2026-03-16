@@ -308,6 +308,56 @@ def map_pitch(
         })
 
     # ------------------------------------------------------------------
+    # Add ball world coordinates if homography is available
+    # ------------------------------------------------------------------
+    if homography_found and tracking.get("ball_trajectory"):
+        ball_trajectory_2d = []
+        
+        for ball_det in tracking["ball_trajectory"]:
+            fi = ball_det["frameIndex"]
+            px = float(ball_det["x"])
+            py = float(ball_det["y"])
+            
+            # Find the closest available homography for this frame
+            H = frame_homographies.get(fi)
+            if H is None and frame_homographies:
+                # Use nearest frame's H
+                nearest = min(frame_homographies.keys(), key=lambda k: abs(k - fi))
+                H = frame_homographies[nearest]
+            
+            if H is not None:
+                # Transform pixel coordinates to world coordinates
+                pixel_pt = np.array([[px, py]], dtype=np.float32).reshape(-1, 1, 2)
+                world_pt = cv2.perspectiveTransform(pixel_pt, H)
+                world_x = float(world_pt[0][0][0])
+                world_y = float(world_pt[0][0][1])
+                
+                # Clamp to pitch boundaries
+                world_x = max(0.0, min(PITCH_WIDTH, world_x))
+                world_y = max(0.0, min(PITCH_HEIGHT, world_y))
+            else:
+                # Proportional fallback
+                world_x = px / frame_w * PITCH_WIDTH
+                world_y = py / frame_h * PITCH_HEIGHT
+            
+            ball_trajectory_2d.append({
+                "frameIndex": fi,
+                "x": round(world_x, 2),
+                "y": round(world_y, 2),
+            })
+        
+        # Sort by frameIndex
+        ball_trajectory_2d.sort(key=lambda p: p["frameIndex"])
+        
+        # Add ball entry to players list
+        players.append({
+            "trackId": -1,
+            "teamId": -1,
+            "is_ball": True,
+            "trajectory2d": ball_trajectory_2d,
+        })
+
+    # ------------------------------------------------------------------
     # Persist
     # ------------------------------------------------------------------
     output_dir = Path(f"temp/{job_id}/pitch")
