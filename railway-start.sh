@@ -1,0 +1,4 @@
+#!/bin/bash
+echo "Starting Railway deployment..."
+export PYTHONPATH=$PYTHONPATH:$(pwd)
+sh -c 'uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}'
