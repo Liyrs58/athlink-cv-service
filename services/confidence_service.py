@@ -51,10 +51,19 @@ def assess_confidence(job_id, service_name):
     # --- Frames analysed ---
     track_data = _load_json(base / "tracking" / "track_results.json")
     frames_analysed = 0
+    valid_frames_pct = 100.0  # FIX 5: assume valid if no metadata
     if track_data is not None:
         frames_analysed = int(track_data.get("framesProcessed", 0))
+        valid_frames_count = int(track_data.get("validFramesCount", frames_analysed))
+        valid_frames_pct = (valid_frames_count / frames_analysed * 100.0) if frames_analysed > 0 else 100.0
     else:
         reasons.append("track_results.json not found")
+
+    # FIX 5: Check if too many non-pitch frames
+    if valid_frames_pct < 50.0:
+        reasons.append(
+            "only {:.1f}% of frames were valid pitch views — many cutaways detected".format(valid_frames_pct)
+        )
 
     if frames_analysed == 0:
         return {
@@ -123,7 +132,11 @@ def assess_confidence(job_id, service_name):
     needs_world_coords = service_name in world_coord_services
 
     # --- Determine confidence level ---
-    if needs_world_coords and not calibration_valid:
+    # FIX 5: Downgrade confidence if too many non-pitch frames
+    if valid_frames_pct < 50.0:
+        confidence = "low"
+        usable = True if frames_analysed >= frames_required * 0.5 else False
+    elif needs_world_coords and not calibration_valid:
         confidence = "unavailable"
         usable = False
     elif needs_world_coords and not ball_available:
@@ -145,6 +158,7 @@ def assess_confidence(job_id, service_name):
     return {
         "confidence": confidence,
         "frames_analysed": frames_analysed,
+        "valid_frames_pct": round(valid_frames_pct, 1),  # FIX 5
         "frames_required": frames_required,
         "calibration_valid": calibration_valid,
         "ball_available": ball_available,

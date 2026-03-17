@@ -79,6 +79,10 @@ def build_analytics_report(job_id):
     video_path = track_data.get("videoPath", "") if track_data else ""
     duration_seconds = round(frame_count / fps, 2) if fps > 0 else 0.0
 
+    # FIX 5: Calculate valid frames percentage from frame metadata
+    valid_frames_count = int(track_data.get("validFramesCount", 0)) if track_data else 0
+    valid_frames_pct = (valid_frames_count / frame_count * 100.0) if frame_count > 0 else 0.0
+
     teams_detected = (base / "tracking" / "team_results.json").exists()
     pitch_mapped = (base / "pitch" / "pitch_map.json").exists()
 
@@ -139,6 +143,8 @@ def build_analytics_report(job_id):
         "duration_seconds": duration_seconds,
         "fps": fps,
         "frame_count": frame_count,
+        "valid_frames_count": valid_frames_count,  # FIX 5: frame validity tracking
+        "valid_frames_pct": round(valid_frames_pct, 1),  # FIX 5: percent valid
         "teams_detected": teams_detected,
         "pitch_mapped": pitch_mapped,
         "match_summary": match_summary,

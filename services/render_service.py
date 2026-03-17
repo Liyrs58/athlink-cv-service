@@ -17,11 +17,18 @@ from services.export_service import build_export
 
 
 TEAM_BGR = {
-    0: (255, 100,   0),
-    1: (  0,  50, 255),
+    0: (255, 100,   0),   # Blue team (BGR: cyan)
+    1: (  0,  50, 255),   # Orange team (BGR: orange)
     2: (  0, 255,   0),   # goalkeeper — bright green
 }
 DEFAULT_BGR = (200, 200, 200)
+
+# FIX 4: Tracking state visualization colors
+CONFIRMED_COLOR = (0, 255, 0)   # Green — confirmed detection
+PREDICTED_COLOR = (0, 255, 255) # Cyan — Kalman prediction
+STALE_COLOR = (128, 128, 128)   # Gray — stale track
+BALL_DETECTED_COLOR = (255, 255, 255)  # White — YOLO detection
+BALL_PREDICTED_COLOR = (128, 128, 128) # Gray — predicted
 
 MINIMAP_W = 200
 MINIMAP_H = 130
@@ -163,6 +170,10 @@ def run_render(job_id: str, include_minimap: bool = False) -> dict:
         frame_data = frame_lookup.get(frame_idx, {})
         players = frame_data.get("players", [])
         ball = frame_data.get("ball")
+
+        # FIX 4: Get frame metadata for validity display
+        frame_meta = frame_data.get("frame_metadata", {})
+
         if players:
             frame = _draw_players(frame, players, include_minimap, out_w, out_h)
         if ball and ball.get("bbox"):
@@ -170,7 +181,14 @@ def run_render(job_id: str, include_minimap: bool = False) -> dict:
             cx = (bbox[0] + bbox[2]) / 2.0
             cy = (bbox[1] + bbox[3]) / 2.0
             ball_trail.append((cx, cy))
-            frame = _draw_ball(frame, bbox, list(ball_trail))
+            # FIX 4: Pass ball source and staleness info
+            ball_source = ball.get("source", "unknown")
+            frames_since_detection = ball.get("frames_since_detection", 0)
+            frame = _draw_ball(frame, bbox, list(ball_trail), ball_source, frames_since_detection)
+
+        # FIX 4: Draw frame status if metadata available
+        if frame_meta:
+            frame = _draw_frame_status(frame, frame_meta, out_w, out_h)
 
         writer.write(frame)
         frames_rendered += 1
@@ -201,6 +219,12 @@ def run_render(job_id: str, include_minimap: bool = False) -> dict:
 
 
 def _draw_players(frame, players, include_minimap: bool, frame_w: int, frame_h: int):
+    """
+    Draw players with FIX 4 state visualization:
+    - Confirmed detection (solid circle): YOLO matched this frame
+    - Kalman prediction (dashed outline, 50% opacity): no YOLO match
+    - Stale track (grey, 30% opacity): not seen for >10 frames (hidden after 20)
+    """
     overlay = frame.copy()
 
     for p in players:
@@ -228,7 +252,25 @@ def _draw_players(frame, players, include_minimap: bool, frame_w: int, frame_h: 
         if x2 <= x1 or y2 <= y1:
             continue
         color = TEAM_BGR.get(team_id, DEFAULT_BGR)
-        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+
+        # FIX 4: Draw bbox based on tracking state
+        is_stale = p.get("is_stale", False)
+        is_predicted = p.get("is_predicted", False)
+
+        if is_stale:
+            # Stale track: grey dashed, 30% opacity
+            cv2.rectangle(frame, (x1, y1), (x2, y2), STALE_COLOR, 1, cv2.LINE_4)
+            frame = cv2.addWeighted(frame, 0.7, frame, 0.3, 0)
+        elif is_predicted:
+            # Kalman prediction: dashed outline, 50% opacity
+            cv2.rectangle(frame, (x1, y1), (x2, y2), PREDICTED_COLOR, 1, cv2.LINE_4)
+            overlay_pred = frame.copy()
+            cv2.putText(overlay_pred, "?", (x1 + 3, y1 + 15),
+                       FONT, 0.6, PREDICTED_COLOR, 1, cv2.LINE_AA)
+            frame = cv2.addWeighted(overlay_pred, 0.5, frame, 0.5, 0)
+        else:
+            # Confirmed detection: solid rectangle
+            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
 
         label = f"T{track_id}"
         font_scale = 0.45
@@ -246,32 +288,103 @@ def _draw_players(frame, players, include_minimap: bool, frame_w: int, frame_h: 
     if include_minimap:
         frame = _draw_minimap(frame, players, frame_w, frame_h)
 
+    # FIX 4: Draw legend
+    frame = _draw_legend(frame, frame_h, frame_w)
+
     return frame
 
 
-def _draw_ball(frame, bbox, trail=None):
+def _draw_ball(frame, bbox, trail=None, ball_source=None, frames_since_detection=0):
+    """
+    FIX 4: Draw ball with source-based visualization:
+    - YOLO detection: white filled circle, radius 6px
+    - Hough candidate: yellow outline circle, radius 6px
+    - Kalman prediction: grey dashed circle, radius 4px
+    - If prediction > 10 frames old: don't show ball at all
+    """
     x1, y1, x2, y2 = [int(v) for v in bbox]
     cx = (x1 + x2) // 2
     cy = (y1 + y2) // 2
 
+    # FIX 4: Hide ball if prediction is too stale (>10 frames without detection)
+    if ball_source == "kalman_prediction" and frames_since_detection > 10:
+        return frame
+
     # Draw fading trail — oldest first, radii 6..2, decreasing opacity
     if trail and len(trail) > 1:
         trail_radii = [6, 5, 4, 3, 2]
-        # trail includes current position at the end; draw all but last as trail
         trail_pts = trail[:-1]
         for i, (tx, ty) in enumerate(trail_pts):
-            idx = len(trail_pts) - 1 - i   # 0 = most recent trail point
+            idx = len(trail_pts) - 1 - i
             radius = trail_radii[min(idx, len(trail_radii) - 1)]
-            # Blend yellow trail circle onto frame with decreasing alpha
-            alpha = 0.3 + 0.1 * (len(trail_pts) - 1 - idx)  # older = more transparent
+            alpha = 0.3 + 0.1 * (len(trail_pts) - 1 - idx)
             alpha = min(alpha, 0.7)
             overlay = frame.copy()
             cv2.circle(overlay, (int(tx), int(ty)), radius, (0, 255, 255), -1)
             cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, frame)
 
-    # Main ball — radius 12, yellow filled, white border
-    cv2.circle(frame, (cx, cy), 12, (0, 255, 255), -1)
-    cv2.circle(frame, (cx, cy), 12, (255, 255, 255), 2)
+    # FIX 4: Draw ball based on source
+    if ball_source == "yolo":
+        # YOLO: white filled circle, radius 6px
+        cv2.circle(frame, (cx, cy), 6, BALL_DETECTED_COLOR, -1)
+        cv2.circle(frame, (cx, cy), 6, (0, 0, 0), 1)
+    elif ball_source == "hough_candidate":
+        # Hough: yellow outline circle, radius 6px
+        cv2.circle(frame, (cx, cy), 6, (0, 255, 255), 2)
+    elif ball_source == "kalman_prediction":
+        # Kalman: grey dashed circle, radius 4px
+        cv2.circle(frame, (cx, cy), 4, BALL_PREDICTED_COLOR, 1, cv2.LINE_4)
+    else:
+        # Fallback: white filled circle
+        cv2.circle(frame, (cx, cy), 6, BALL_DETECTED_COLOR, -1)
+        cv2.circle(frame, (cx, cy), 6, (0, 0, 0), 1)
+
+    return frame
+
+
+def _draw_legend(frame, frame_h: int, frame_w: int):
+    """FIX 4: Draw legend box in bottom-left corner."""
+    legend_y_start = frame_h - 120
+    legend_x_start = 10
+    legend_items = [
+        ("Confirmed", CONFIRMED_COLOR),
+        ("Predicted", PREDICTED_COLOR),
+        ("Ball (YOLO)", BALL_DETECTED_COLOR),
+        ("Ball (Pred)", BALL_PREDICTED_COLOR),
+    ]
+
+    for i, (label, color) in enumerate(legend_items):
+        y = legend_y_start + i * 28
+        # Draw colored dot
+        cv2.circle(frame, (legend_x_start + 8, y + 8), 4, color, -1)
+        # Draw label
+        cv2.putText(frame, label, (legend_x_start + 20, y + 12),
+                   FONT, 0.35, (255, 255, 255), 1, cv2.LINE_AA)
+
+    return frame
+
+
+def _draw_frame_status(frame, frame_data, frame_w: int, frame_h: int):
+    """FIX 4: Draw frame validity status in top-right corner."""
+    is_valid = frame_data.get("analysis_valid", True)
+    scene_cut = frame_data.get("scene_cut", False)
+
+    status_x = frame_w - 150
+    status_y = 20
+
+    # Draw validity indicator
+    if is_valid:
+        cv2.circle(frame, (status_x, status_y), 6, (0, 255, 0), -1)
+    else:
+        cv2.circle(frame, (status_x, status_y), 6, (0, 0, 255), -1)
+        cv2.putText(frame, "NON-PITCH", (status_x + 15, status_y + 5),
+                   FONT, 0.4, (0, 0, 255), 1, cv2.LINE_AA)
+
+    # Draw scene cut indicator
+    if scene_cut:
+        cv2.putText(frame, "SCENE CUT", (status_x - 50, status_y + 30),
+                   FONT, 0.5, (0, 165, 255), 2, cv2.LINE_AA)
+
     return frame
 
 

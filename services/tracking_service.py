@@ -148,6 +148,36 @@ def is_pitch_shot(frame, threshold=0.12):
     return np.count_nonzero(green) / green.size > threshold
 
 
+def detect_scene_cut(prev_frame_gray, curr_frame_gray, threshold=45.0) -> bool:
+    """
+    Detects hard broadcast cuts by measuring mean absolute difference
+    between consecutive frames. A cut produces a sudden large intensity change.
+    threshold=45.0 catches hard cuts without triggering on fast camera pans
+    (which are gradual).
+    """
+    if prev_frame_gray is None or curr_frame_gray is None:
+        return False
+    if prev_frame_gray.shape != curr_frame_gray.shape:
+        return False
+    diff = cv2.absdiff(prev_frame_gray, curr_frame_gray)
+    mean_diff = float(diff.mean())
+    return mean_diff > threshold
+
+
+def is_valid_pitch_frame(frame_bgr, min_green_pct=0.25) -> bool:
+    """
+    Returns True only if frame contains enough green pitch to be a valid
+    gameplay view. Bench shots, crowd shots, close-ups fail this test.
+    min_green_pct=0.25 means at least 25% of frame must be pitch-green.
+    """
+    hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
+    lower = np.array([30, 40, 40])
+    upper = np.array([90, 255, 255])
+    mask = cv2.inRange(hsv, lower, upper)
+    green_pct = mask.sum() / 255 / mask.size
+    return green_pct >= min_green_pct
+
+
 class BallKalmanTracker:
     """
     Dedicated Kalman filter for ball tracking.
@@ -161,12 +191,15 @@ class BallKalmanTracker:
         self.kf.transitionMatrix = np.array(
             [[1,0,1,0],[0,1,0,1],
              [0,0,1,0],[0,0,0,1]], np.float32)
-        self.kf.processNoiseCov = np.eye(4, dtype=np.float32) * 0.03
-        self.kf.measurementNoiseCov = np.eye(2, dtype=np.float32) * 0.5
+        # FIX 3: Increased process noise — allows faster state changes (less smoothing)
+        self.kf.processNoiseCov = np.eye(4, dtype=np.float32) * 0.1
+        # FIX 3: Decreased measurement noise — trust YOLO detections more
+        self.kf.measurementNoiseCov = np.eye(2, dtype=np.float32) * 0.3
         self.kf.errorCovPost = np.eye(4, dtype=np.float32)
         self.initialized = False
         self.frames_since_detection = 0
-        self.max_prediction_frames = 45  # ~1.8s at 25fps
+        # FIX 3: Reduced max prediction frames — stop predicting after 0.8s without detection
+        self.max_prediction_frames = 20  # ~0.8s at 25fps (was 45)
 
     def update(self, x, y):
         """Call when YOLO detects ball. Returns corrected position."""
@@ -216,7 +249,7 @@ def run_tracking(
     job_id: str,
     frame_stride: int = 5,
     max_frames: Optional[int] = None,
-    max_track_age: int = 50,
+    max_track_age: int = 30,  # FIX 2: reduced from 50 to 30 frames for aggressive lifecycle
     adaptive_stride: bool = True,  # FIX 2: process every frame during fast pans
 ) -> Dict[str, Any]:
     """Run BoT-SORT object tracking on video frames with camera motion compensation."""
@@ -228,6 +261,7 @@ def run_tracking(
     frame_results: List[Dict[str, Any]] = []
     ball_trajectory: List[Dict[str, Any]] = []
     ball_tracker = BallKalmanTracker()
+    frame_metadata: List[Dict[str, Any]] = []  # FIX 5: per-frame validity tracking
 
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -258,6 +292,10 @@ def run_tracking(
     prev_gray = None
     # FIX 2: Adaptive stride state
     force_next_frame = False
+    # FIX 1 & 2: Scene cut and frame validity state
+    scene_cut_flag = False
+    frame_is_valid = False
+    valid_frames_count = 0
 
     while True:
         ret, frame = cap.read()
@@ -282,13 +320,34 @@ def run_tracking(
         frame_path = frames_dir / f"frame_{current_frame_idx:06d}.jpg"
         cv2.imwrite(str(frame_path), frame)
 
-        # Pitch shot gate — skip YOLO on non-pitch frames (bench/crowd/closeup)
-        if not is_pitch_shot(frame):
-            logger.info(
-                f"Frame {current_frame_idx}: non-pitch shot, skipping detection"
-            )
+        # FIX 1: Frame validity gate — check if frame contains valid pitch view
+        frame_is_valid = is_valid_pitch_frame(frame, min_green_pct=0.25)
+        if not frame_is_valid:
+            logger.info(f"Frame {current_frame_idx}: non-pitch frame, skipping")
+            # Still detect scene cuts from grayscale even on invalid frames
+            curr_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            scene_cut_flag = detect_scene_cut(prev_gray, curr_gray, threshold=45.0)
+            if scene_cut_flag:
+                logger.info(f"Frame {current_frame_idx}: scene cut detected")
+            prev_gray = curr_gray
+            frame_metadata.append({
+                "frameIndex": current_frame_idx,
+                "analysis_valid": False,
+                "scene_cut": scene_cut_flag,
+                "tracks_active": len(prev_active_ids),
+                "ball_detected": False,
+                "ball_source": None,
+            })
             raw_frame_idx += 1
             continue
+
+        valid_frames_count += 1
+
+        # FIX 1: Scene cut detection from valid frames
+        curr_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        scene_cut_flag = detect_scene_cut(prev_gray, curr_gray, threshold=45.0)
+        if scene_cut_flag:
+            logger.info(f"Frame {current_frame_idx}: scene cut detected")
 
         timestamp = current_frame_idx / fps if fps > 0 else 0.0
         frame_h_px = frame.shape[0]
@@ -309,11 +368,12 @@ def run_tracking(
             detect_frame = detection_frame
 
         # FIX 1: Camera motion compensation via ORB homography (Farneback fallback)
-        curr_gray = cv2.cvtColor(detect_frame, cv2.COLOR_BGR2GRAY)
+        # curr_gray already computed above for scene cut detection
+        detect_frame_gray = cv2.cvtColor(detect_frame, cv2.COLOR_BGR2GRAY)
 
-        if prev_gray is not None and prev_gray.shape == curr_gray.shape:
+        if prev_gray is not None and prev_gray.shape == detect_frame_gray.shape:
             pitch_mask = get_pitch_mask(detect_frame)
-            M, method = estimate_camera_motion(prev_gray, curr_gray, pitch_mask)
+            M, method = estimate_camera_motion(prev_gray, detect_frame_gray, pitch_mask)
 
             if M is not None:
                 dx_cam = float(M[0, 2])
@@ -361,9 +421,12 @@ def run_tracking(
                                 _b[3] + dy_orig,
                             ]
 
-        prev_gray = curr_gray  # keep for next iteration
+        prev_gray = detect_frame_gray  # keep for next iteration
 
         # --- Player tracking via BoT-SORT (camera motion compensation) ---
+        # FIX 3: BoT-SORT internal Kalman filters also benefit from tighter track lifecycle
+        # The botsort_football.yaml config controls coasting frames (default ~30).
+        # Combined with our aggressive MAX_TRACK_AGE=30, weak tracks are eliminated quickly.
         bt_results = model.track(
             detect_frame,
             tracker="tracker_config/botsort_football.yaml",
@@ -377,6 +440,7 @@ def run_tracking(
 
         current_active_ids: set = set()
         frame_track_entries: List[Dict[str, Any]] = []
+        TRACK_MATCHING_GATE = 80  # FIX 2: distance threshold for matching detections to tracks
 
         if bt_results[0].boxes is not None and bt_results[0].boxes.id is not None:
             bt_ids = bt_results[0].boxes.id.cpu().tolist()
@@ -403,6 +467,19 @@ def run_tracking(
                     continue
                 if bbox[1] > frame_h_px * 0.90:
                     continue
+
+                # FIX 2: Track matching gate — only match if within 80px of prediction
+                if track_id in active_tracks:
+                    pred_bbox = active_tracks[track_id].get("_cam_pred_bbox")
+                    if pred_bbox is not None:
+                        pred_cx = (pred_bbox[0] + pred_bbox[2]) / 2.0
+                        pred_cy = (pred_bbox[1] + pred_bbox[3]) / 2.0
+                        curr_cx = (bbox[0] + bbox[2]) / 2.0
+                        curr_cy = (bbox[1] + bbox[3]) / 2.0
+                        dist = ((pred_cx - curr_cx)**2 + (pred_cy - curr_cy)**2)**0.5
+                        if dist > TRACK_MATCHING_GATE:
+                            # Detection too far from prediction — treat as new track
+                            track_id = -1
 
                 current_active_ids.add(track_id)
 
@@ -542,12 +619,20 @@ def run_tracking(
                             pred_in_crop_y = py - y1
                             for circle in circles[0]:
                                 cx_crop, cy_crop, r = circle
+                                # Convert numpy types to Python types for JSON serialization
+                                cx_crop = int(cx_crop)
+                                cy_crop = int(cy_crop)
+                                r = int(r)
                                 dist = ((cx_crop - pred_in_crop_x)**2 + (cy_crop - pred_in_crop_y)**2)**0.5
                                 if dist < best_dist:
                                     best_dist = dist
                                     best_circle = circle
                             if best_circle is not None:
                                 cx_crop, cy_crop, r = best_circle
+                                # Convert numpy types to Python types for JSON serialization
+                                cx_crop = int(cx_crop)
+                                cy_crop = int(cy_crop)
+                                r = int(r)
                                 cx = x1 + cx_crop
                                 cy = y1 + cy_crop
                                 ball_tracker.update(cx, cy)
@@ -584,9 +669,32 @@ def run_tracking(
             "tracks": frame_track_entries,
         })
 
+        # FIX 5: Record per-frame metadata for validity analysis
+        frame_metadata.append({
+            "frameIndex": current_frame_idx,
+            "analysis_valid": frame_is_valid,
+            "scene_cut": scene_cut_flag,
+            "tracks_active": len(current_active_ids),
+            "ball_detected": any(bt["source"] == "yolo" for bt in ball_trajectory if bt.get("frameIndex") == current_frame_idx),
+            "ball_source": next((bt.get("source") for bt in ball_trajectory if bt.get("frameIndex") == current_frame_idx), None),
+        })
+
+        # FIX 2: Handle scene cut — aggressively reset tracks
+        if scene_cut_flag:
+            # On scene cut, drastically reduce track lifetimes
+            MAX_TRACK_AGE_CUT = 3
+            for tid in list(active_tracks.keys()):
+                track = active_tracks[tid]
+                age = current_frame_idx - track["lastSeen"]
+                if age > MAX_TRACK_AGE_CUT:
+                    completed_tracks.append(active_tracks.pop(tid))
+            # Reset ball Kalman filter on cut
+            ball_tracker.initialized = False
+            ball_tracker.frames_since_detection = 0
+
         logger.info(
             f"Frame {current_frame_idx:6d} | t={timestamp:6.2f}s | "
-            f"tracks={len(current_active_ids):3d}"
+            f"tracks={len(current_active_ids):3d} | valid={frame_is_valid} | cut={scene_cut_flag}"
         )
 
         raw_frame_idx += 1
@@ -677,9 +785,12 @@ def run_tracking(
     for t in all_tracks:
         t.pop("_histogram", None)
 
-    filtered = [t for t in all_tracks if t["hits"] >= 2]
+    # FIX 2: Minimum track length requirement — at least 5 confirmed detections
+    MIN_TRACK_DETECTIONS = 5
+    filtered = [t for t in all_tracks if t["hits"] >= MIN_TRACK_DETECTIONS]
     if len(filtered) < 5:
-        filtered = [t for t in all_tracks if t["hits"] >= 1]
+        # Fallback: accept tracks with >= 2 hits
+        filtered = [t for t in all_tracks if t["hits"] >= 2]
 
     # Gap-filling: linearly interpolate bbox for gaps of 2-4 frame-strides
     for track in filtered:
@@ -716,10 +827,12 @@ def run_tracking(
         "videoPath": video_path,
         "frameStride": frame_stride,
         "framesProcessed": len(frame_results),
+        "validFramesCount": valid_frames_count,  # FIX 5: track valid frames
         "trackCount": len(filtered),
         "tracks": filtered,
         "ballDetections": len(ball_trajectory),
         "ball_trajectory": ball_trajectory,
+        "frame_metadata": frame_metadata,  # FIX 5: per-frame validity data
     }
 
     results_file = output_dir / "track_results.json"
