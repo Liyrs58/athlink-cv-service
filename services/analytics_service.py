@@ -4,6 +4,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Any, List, Optional
 
+from services.confidence_service import assess_confidence, assess_data_quality
+from services.sanity_service import validate_analytics_report
+
 logger = logging.getLogger(__name__)
 
 # Service registry: (key, module_path, function_name, required_files)
@@ -110,17 +113,26 @@ def build_analytics_report(job_id):
 
     # Build match summary from available results
     match_summary = _build_match_summary(results)
-    
-    # Check for analytics highlight video
+
+    # Null out match_summary fields for unavailable services
+    for key, _mod, _fn, _req in _SERVICE_REGISTRY:
+        conf = assess_confidence(job_id, key)
+        if not conf["usable"] and results.get(key) is not None:
+            # Service ran but produced unreliable output — mark summary fields null
+            _nullify_summary_for_service(match_summary, key)
+
+    # Data quality section
+    data_quality = assess_data_quality(job_id)
+
+    # Sanity check — nullifies physically impossible values
     highlight_video_path = None
     highlight_video_url = None
-    
+
     highlight_path = base / "highlights" / "analytics_highlight.mp4"
     if highlight_path.exists():
         highlight_video_path = str(highlight_path)
-        # TODO: Get URL from storage service when available
-    
-    return {
+
+    report = {
         "job_id": job_id,
         "generated_at": generated_at,
         "video_path": video_path,
@@ -130,18 +142,73 @@ def build_analytics_report(job_id):
         "teams_detected": teams_detected,
         "pitch_mapped": pitch_mapped,
         "match_summary": match_summary,
+        "data_quality": data_quality,
         "pass_network": results.get("pass_network"),
         "xg": results.get("xg"),
         "heatmaps": results.get("heatmaps"),
         "pressing": results.get("pressing"),
         "formations": results.get("formations"),
         "tactics": results.get("tactics"),
-        "player_stats": None,  # stats_service does not exist yet
+        "player_stats": None,
         "highlight_video_path": highlight_video_path,
         "highlight_video_url": highlight_video_url,
         "errors": errors,
         "available_services": available,
     }
+
+    report = validate_analytics_report(report)
+
+    # analyst_ready: only True when all core conditions are met
+    dq = report["data_quality"]
+    sc = report.get("sanity_check", {})
+    analyst_ready = (
+        dq["calibration_valid"]
+        and dq["ball_tracking_available"]
+        and dq["frames_analysed"] >= 150
+        and not sc.get("failures", [])
+    )
+    report["analyst_ready"] = analyst_ready
+    if not analyst_ready:
+        reasons = []
+        if not dq["calibration_valid"]:
+            reasons.append("homography calibration failed or not run")
+        if not dq["ball_tracking_available"]:
+            reasons.append("ball tracking unavailable")
+        if dq["frames_analysed"] < 150:
+            reasons.append(
+                "only {} frames analysed (150 minimum)".format(dq["frames_analysed"])
+            )
+        if sc.get("failures"):
+            reasons.append(
+                "{} sanity violation(s): {}".format(
+                    len(sc["failures"]),
+                    ", ".join(f["field"] for f in sc["failures"])
+                )
+            )
+        report["analyst_ready_reason"] = "; ".join(reasons)
+
+    return report
+
+
+def _nullify_summary_for_service(summary, service_key):
+    # type: (Dict[str, Any], str) -> None
+    """Set match_summary fields to None for a service whose confidence is unavailable."""
+    field_map = {
+        "pass_network":    ["total_passes", "possession_pct"],
+        "xg":              ["xg_team_0", "xg_team_1", "shots_team_0", "shots_team_1"],
+        "heatmaps":        ["top_distance_player", "top_speed_player"],
+        "pressing":        ["ppda_team_0", "ppda_team_1"],
+        "formations":      ["dominant_formation_team_0", "dominant_formation_team_1"],
+        "events":          ["total_shots", "dribble_success_rate_team_0",
+                            "dribble_success_rate_team_1"],
+        "defensive_lines": ["avg_def_line_depth_team_0", "avg_def_line_depth_team_1"],
+        "counter_press":   ["counter_press_success_rate_team_0",
+                            "counter_press_success_rate_team_1"],
+        "set_pieces":      ["corners_team_0", "corners_team_1",
+                            "free_kicks_team_0", "free_kicks_team_1"],
+    }
+    for field in field_map.get(service_key, []):
+        summary[field] = None
 
 
 def _build_match_summary(results):

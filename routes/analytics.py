@@ -22,9 +22,15 @@ async def get_analytics(jobId: str):
     try:
         result = build_analytics_report(jobId)
         available = get_available_services(jobId)
+        dq = result.get("data_quality", {})
         return JSONResponse(
             content=result,
-            headers={"X-Available-Services": ",".join(available)},
+            headers={
+                "X-Available-Services": ",".join(available),
+                "X-Data-Quality": str(dq.get("overall", "unknown")),
+                "X-Analyst-Ready": str(result.get("analyst_ready", False)).lower(),
+                "X-Frames-Analysed": str(dq.get("frames_analysed", 0)),
+            },
         )
     except FileNotFoundError as e:
         raise HTTPException(status_code=404, detail=str(e))

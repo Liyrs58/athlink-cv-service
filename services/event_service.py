@@ -22,7 +22,7 @@ PITCH_WIDTH = 105.0
 PITCH_HEIGHT = 68.0
 
 # Import helper functions from existing services
-from services.pass_network_service import _base_job_id, _load_json
+from services.pass_network_service import _base_job_id, _load_json, _check_ball_data_quality
 try:
     from services.xg_service import compute_xg
     XG_AVAILABLE = True
@@ -361,17 +361,55 @@ def detect_events(job_id: str) -> dict:
         logger.warning("No ball trajectory found")
         return {"events": [], "summary": {}, "ball_track_frames": 0, "interpolated_frames": 0, "possession_sequences": 0}
     
+    # Check ball data quality before running distance-based detection
+    ball_quality = _check_ball_data_quality(job_id)
+    if not ball_quality["has_ball_world_coords"] or ball_quality["ball_frame_coverage"] < 0.05:
+        logger.warning(
+            "Event detection unavailable for job %s: %s", job_id, ball_quality["reason"]
+        )
+        empty_summary = {
+            "team_0": {"pass_count": 0, "shot_count": 0, "dribble_count": 0,
+                       "dribble_success_rate": None, "turnover_count": 0,
+                       "clearance_count": 0, "forward_carry_distance_m": 0.0},
+            "team_1": {"pass_count": 0, "shot_count": 0, "dribble_count": 0,
+                       "dribble_success_rate": None, "turnover_count": 0,
+                       "clearance_count": 0, "forward_carry_distance_m": 0.0},
+            "total_events": 0,
+            "duration_seconds": 0.0,
+        }
+        result = {
+            "status": "unavailable",
+            "reason": ball_quality["reason"],
+            "message": (
+                "Event detection requires ball world coordinates. "
+                "Run pitch mapping with homography first."
+            ),
+            "events": [],
+            "summary": empty_summary,
+            "ball_track_frames": 0,
+            "interpolated_frames": 0,
+            "possession_sequences": 0,
+            "ball_data_quality": ball_quality,
+        }
+        output_dir = Path(f"temp/{job_id}/events")
+        output_dir.mkdir(parents=True, exist_ok=True)
+        with open(output_dir / "event_timeline.json", "w") as f:
+            json.dump(result, f, indent=2)
+        return result
+
     positions, ball_lost, interpolated_count, lost_count, ball_coords_are_pixels = _build_continuous_ball_track(ball_trajectory, pitch_data)
-    
-    # If ball coords are pixels, skip distance-based calculations
+
+    # Secondary check: if build_ball_track still ended up in pixel mode, refuse
     if ball_coords_are_pixels:
         return {
-            "warning": "ball world coords unavailable - using pixel coordinates",
+            "status": "unavailable",
+            "reason": "ball_coords_are_pixels",
+            "message": "Ball coordinates are pixel-space, not world-space. Homography required.",
             "events": [],
             "summary": {},
             "ball_track_frames": len(positions),
             "interpolated_frames": interpolated_count,
-            "possession_sequences": 0
+            "possession_sequences": 0,
         }
     smoothed_x, smoothed_y, speeds = _smooth_and_compute_speed(positions, ball_lost, fps)
     

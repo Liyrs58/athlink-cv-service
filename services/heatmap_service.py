@@ -143,18 +143,28 @@ def compute_heatmaps(job_id):
         seg_mid_x = np.zeros(max(n - 1, 0), dtype=np.float64)
         seg_mid_y = np.zeros(max(n - 1, 0), dtype=np.float64)
         valid = np.zeros(max(n - 1, 0), dtype=bool)
-        
+
         MAX_HUMAN_SPEED_MS = 12.0  # m/s — fastest human sprint
+        # At 25fps, max sprint ~12 m/s = 0.48m/frame. Allow 3m/frame
+        # to handle stride + FPS variance without catching teleports.
+        MAX_FRAME_DISPLACEMENT_M = 3.0
 
         for i in range(n - 1):
-            dt = (frames[i + 1] - frames[i]) / fps
+            frame_gap = int(frames[i + 1] - frames[i])
+            dt = frame_gap / fps
             if dt <= 0 or dt > 2.0:
                 continue
             dx = xs[i + 1] - xs[i]
             dy = ys[i + 1] - ys[i]
             d = np.sqrt(dx * dx + dy * dy)
+
+            # Reject track-ID switches / teleports before computing speed
+            displacement_per_frame = d / frame_gap
+            if displacement_per_frame > MAX_FRAME_DISPLACEMENT_M:
+                continue  # track break — skip segment entirely
+
             s = d / dt
-            
+
             distances[i] = d
             speeds[i] = s
             seg_mid_x[i] = (xs[i] + xs[i + 1]) / 2.0

@@ -57,6 +57,32 @@ def _find_field_corners(frame: np.ndarray) -> Optional[np.ndarray]:
     return np.array(corners, dtype=np.float32)
 
 
+def validate_homography(H: np.ndarray, frame_w: int, frame_h: int) -> bool:
+    """
+    Test H by projecting known pixel locations and checking world coords
+    are within pitch bounds and sensibly located.
+    Returns True if valid, False if H is garbage.
+    """
+    test_pixels = [
+        [frame_w / 2, frame_h / 2],      # centre
+        [frame_w * 0.1, frame_h * 0.5],  # left edge
+        [frame_w * 0.9, frame_h * 0.5],  # right edge
+    ]
+    pts = np.array(test_pixels, dtype=np.float32).reshape(-1, 1, 2)
+    try:
+        world = cv2.perspectiveTransform(pts, H)
+    except Exception:
+        return False
+    for pt in world:
+        x, y = float(pt[0][0]), float(pt[0][1])
+        if not (-10 < x < 115 and -10 < y < 78):
+            return False
+    centre_x, centre_y = float(world[0][0][0]), float(world[0][0][1])
+    if not (30 < centre_x < 75 and 15 < centre_y < 53):
+        return False
+    return True
+
+
 def _estimate_homography(frame: np.ndarray) -> Optional[np.ndarray]:
     """Estimate homography mapping pixel coords → pitch metres."""
     corners = _find_field_corners(frame)
@@ -237,9 +263,12 @@ def map_pitch(
 
         H = _estimate_homography(frame)
         if H is not None:
-            last_good_H = H
-        elif last_good_H is not None:
-            # Carry forward previous frame's homography
+            if validate_homography(H, frame_w, frame_h):
+                last_good_H = H
+            else:
+                H = None  # reject bad homography
+        if H is None and last_good_H is not None:
+            # Carry forward previous validated H
             H = last_good_H
 
         if H is not None:
@@ -256,8 +285,12 @@ def map_pitch(
     cap.release()
 
     homography_found = last_good_H is not None
+    calibration_valid = homography_found  # already validated per-frame above
+
     if not homography_found:
-        logger.warning("No homography found for job %s — using normalised fallback", job_id)
+        logger.warning("No homography found for job %s — world coords unavailable", job_id)
+    else:
+        logger.info("Homography validated for job %s", job_id)
 
     # ------------------------------------------------------------------
     # Transform player trajectories
@@ -275,19 +308,23 @@ def map_pitch(
             px = (float(bbox[0]) + float(bbox[2])) / 2.0
             py = float(bbox[3])
 
-            # Find the closest available homography for this frame
-            H = frame_homographies.get(fi)
-            if H is None and frame_homographies:
-                # Use nearest frame's H
-                nearest = min(frame_homographies.keys(), key=lambda k: abs(k - fi))
-                H = frame_homographies[nearest]
+            if calibration_valid:
+                # Find the closest available homography for this frame
+                H = frame_homographies.get(fi)
+                if H is None and frame_homographies:
+                    nearest = min(frame_homographies.keys(), key=lambda k: abs(k - fi))
+                    H = frame_homographies[nearest]
 
-            if H is not None:
-                x, y = _transform_point(H, px, py)
-                x = max(0.0, min(PITCH_WIDTH, x))
-                y = max(0.0, min(PITCH_HEIGHT, y))
+                if H is not None:
+                    x, y = _transform_point(H, px, py)
+                    x = max(0.0, min(PITCH_WIDTH, x))
+                    y = max(0.0, min(PITCH_HEIGHT, y))
+                else:
+                    # No H available — skip this point
+                    continue
             else:
-                # Proportional fallback
+                # calibration failed — do NOT write proportional fallback world coords
+                # downstream services must check calibration_valid before trusting coords
                 x = px / frame_w * PITCH_WIDTH
                 y = py / frame_h * PITCH_HEIGHT
 
@@ -308,9 +345,9 @@ def map_pitch(
         })
 
     # ------------------------------------------------------------------
-    # Add ball world coordinates if homography is available
+    # Add ball world coordinates only if homography is valid
     # ------------------------------------------------------------------
-    if homography_found and tracking.get("ball_trajectory"):
+    if calibration_valid and tracking.get("ball_trajectory"):
         ball_trajectory_2d = []
         
         for ball_det in tracking["ball_trajectory"]:
@@ -368,6 +405,8 @@ def map_pitch(
         "jobId": job_id,
         "framesProcessed": frames_checked,
         "homographyFound": homography_found,
+        "calibration_valid": calibration_valid,
+        "calibration_failed": not calibration_valid,
         "players": players,
         "outputPath": output_path,
     }
