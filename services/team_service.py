@@ -128,12 +128,20 @@ def assign_teams(
         return tracks
 
     # ── 2. K-means (k=2) on long tracks ──────────────────────────────────────
+    # FIX 2: Exclude potential officials from clustering
     clustering_indices = [
-        idx for idx in feature_vectors if not is_short_track.get(idx, True)
+        idx for idx in feature_vectors
+        if not is_short_track.get(idx, True) and not tracks[idx].get("is_official", False)
     ]
 
     if len(clustering_indices) < 2:
-        # fall back: use all tracks
+        # fall back: use all tracks (but still exclude officials)
+        clustering_indices = [
+            idx for idx in feature_vectors if not tracks[idx].get("is_official", False)
+        ]
+
+    if len(clustering_indices) < 2:
+        # last resort: use all tracks including officials
         clustering_indices = list(feature_vectors.keys())
 
     data = np.array([feature_vectors[i] for i in clustering_indices])
@@ -149,9 +157,13 @@ def assign_teams(
         tracks[track_idx]["teamId"] = int(labels[i])
 
     # ── 3. Assign short / unclustered tracks to nearest centroid ─────────────
+    # FIX 2: Skip officials, assign them teamId -2
     clustered_set = set(clustering_indices)
     for track_idx, feat in feature_vectors.items():
         if track_idx in clustered_set:
+            continue
+        if tracks[track_idx].get("is_official", False):
+            tracks[track_idx]["teamId"] = -2
             continue
         feat_w = feat * weights
         d0 = float(np.linalg.norm(feat_w - centroids_w[0]))
@@ -159,9 +171,12 @@ def assign_teams(
         tracks[track_idx]["teamId"] = 0 if d0 <= d1 else 1
 
     # ── 4. Goalkeeper — track most unlike its team's hue centroid ────────────
+    # FIX 2: Skip officials when finding goalkeeper
     team_hues: dict = {0: [], 1: []}
     for track_idx, feat in feature_vectors.items():
         tid = tracks[track_idx].get("teamId")
+        if tid == -2:  # Skip officials
+            continue
         if tid in team_hues:
             team_hues[tid].append(feat[0])
 
@@ -174,6 +189,8 @@ def assign_teams(
     gk_dist = 0.0
     for track_idx, feat in feature_vectors.items():
         tid = tracks[track_idx].get("teamId")
+        if tid == -2:  # Skip officials
+            continue
         if tid not in team_median_hue:
             continue
         dist = abs(feat[0] - team_median_hue[tid])
@@ -191,15 +208,22 @@ def assign_teams(
         logger.info("No goalkeeper detected (max hue dist %.3f)", gk_dist)
 
     # ── 5. Role field ─────────────────────────────────────────────────────────
+    # FIX 2: Mark officials with special role
     for track in tracks:
         track.setdefault("teamId", -1)
-        track["role"] = "goalkeeper" if track.get("teamId") == 2 else "player"
+        if track.get("teamId") == -2:
+            track["role"] = "official"
+        elif track.get("teamId") == 2:
+            track["role"] = "goalkeeper"
+        else:
+            track["role"] = "player"
 
     # ── 6. Save ───────────────────────────────────────────────────────────────
     t0 = sum(1 for t in tracks if t.get("teamId") == 0)
     t1 = sum(1 for t in tracks if t.get("teamId") == 1)
     t2 = sum(1 for t in tracks if t.get("teamId") == 2)
-    logger.info("Teams: team0=%d  team1=%d  goalkeeper=%d", t0, t1, t2)
+    t_official = sum(1 for t in tracks if t.get("teamId") == -2)
+    logger.info("Teams: team0=%d  team1=%d  goalkeeper=%d  officials=%d", t0, t1, t2, t_official)
 
     results = [
         {

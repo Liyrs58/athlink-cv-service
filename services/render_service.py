@@ -20,8 +20,10 @@ TEAM_BGR = {
     0: (255, 100,   0),   # Blue team (BGR: cyan)
     1: (  0,  50, 255),   # Orange team (BGR: orange)
     2: (  0, 255,   0),   # goalkeeper — bright green
+    -2: (128, 128, 128),  # FIX 2: Official — grey
 }
 DEFAULT_BGR = (200, 200, 200)
+OFFICIAL_BGR = (128, 128, 128)  # FIX 2: Grey for referees/linesmen
 
 # FIX 4: Tracking state visualization colors
 CONFIRMED_COLOR = (0, 255, 0)   # Green — confirmed detection
@@ -229,12 +231,16 @@ def _draw_players(frame, players, include_minimap: bool, frame_w: int, frame_h: 
 
     for p in players:
         team_id = p.get("teamId", -1)
+        is_official = p.get("is_official", False)  # FIX 2: skip fill for officials
         x1, y1, x2, y2 = [int(v) for v in p["bbox"]]
         x1 = max(0, min(x1, frame_w - 1))
         x2 = max(0, min(x2, frame_w - 1))
         y1 = max(0, min(y1, frame_h - 1))
         y2 = max(0, min(y2, frame_h - 1))
         if x2 <= x1 or y2 <= y1:
+            continue
+        if is_official:
+            # FIX 2: Don't fill officials, just outline them
             continue
         color = TEAM_BGR.get(team_id, DEFAULT_BGR)
         cv2.rectangle(overlay, (x1, y1), (x2, y2), color, -1)
@@ -244,6 +250,7 @@ def _draw_players(frame, players, include_minimap: bool, frame_w: int, frame_h: 
     for p in players:
         track_id = p["trackId"]
         team_id  = p.get("teamId", -1)
+        is_official = p.get("is_official", False)  # FIX 2: handle officials
         x1, y1, x2, y2 = [int(v) for v in p["bbox"]]
         x1 = max(0, min(x1, frame_w - 1))
         x2 = max(0, min(x2, frame_w - 1))
@@ -251,6 +258,22 @@ def _draw_players(frame, players, include_minimap: bool, frame_w: int, frame_h: 
         y2 = max(0, min(y2, frame_h - 1))
         if x2 <= x1 or y2 <= y1:
             continue
+
+        # FIX 2: Draw officials as thin grey box without label
+        if is_official:
+            cv2.rectangle(frame, (x1, y1), (x2, y2), OFFICIAL_BGR, 2)
+            label = "REF"
+            (lw, lh), baseline = cv2.getTextSize(label, FONT, 0.4, 1)
+            label_x = x1
+            label_y = max(y1 - 4, lh + 2)
+            cv2.rectangle(frame,
+                          (label_x, label_y - lh - baseline),
+                          (label_x + lw + 2, label_y + baseline),
+                          OFFICIAL_BGR, -1)
+            cv2.putText(frame, label, (label_x + 1, label_y),
+                        FONT, 0.4, (255, 255, 255), 1, cv2.LINE_AA)
+            continue
+
         color = TEAM_BGR.get(team_id, DEFAULT_BGR)
 
         # FIX 4: Draw bbox based on tracking state
@@ -343,12 +366,13 @@ def _draw_ball(frame, bbox, trail=None, ball_source=None, frames_since_detection
 
 
 def _draw_legend(frame, frame_h: int, frame_w: int):
-    """FIX 4: Draw legend box in bottom-left corner."""
-    legend_y_start = frame_h - 120
+    """FIX 4: Draw legend box in bottom-left corner with FIX 2 official marker."""
+    legend_y_start = frame_h - 150
     legend_x_start = 10
     legend_items = [
         ("Confirmed", CONFIRMED_COLOR),
         ("Predicted", PREDICTED_COLOR),
+        ("Official", OFFICIAL_BGR),  # FIX 2: Add official marker
         ("Ball (YOLO)", BALL_DETECTED_COLOR),
         ("Ball (Pred)", BALL_PREDICTED_COLOR),
     ]

@@ -65,6 +65,25 @@ def assess_confidence(job_id, service_name):
             "only {:.1f}% of frames were valid pitch views — many cutaways detected".format(valid_frames_pct)
         )
 
+    # FIX 3: Check tracking quality metrics for ID stability
+    tq = track_data.get("tracking_quality", {}) if track_data else {}
+    id_switches = tq.get("id_switches_total", 0)
+    avg_track_len = tq.get("avg_track_length_frames", 999)
+    stable_tracks = tq.get("tracks_with_5plus_detections", 999)
+
+    if id_switches > 50:
+        reasons.append(
+            "high ID churn: {} track ID switches detected — identity persistence is poor".format(id_switches)
+        )
+    if avg_track_len < 10:
+        reasons.append(
+            "short average track length: {:.1f} frames — tracks fragmenting".format(avg_track_len)
+        )
+    if stable_tracks < 10:
+        reasons.append(
+            "insufficient stable tracks: {} with 5+ detections".format(stable_tracks)
+        )
+
     if frames_analysed == 0:
         return {
             "confidence": "unavailable",

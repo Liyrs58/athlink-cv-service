@@ -201,20 +201,28 @@ def _interpolate_trajectory(trajectory_2d: List[Dict]) -> List[Dict]:
     for i in range(1, len(filled) - 1):
         # Compute velocity from surrounding 5 frames using central difference
         if i >= 2 and i + 2 < len(filled):
-            prev_pt = filled[i - 2]
-            curr_pt = filled[i]
-            next_pt = filled[i + 2]
+            # Compute velocity from surrounding 5 frames using central difference
+            if i >= 2 and i + 2 < len(filled):
+                prev_pt = filled[i - 2]
+                curr_pt = filled[i]
+                next_pt = filled[i + 2]
 
-            frame_gap = next_pt["frameIndex"] - prev_pt["frameIndex"]
-            if frame_gap > 0:
-                dx = next_pt["x"] - prev_pt["x"]
-                dy = next_pt["y"] - prev_pt["y"]
-                dist_m = (dx**2 + dy**2)**0.5
-                velocity_ms = dist_m / (frame_gap * (1.0 / 25.0))  # assume 25fps
+                frame_gap = next_pt["frameIndex"] - prev_pt["frameIndex"]
+                if frame_gap > 0:
+                    dx = next_pt["x"] - prev_pt["x"]
+                    dy = next_pt["y"] - prev_pt["y"]
+                    dist_m = (dx**2 + dy**2)**0.5
+                    velocity_ms = dist_m / (frame_gap * (1.0 / 25.0))  # assume 25fps
 
-                # If velocity > 35 m/s (impossible even for shots), mark unreliable
-                if velocity_ms > 35.0:
-                    filled[i]["reliable"] = False
+                    # If velocity > 35 m/s (impossible even for shots), mark unreliable
+                    if velocity_ms > 35.0:
+                        filled[i]["reliable"] = False
+
+    # Convert bool values to strings for JSON serialization
+    for pt in filled:
+        for key, value in pt.items():
+            if isinstance(value, bool):
+                pt[key] = str(value)
 
     return filled
 
@@ -413,7 +421,7 @@ def map_pitch(
                 "y": round(world_y, 2),
                 "source": source,
                 "confidence": confidence,
-                "reliable": reliable,
+                "reliable": str(reliable),  # Convert bool to string for JSON
             })
 
         # Sort by frameIndex

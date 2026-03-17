@@ -1,9 +1,9 @@
 tracker_type: botsort
-track_high_thresh: 0.15
+track_high_thresh: 0.20
 track_low_thresh: 0.05
 new_track_thresh: 0.2
-track_buffer: 60
-match_thresh: 0.75
+track_buffer: 90
+match_thresh: 0.3
 fuse_score: true
 
 # BoT-SORT specific — camera motion compensation via sparse optical flow

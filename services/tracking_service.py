@@ -178,6 +178,33 @@ def is_valid_pitch_frame(frame_bgr, min_green_pct=0.25) -> bool:
     return green_pct >= min_green_pct
 
 
+def _is_potential_official(frame_bgr, bbox) -> bool:
+    """
+    Detects potential referee/linesman by analyzing dominant jersey color.
+    Returns True if bbox shows black (ref) or yellow (linesman) kit.
+    """
+    x1, y1, x2, y2 = [max(0, int(v)) for v in bbox]
+    if x2 <= x1 or y2 <= y1:
+        return False
+    crop = frame_bgr[y1:y2, x1:x2]
+    if crop.size == 0:
+        return False
+    try:
+        hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+        dominant_v = float(np.median(hsv[:, :, 2]))
+        dominant_h = float(np.median(hsv[:, :, 0]))
+        dominant_s = float(np.median(hsv[:, :, 1]))
+        # Black kit (referee): low Value
+        if dominant_v < 50:
+            return True
+        # Yellow kit (linesman): H 20-35, high saturation
+        if 20 < dominant_h < 35 and dominant_s > 100:
+            return True
+    except Exception:
+        return False
+    return False
+
+
 class BallKalmanTracker:
     """
     Dedicated Kalman filter for ball tracking.
@@ -257,11 +284,15 @@ def run_tracking(
 
     active_tracks: Dict[int, Dict[str, Any]] = {}
     completed_tracks: List[Dict[str, Any]] = []
+    recently_lost: Dict[int, Dict[str, Any]] = {}  # FIX 1: tracks lost in last 30 frames for ReID recovery
 
     frame_results: List[Dict[str, Any]] = []
     ball_trajectory: List[Dict[str, Any]] = []
     ball_tracker = BallKalmanTracker()
     frame_metadata: List[Dict[str, Any]] = []  # FIX 5: per-frame validity tracking
+
+    # FIX 3: track quality counters (use list for mutable reference in nested scope)
+    id_switches_counter = [0]  # [0] = total_id_switches
 
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -481,7 +512,31 @@ def run_tracking(
                             # Detection too far from prediction — treat as new track
                             track_id = -1
 
+                # FIX 1: Suppression gate — if scene is populated (>15 tracks),
+                # don't create new tracks for detections close to existing predictions
+                if (track_id == -1 and len(active_tracks) > 15 and
+                    prev_active_ids):  # Only apply if we have existing tracks
+                    det_cx = (bbox[0] + bbox[2]) / 2.0
+                    det_cy = (bbox[1] + bbox[3]) / 2.0
+                    nearest_tid = None
+                    nearest_dist = float('inf')
+                    for existing_tid in prev_active_ids:
+                        if existing_tid in active_tracks:
+                            pred = active_tracks[existing_tid].get("_cam_pred_bbox")
+                            if pred is not None:
+                                pred_cx = (pred[0] + pred[2]) / 2.0
+                                pred_cy = (pred[1] + pred[3]) / 2.0
+                                dist = ((det_cx - pred_cx) ** 2 + (det_cy - pred_cy) ** 2) ** 0.5
+                                if dist < nearest_dist:
+                                    nearest_dist = dist
+                                    nearest_tid = existing_tid
+                    if nearest_tid is not None and nearest_dist < 120:
+                        track_id = nearest_tid  # Assign to nearest existing track
+
                 current_active_ids.add(track_id)
+
+                # FIX 2: Detect if this detection is a potential official
+                is_official_detection = _is_potential_official(frame, bbox)
 
                 trajectory_entry = {
                     "frameIndex": current_frame_idx,
@@ -491,17 +546,56 @@ def run_tracking(
                 }
 
                 if track_id not in active_tracks:
-                    active_tracks[track_id] = {
+                    new_track = {
                         "trackId": track_id,
                         "hits": 1,
                         "firstSeen": current_frame_idx,
                         "lastSeen": current_frame_idx,
                         "trajectory": [trajectory_entry],
+                        "_confirmed_detections": 1,
+                        "_predicted_frames": 0,
+                        "_id_switches": 0,
+                        "_official_votes": 1 if is_official_detection else 0,
                     }
+                    # FIX 1: Check if this is a ReID recovery from recently_lost
+                    best_lost_tid = None
+                    best_lost_score = float('inf')
+                    for lost_tid, lost_track in recently_lost.items():
+                        # Check bbox size similarity (±30%)
+                        last_bbox = lost_track["trajectory"][-1]["bbox"]
+                        last_h = last_bbox[3] - last_bbox[1]
+                        curr_h = bbox[3] - bbox[1]
+                        size_ratio = curr_h / last_h if last_h > 0 else 1.0
+                        if 0.7 <= size_ratio <= 1.3:
+                            # Check position proximity to Kalman prediction
+                            pred = lost_track.get("_kalman_pred")
+                            if pred is not None:
+                                pred_cx, pred_cy = pred
+                                curr_cx = (bbox[0] + bbox[2]) / 2.0
+                                curr_cy = (bbox[1] + bbox[3]) / 2.0
+                                dist = ((curr_cx - pred_cx) ** 2 + (curr_cy - pred_cy) ** 2) ** 0.5
+                                if dist < 80 and dist < best_lost_score:
+                                    best_lost_score = dist
+                                    best_lost_tid = lost_tid
+                    if best_lost_tid is not None:
+                        # Reuse the old track ID
+                        old_track = recently_lost.pop(best_lost_tid)
+                        new_track["trackId"] = best_lost_tid
+                        new_track["trajectory"] = old_track["trajectory"] + [trajectory_entry]
+                        new_track["hits"] = old_track["hits"] + 1
+                        new_track["firstSeen"] = old_track["firstSeen"]
+                        new_track["_confirmed_detections"] = old_track.get("_confirmed_detections", 0) + 1
+                        new_track["_predicted_frames"] = old_track.get("_predicted_frames", 0)
+                        new_track["_id_switches"] = old_track.get("_id_switches", 0) + 1
+                        id_switches_counter[0] += 1  # FIX 1: track total ID switches
+                        track_id = best_lost_tid
+                    active_tracks[track_id] = new_track
                 else:
                     active_tracks[track_id]["hits"] += 1
                     active_tracks[track_id]["lastSeen"] = current_frame_idx
                     active_tracks[track_id]["trajectory"].append(trajectory_entry)
+                    active_tracks[track_id]["_confirmed_detections"] += 1
+                    active_tracks[track_id]["_official_votes"] += 1 if is_official_detection else 0
 
                 # ReID: update appearance histogram (EMA blend)
                 hist = _compute_histogram(frame, bbox)
@@ -564,11 +658,28 @@ def run_tracking(
                     f"{len(frame_track_entries)} total detections"
                 )
 
-        # Move disappeared tracks to completed_tracks
+        # Move disappeared tracks to recently_lost (FIX 1: for ReID recovery)
         disappeared = prev_active_ids - current_active_ids
         for tid in disappeared:
             if tid in active_tracks:
-                completed_tracks.append(active_tracks.pop(tid))
+                track = active_tracks.pop(tid)
+                # Store Kalman prediction for ReID matching
+                if track["trajectory"]:
+                    last_bbox = track["trajectory"][-1]["bbox"]
+                    track["_kalman_pred"] = (
+                        (last_bbox[0] + last_bbox[2]) / 2.0,
+                        (last_bbox[1] + last_bbox[3]) / 2.0,
+                    )
+                recently_lost[tid] = track
+
+        # Clean up recently_lost: remove tracks lost >30 frames ago
+        to_complete = []
+        for tid, track in recently_lost.items():
+            age = current_frame_idx - track["lastSeen"]
+            if age > 30 * frame_stride:
+                to_complete.append(tid)
+        for tid in to_complete:
+            completed_tracks.append(recently_lost.pop(tid))
 
         prev_active_ids = current_active_ids
 
@@ -798,6 +909,7 @@ def run_tracking(
         if len(traj) < 2:
             continue
         filled = []
+        predicted_frames_count = 0
         for i in range(len(traj) - 1):
             filled.append(traj[i])
             a = traj[i]
@@ -819,8 +931,57 @@ def run_tracking(
                         "bbox": interp_bbox,
                         "confidence": (a["confidence"] + b["confidence"]) / 2.0,
                     })
+                    predicted_frames_count += 1
         filled.append(traj[-1])
         track["trajectory"] = filled
+        # FIX 3: Add quality metadata
+        track["_predicted_frames"] = track.get("_predicted_frames", 0) + predicted_frames_count
+
+    # FIX 3: Compute tracking quality metrics and clean up internal fields
+    total_confirmed_detections = 0
+    total_predicted_frames = 0
+    stable_tracks = 0
+    official_tracks_count = 0
+    for track in filtered:
+        confirmed = track.pop("_confirmed_detections", 0)
+        predicted = track.pop("_predicted_frames", 0)
+        official_votes = track.pop("_official_votes", 0)
+        id_switches = track.pop("_id_switches", 0)
+        total_confirmed_detections += confirmed
+        total_predicted_frames += predicted
+        if confirmed >= 5:
+            stable_tracks += 1
+        # Mark track as official if ≥30% of frames voted official
+        traj_len = len(track["trajectory"])
+        is_official = (official_votes >= traj_len * 0.3) if traj_len > 0 else False
+        if is_official:
+            official_tracks_count += 1
+        # Add quality metadata to track output
+        track["confirmed_detections"] = confirmed
+        track["predicted_frames"] = predicted
+        track["id_switches"] = id_switches
+        track["is_official"] = is_official
+        track["confidence_score"] = (confirmed / traj_len) if traj_len > 0 else 0.0
+        # Clean up internal fields
+        track.pop("_kalman_pred", None)
+        track.pop("_cam_pred_bbox", None)
+        track.pop("_histogram", None)
+
+    avg_track_length = sum(len(t["trajectory"]) for t in filtered) / len(filtered) if filtered else 0.0
+
+    # Convert bool values for JSON serialization
+    for frame_meta in frame_metadata:
+        for key, value in frame_meta.items():
+            if isinstance(value, (bool, np.bool_)):
+                frame_meta[key] = bool(value)
+
+    tracking_quality = {
+        "id_switches_total": id_switches_counter[0],  # FIX 1: total ID switches
+        "avg_track_length_frames": avg_track_length,
+        "tracks_with_5plus_detections": stable_tracks,
+        "official_tracks": official_tracks_count,
+        "valid_frames_pct": (valid_frames_count / len(frame_results) * 100.0) if frame_results else 0.0,
+    }
 
     results_data = {
         "jobId": job_id,
@@ -833,6 +994,7 @@ def run_tracking(
         "ballDetections": len(ball_trajectory),
         "ball_trajectory": ball_trajectory,
         "frame_metadata": frame_metadata,  # FIX 5: per-frame validity data
+        "tracking_quality": tracking_quality,  # FIX 3: quality metrics
     }
 
     results_file = output_dir / "track_results.json"
