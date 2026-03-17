@@ -293,6 +293,7 @@ def run_tracking(
 
     # FIX 3: track quality counters (use list for mutable reference in nested scope)
     id_switches_counter = [0]  # [0] = total_id_switches
+    last_rescue_frame = -10  # Track last rescue detection frame
 
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -412,7 +413,7 @@ def run_tracking(
                 magnitude = np.sqrt(dx_cam ** 2 + dy_cam ** 2)
 
                 # FIX 2: adaptive stride — process next frame if pan is fast
-                if adaptive_stride and magnitude > 8.0:
+                if adaptive_stride and magnitude > 40.0:
                     force_next_frame = True
                     logger.info(
                         f"Frame {current_frame_idx}: fast pan detected "
@@ -615,7 +616,12 @@ def run_tracking(
                 })
 
         # --- Rescue detection when active tracks drop ---
-        if len(current_active_ids) < 3:
+        # Only fire when: tracks < 3, valid pitch frame, no fast pan, and not recently used
+        frames_since_rescue = current_frame_idx - last_rescue_frame
+        if (len(current_active_ids) < 3 and 
+            frame_is_valid and 
+            not scene_cut_flag and
+            frames_since_rescue >= 10):
             rescue_results = model(detect_frame, verbose=False, conf=0.10, classes=[0], half=_use_half)
             if rescue_results[0].boxes is not None and len(rescue_results[0].boxes) > 0:
                 rescue_bboxes = rescue_results[0].boxes.xyxy.cpu().tolist()
@@ -657,6 +663,7 @@ def run_tracking(
                     f"Frame {current_frame_idx}: rescue detection fired, "
                     f"{len(frame_track_entries)} total detections"
                 )
+                last_rescue_frame = current_frame_idx
 
         # Move disappeared tracks to recently_lost (FIX 1: for ReID recovery)
         disappeared = prev_active_ids - current_active_ids
