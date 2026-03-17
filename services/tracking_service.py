@@ -148,6 +148,69 @@ def is_pitch_shot(frame, threshold=0.12):
     return np.count_nonzero(green) / green.size > threshold
 
 
+class BallKalmanTracker:
+    """
+    Dedicated Kalman filter for ball tracking.
+    State vector: [x, y, vx, vy] (position + velocity)
+    Measurement: [x, y] (pixel position from YOLO)
+    """
+    def __init__(self):
+        self.kf = cv2.KalmanFilter(4, 2)
+        self.kf.measurementMatrix = np.array(
+            [[1,0,0,0],[0,1,0,0]], np.float32)
+        self.kf.transitionMatrix = np.array(
+            [[1,0,1,0],[0,1,0,1],
+             [0,0,1,0],[0,0,0,1]], np.float32)
+        self.kf.processNoiseCov = np.eye(4, dtype=np.float32) * 0.03
+        self.kf.measurementNoiseCov = np.eye(2, dtype=np.float32) * 0.5
+        self.kf.errorCovPost = np.eye(4, dtype=np.float32)
+        self.initialized = False
+        self.frames_since_detection = 0
+        self.max_prediction_frames = 45  # ~1.8s at 25fps
+
+    def update(self, x, y):
+        """Call when YOLO detects ball. Returns corrected position."""
+        measurement = np.array([[x], [y]], dtype=np.float32)
+        if not self.initialized:
+            self.kf.statePre = np.array(
+                [[x],[y],[0],[0]], dtype=np.float32)
+            self.kf.statePost = np.array(
+                [[x],[y],[0],[0]], dtype=np.float32)
+            self.initialized = True
+        self.kf.predict()
+        corrected = self.kf.correct(measurement)
+        self.frames_since_detection = 0
+        return float(corrected[0]), float(corrected[1])
+
+    def predict(self):
+        """Call when YOLO does NOT detect ball.
+        Returns predicted position if within window."""
+        if not self.initialized:
+            return None
+        if self.frames_since_detection >= self.max_prediction_frames:
+            return None
+        predicted = self.kf.predict()
+        self.frames_since_detection += 1
+        x, y = float(predicted[0]), float(predicted[1])
+        return x, y
+
+    def search_region(self, frame_gray, radius=60):
+        """
+        Returns a bounding box to search for ball candidates
+        near the predicted position.
+        """
+        pred = self.predict()
+        if pred is None:
+            return None
+        px, py = pred
+        return (
+            max(0, int(px - radius)),
+            max(0, int(py - radius)),
+            min(frame_gray.shape[1], int(px + radius)),
+            min(frame_gray.shape[0], int(py + radius))
+        )
+
+
 def run_tracking(
     video_path: str,
     job_id: str,
@@ -164,6 +227,7 @@ def run_tracking(
 
     frame_results: List[Dict[str, Any]] = []
     ball_trajectory: List[Dict[str, Any]] = []
+    ball_tracker = BallKalmanTracker()
 
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -431,20 +495,87 @@ def run_tracking(
 
         prev_active_ids = current_active_ids
 
-        # --- Ball detection ---
+        # --- Ball detection with Kalman prediction ---
+        ball_detected = False
         ball_results = model(frame, verbose=False, conf=0.15, classes=[32], half=_use_half)
         if ball_results[0].boxes is not None and len(ball_results[0].boxes) > 0:
             ball_boxes = ball_results[0].boxes.xyxy.cpu().tolist()
             ball_confs = ball_results[0].boxes.conf.cpu().tolist()
             best_idx = int(np.argmax(ball_confs))
             bx1, by1, bx2, by2 = ball_boxes[best_idx]
+            cx = (bx1 + bx2) / 2.0
+            cy = (by1 + by2) / 2.0
+            # Update Kalman filter with YOLO detection
+            cx, cy = ball_tracker.update(cx, cy)
             ball_trajectory.append({
                 "frameIndex": current_frame_idx,
-                "x": (bx1 + bx2) / 2.0,
-                "y": (by1 + by2) / 2.0,
+                "x": cx,
+                "y": cy,
                 "bbox": [bx1, by1, bx2, by2],
                 "confidence": float(ball_confs[best_idx]),
+                "source": "yolo",
             })
+            ball_detected = True
+
+        # If YOLO did not detect ball, use Kalman prediction + Hough circles
+        if not ball_detected:
+            predicted = ball_tracker.predict()
+            if predicted is not None:
+                px, py = predicted
+                region = ball_tracker.search_region(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), radius=50)
+                if region is not None:
+                    x1, y1, x2, y2 = region
+                    crop = frame[y1:y2, x1:x2]
+                    if crop.size > 0:
+                        crop_gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+                        circles = cv2.HoughCircles(
+                            crop_gray, cv2.HOUGH_GRADIENT, dp=1.2,
+                            minDist=20, param1=50, param2=25,
+                            minRadius=3, maxRadius=20
+                        )
+                        if circles is not None:
+                            circles = np.uint16(np.around(circles))
+                            # Pick circle nearest to prediction centre
+                            best_circle = None
+                            best_dist = float('inf')
+                            pred_in_crop_x = px - x1
+                            pred_in_crop_y = py - y1
+                            for circle in circles[0]:
+                                cx_crop, cy_crop, r = circle
+                                dist = ((cx_crop - pred_in_crop_x)**2 + (cy_crop - pred_in_crop_y)**2)**0.5
+                                if dist < best_dist:
+                                    best_dist = dist
+                                    best_circle = circle
+                            if best_circle is not None:
+                                cx_crop, cy_crop, r = best_circle
+                                cx = x1 + cx_crop
+                                cy = y1 + cy_crop
+                                ball_tracker.update(cx, cy)
+                                ball_trajectory.append({
+                                    "frameIndex": current_frame_idx,
+                                    "x": cx,
+                                    "y": cy,
+                                    "confidence": 0.5,
+                                    "source": "hough_candidate",
+                                })
+                            else:
+                                # No circle found, use Kalman prediction
+                                ball_trajectory.append({
+                                    "frameIndex": current_frame_idx,
+                                    "x": px,
+                                    "y": py,
+                                    "confidence": 0.3,
+                                    "source": "kalman_prediction",
+                                })
+                        else:
+                            # No circles detected, use Kalman prediction
+                            ball_trajectory.append({
+                                "frameIndex": current_frame_idx,
+                                "x": px,
+                                "y": py,
+                                "confidence": 0.3,
+                                "source": "kalman_prediction",
+                            })
 
         frame_results.append({
             "frameIndex": current_frame_idx,

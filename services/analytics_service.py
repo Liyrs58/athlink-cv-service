@@ -244,14 +244,15 @@ def _build_match_summary(results):
         summary["total_passes"] = pn.get("total_passes")
         pbt = pn.get("passes_by_team")
         if pbt and isinstance(pbt, dict):
-            t0 = pbt.get("0", pbt.get(0, 0))
-            t1 = pbt.get("1", pbt.get(1, 0))
-            total = t0 + t1
-            if total > 0:
-                summary["possession_pct"] = {
-                    "team_0": round(t0 / total * 100, 1),
-                    "team_1": round(t1 / total * 100, 1),
-                }
+            t0 = pbt.get("0", pbt.get(0, None))
+            t1 = pbt.get("1", pbt.get(1, None))
+            if t0 is not None and t1 is not None:
+                total = t0 + t1
+                if total > 0:
+                    summary["possession_pct"] = {
+                        "team_0": round(t0 / total * 100, 1),
+                        "team_1": round(t1 / total * 100, 1),
+                    }
 
     xg = results.get("xg")
     if xg is not None:
@@ -263,9 +264,13 @@ def _build_match_summary(results):
     # Add event-based statistics
     events = results.get("events")
     if events is not None:
-        summary["total_shots"] = events.get("summary", {}).get("team_0", {}).get("shot_count", 0) + events.get("summary", {}).get("team_1", {}).get("shot_count", 0)
-        summary["dribble_success_rate_team_0"] = events.get("summary", {}).get("team_0", {}).get("dribble_success_rate")
-        summary["dribble_success_rate_team_1"] = events.get("summary", {}).get("team_1", {}).get("dribble_success_rate")
+        evs = events.get("summary", {})
+        sc0 = evs.get("team_0", {}).get("shot_count")
+        sc1 = evs.get("team_1", {}).get("shot_count")
+        if sc0 is not None or sc1 is not None:
+            summary["total_shots"] = (sc0 or 0) + (sc1 or 0)
+        summary["dribble_success_rate_team_0"] = evs.get("team_0", {}).get("dribble_success_rate")
+        summary["dribble_success_rate_team_1"] = evs.get("team_1", {}).get("dribble_success_rate")
 
     # Add defensive line statistics
     defensive_lines = results.get("defensive_lines")
@@ -310,12 +315,14 @@ def _build_match_summary(results):
             for tid_str, pdata in players.items():
                 tid = int(tid_str) if isinstance(tid_str, str) else tid_str
                 team = pdata.get("team", -1)
-                dist = pdata.get("total_distance_m", 0)
-                speed = pdata.get("top_speed_ms", 0)
-                if best_dist is None or dist > best_dist["distance_m"]:
-                    best_dist = {"track_id": tid, "team": team, "distance_m": round(dist, 1)}
-                if best_speed is None or speed > best_speed["speed_ms"]:
-                    best_speed = {"track_id": tid, "team": team, "speed_ms": round(speed, 2)}
+                dist = pdata.get("total_distance_m")
+                speed = pdata.get("top_speed_ms")
+                if dist is not None:
+                    if best_dist is None or dist > best_dist["distance_m"]:
+                        best_dist = {"track_id": tid, "team": team, "distance_m": round(dist, 1)}
+                if speed is not None:
+                    if best_speed is None or speed > best_speed["speed_ms"]:
+                        best_speed = {"track_id": tid, "team": team, "speed_ms": round(speed, 2)}
             summary["top_distance_player"] = best_dist
             summary["top_speed_player"] = best_speed
 

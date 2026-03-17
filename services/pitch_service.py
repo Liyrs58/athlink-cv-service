@@ -170,8 +170,9 @@ def _load_team_map(job_id: str) -> Dict[int, int]:
 
 def _interpolate_trajectory(trajectory_2d: List[Dict]) -> List[Dict]:
     """
-    Linearly interpolate x/y for any gaps between consecutive trajectory points.
+    Linearly interpolate x/y for any gaps up to 45 frames between consecutive trajectory points.
     Points are assumed sorted by frameIndex.
+    Add velocity-based smoothing and reliability flags.
     """
     if len(trajectory_2d) < 2:
         return trajectory_2d
@@ -182,15 +183,39 @@ def _interpolate_trajectory(trajectory_2d: List[Dict]) -> List[Dict]:
         b = trajectory_2d[i + 1]
         filled.append(a)
         gap = b["frameIndex"] - a["frameIndex"]
-        if gap > 1:
+        if 1 < gap <= 45:  # Allow interpolation up to 45 frames
             for s in range(1, gap):
                 t = s / gap
                 filled.append({
                     "frameIndex": a["frameIndex"] + s,
                     "x": round(a["x"] + t * (b["x"] - a["x"]), 2),
                     "y": round(a["y"] + t * (b["y"] - a["y"]), 2),
+                    "reliable": False,
                 })
+        elif gap > 45:
+            # Gap too large, do not interpolate
+            pass
     filled.append(trajectory_2d[-1])
+
+    # Physics-based velocity smoothing: flag unreliable positions
+    for i in range(1, len(filled) - 1):
+        # Compute velocity from surrounding 5 frames using central difference
+        if i >= 2 and i + 2 < len(filled):
+            prev_pt = filled[i - 2]
+            curr_pt = filled[i]
+            next_pt = filled[i + 2]
+
+            frame_gap = next_pt["frameIndex"] - prev_pt["frameIndex"]
+            if frame_gap > 0:
+                dx = next_pt["x"] - prev_pt["x"]
+                dy = next_pt["y"] - prev_pt["y"]
+                dist_m = (dx**2 + dy**2)**0.5
+                velocity_ms = dist_m / (frame_gap * (1.0 / 25.0))  # assume 25fps
+
+                # If velocity > 35 m/s (impossible even for shots), mark unreliable
+                if velocity_ms > 35.0:
+                    filled[i]["reliable"] = False
+
     return filled
 
 
@@ -349,26 +374,28 @@ def map_pitch(
     # ------------------------------------------------------------------
     if calibration_valid and tracking.get("ball_trajectory"):
         ball_trajectory_2d = []
-        
+
         for ball_det in tracking["ball_trajectory"]:
             fi = ball_det["frameIndex"]
             px = float(ball_det["x"])
             py = float(ball_det["y"])
-            
+            source = ball_det.get("source", "unknown")
+            confidence = ball_det.get("confidence", 0.5)
+
             # Find the closest available homography for this frame
             H = frame_homographies.get(fi)
             if H is None and frame_homographies:
                 # Use nearest frame's H
                 nearest = min(frame_homographies.keys(), key=lambda k: abs(k - fi))
                 H = frame_homographies[nearest]
-            
+
             if H is not None:
                 # Transform pixel coordinates to world coordinates
                 pixel_pt = np.array([[px, py]], dtype=np.float32).reshape(-1, 1, 2)
                 world_pt = cv2.perspectiveTransform(pixel_pt, H)
                 world_x = float(world_pt[0][0][0])
                 world_y = float(world_pt[0][0][1])
-                
+
                 # Clamp to pitch boundaries
                 world_x = max(0.0, min(PITCH_WIDTH, world_x))
                 world_y = max(0.0, min(PITCH_HEIGHT, world_y))
@@ -376,16 +403,22 @@ def map_pitch(
                 # Proportional fallback
                 world_x = px / frame_w * PITCH_WIDTH
                 world_y = py / frame_h * PITCH_HEIGHT
-            
+
+            # Reliability flag based on source
+            reliable = (source == "yolo")
+
             ball_trajectory_2d.append({
                 "frameIndex": fi,
                 "x": round(world_x, 2),
                 "y": round(world_y, 2),
+                "source": source,
+                "confidence": confidence,
+                "reliable": reliable,
             })
-        
+
         # Sort by frameIndex
         ball_trajectory_2d.sort(key=lambda p: p["frameIndex"])
-        
+
         # Add ball entry to players list
         players.append({
             "trackId": -1,

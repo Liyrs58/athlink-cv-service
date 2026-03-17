@@ -9,10 +9,26 @@ logger = logging.getLogger(__name__)
 
 PITCH_WIDTH = 105.0
 PITCH_HEIGHT = 68.0
-CARRIER_RADIUS_M = 5.0
-CARRIER_MIN_FRAMES = 2
+CARRIER_RADIUS_M = 10.0
+CARRIER_MIN_FRAMES = 1
 PASS_MIN_DIST_M = 2.0
-PASS_MAX_FRAMES = 60
+PASS_MAX_FRAMES = 100
+
+# Confidence weights by ball source
+CONFIDENCE_WEIGHTS = {
+    "yolo": 1.0,
+    "hough_candidate": 0.7,
+    "kalman_prediction": 0.4,
+    "unknown": 0.5,
+}
+
+# Ball carrier distance thresholds by source (metres)
+CARRIER_DISTANCE_THRESHOLDS = {
+    "yolo": 3.0,
+    "hough_candidate": 5.0,
+    "kalman_prediction": 7.0,
+    "unknown": 5.0,
+}
 
 
 def _base_job_id(job_id):
@@ -117,33 +133,43 @@ def compute_possession_frames(
     ball_world,         # type: Dict[int, Tuple[float, float]]
     player_world,       # type: Dict[int, List[Dict[str, Any]]]
     team_map,           # type: Dict[int, int]
+    ball_source=None,   # type: Optional[Dict[int, str]]
 ):
     # type: (...) -> Tuple[Dict[int, int], int]
     """
-    Determine ball carrier per frame with 3-frame consecutive rule.
+    Determine ball carrier per frame with 1-frame consecutive rule.
+    Uses source-aware distance thresholds for ball confidence.
 
     Returns:
         carrier_by_frame: {frame: trackId} (only confirmed carriers)
         contested_count: number of contested frames
     """
-    # First pass: find closest player within CARRIER_RADIUS_M at each frame
+    if ball_source is None:
+        ball_source = {}
+
+    # First pass: find closest player within source-aware threshold at each frame
     raw_closest = {}  # type: Dict[int, int]
     for fi in common_frames:
         bx, by = ball_world[fi]
         players = player_world.get(fi, [])
         best_tid = -1
         best_dist = float("inf")
+
+        # Get source and corresponding distance threshold for this frame
+        source = ball_source.get(fi, "unknown")
+        threshold = CARRIER_DISTANCE_THRESHOLDS.get(source, 5.0)
+
         for p in players:
             dx = p["x"] - bx
             dy = p["y"] - by
             d = math.sqrt(dx * dx + dy * dy)
-            if d < CARRIER_RADIUS_M and d < best_dist:
+            if d < threshold and d < best_dist:
                 best_dist = d
                 best_tid = p["trackId"]
         if best_tid >= 0:
             raw_closest[fi] = best_tid
 
-    # Second pass: require 3 consecutive frames with same player
+    # Second pass: require 1 consecutive frames with same player
     carrier_by_frame = {}  # type: Dict[int, int]
     contested = 0
     streak_tid = -1
@@ -260,6 +286,7 @@ def compute_pass_network(job_id):
     # Ball world positions — read from pitch_map ball entry (trackId==-1)
     ball_trajectory = track_data.get("ball_trajectory", [])
     ball_world = {}  # type: Dict[int, Tuple[float, float]]
+    ball_source = {}  # type: Dict[int, str]
 
     # Prefer world coords from pitch_map (already homography-transformed)
     if pitch_data is not None:
@@ -268,6 +295,7 @@ def compute_pass_network(job_id):
                 for pt in player.get("trajectory2d", []):
                     fi = int(pt["frameIndex"])
                     ball_world[fi] = (float(pt["x"]), float(pt["y"]))
+                    ball_source[fi] = pt.get("source", "unknown")
                 break
 
     # Fall back to pixel conversion only if no ball in pitch_map
@@ -287,12 +315,34 @@ def compute_pass_network(job_id):
             "ball_data_quality": ball_quality,
         }
 
+    # Add ball interpolation across gaps up to 15 frames
+    existing_frames = sorted(ball_world.keys())
+    interpolated = dict(ball_world)
+    interpolated_flags = {}  # type: Dict[int, bool]
+    
+    for i in range(len(existing_frames) - 1):
+        f1, f2 = existing_frames[i], existing_frames[i + 1]
+        gap = f2 - f1
+        if 1 < gap <= 15:  # interpolate gaps up to 15 frames
+            x1, y1 = ball_world[f1]
+            x2, y2 = ball_world[f2]
+            for j in range(1, gap):
+                t = j / gap
+                interpolated[f1 + j] = (
+                    x1 + t * (x2 - x1),
+                    y1 + t * (y2 - y1)
+                )
+                interpolated_flags[f1 + j] = True
+
+    # Use interpolated positions as ball source
+    ball_world = interpolated
+
     # Frames where we have both ball and player data
     common_frames = sorted(set(ball_world.keys()) & set(player_world.keys()))
 
     # Compute possession
     carrier_by_frame, contested_count = compute_possession_frames(
-        common_frames, ball_world, player_world, team_map
+        common_frames, ball_world, player_world, team_map, ball_source
     )
 
     # Detect pass events
@@ -359,6 +409,7 @@ def compute_pass_network(job_id):
                             "frame": next_fi,
                             "distance_m": pass_dist,
                             "x_advance": to_player_pos[0] - from_player_pos[0],
+                            "confidence": "interpolated" if interpolated_flags.get(next_fi, False) else "confirmed",
                         })
 
             i = run_end + 1
