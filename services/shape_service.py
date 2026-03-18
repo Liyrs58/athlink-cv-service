@@ -3,6 +3,38 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+def _safe_shape_fallback():
+    """
+    Return a safe fallback dict when shape computation fails.
+    All numeric fields are None, ensures no type errors downstream.
+    """
+    return {
+        "frames_analysed": 0,
+        "team_0": {
+            "avg_width_metres": None,
+            "avg_depth_metres": None,
+            "avg_compactness_metres": None,
+            "min_width_metres": None,
+            "max_width_metres": None,
+        },
+        "team_1": {
+            "avg_width_metres": None,
+            "avg_depth_metres": None,
+            "avg_compactness_metres": None,
+            "min_width_metres": None,
+            "max_width_metres": None,
+        },
+        "combined_width_metres": None,
+        "min_combined_width_metres": None,
+        "max_combined_width_metres": None,
+        "avg_width_metres": None,
+        "avg_depth_metres": None,
+        "avg_compactness_metres": None,
+        "min_width_metres": None,
+        "max_width_metres": None,
+        "data_quality": "unavailable",
+    }
+
 def get_centre(bbox):
     return ((bbox[0] + bbox[2]) / 2.0, (bbox[1] + bbox[3]) / 2.0)
 
@@ -10,10 +42,22 @@ def compute_team_shape(tracks, frame_idx):
     """
     Computes team shape metrics for a given frame.
     Returns width, depth, compactness, centroid per team.
+
+    Handles both list of tracks and dict with 'tracks' key.
     """
+    # Defensive: handle both list and dict inputs
+    if isinstance(tracks, dict):
+        tracks_list = tracks.get("tracks", [])
+    else:
+        tracks_list = tracks if isinstance(tracks, list) else []
+
+    if not tracks_list:
+        return None
+
     active = [
-        t for t in tracks
-        if (t.get("firstSeen", 0) <= frame_idx <= t.get("lastSeen", 0) and
+        t for t in tracks_list
+        if (isinstance(t, dict) and
+            t.get("firstSeen", 0) <= frame_idx <= t.get("lastSeen", 0) and
             not t.get("is_staff", False))  # Filter out staff tracks
     ]
     if len(active) < 4:
@@ -102,96 +146,94 @@ def compute_team_shape(tracks, frame_idx):
     }
 
 def compute_shape_summary(tracks, frame_metadata):
-    """Compute average shape metrics across all valid frames."""
-    shapes = []
-    for meta in frame_metadata:
-        frame_idx = meta.get("frameIndex", 0)
-        shape = compute_team_shape(tracks, frame_idx)
-        if shape:
-            shapes.append(shape)
+    """
+    Compute average shape metrics across all valid frames.
 
-    if not shapes:
-        # Return complete dict with None values instead of empty dict
-        logger.warning("No valid shape data available for any frame (all geometry invalid)")
-        return {
-            "frames_analysed": 0,
+    Handles any exception gracefully and returns safe fallback dict.
+    Never crashes the pipeline due to shape data issues.
+    """
+    try:
+        # Defensive: handle both list and dict inputs
+        if isinstance(tracks, dict):
+            tracks_list = tracks.get("tracks", [])
+        else:
+            tracks_list = tracks if isinstance(tracks, list) else []
+
+        if not tracks_list or not frame_metadata:
+            logger.warning("No tracks or frame_metadata provided to compute_shape_summary")
+            return _safe_shape_fallback()
+
+        shapes = []
+        for meta in frame_metadata:
+            if not isinstance(meta, dict):
+                continue
+            frame_idx = meta.get("frameIndex", 0)
+            shape = compute_team_shape(tracks_list, frame_idx)
+            if shape:
+                shapes.append(shape)
+
+        if not shapes:
+            # Return complete dict with None values instead of empty dict
+            logger.warning("No valid shape data available for any frame (all geometry invalid)")
+            return _safe_shape_fallback()
+
+        # Collect metrics for each team separately (filtering out None values)
+        team_0_widths = [s["team_0"]["width_metres"] for s in shapes if s["team_0"] and s["team_0"]["width_metres"] is not None]
+        team_1_widths = [s["team_1"]["width_metres"] for s in shapes if s["team_1"] and s["team_1"]["width_metres"] is not None]
+        team_0_depths = [s["team_0"]["depth_metres"] for s in shapes if s["team_0"] and s["team_0"]["depth_metres"] is not None]
+        team_1_depths = [s["team_1"]["depth_metres"] for s in shapes if s["team_1"] and s["team_1"]["depth_metres"] is not None]
+        team_0_compactness = [s["team_0"]["compactness_metres"] for s in shapes if s["team_0"] and s["team_0"]["compactness_metres"] is not None]
+        team_1_compactness = [s["team_1"]["compactness_metres"] for s in shapes if s["team_1"] and s["team_1"]["compactness_metres"] is not None]
+        combined_widths = [s["combined_width_metres"] for s in shapes if s["combined_width_metres"]]
+
+        def safe_avg(values):
+            """Return average if values exist, else return 'data unavailable'"""
+            return round(sum(values) / len(values), 1) if values else "data unavailable"
+
+        def safe_min(values):
+            """Return min if values exist, else return 'data unavailable'"""
+            return round(min(values), 1) if values else "data unavailable"
+
+        def safe_max(values):
+            """Return max if values exist, else return 'data unavailable'"""
+            return round(max(values), 1) if values else "data unavailable"
+
+        result = {
+            "frames_analysed": len(shapes),
+            # Per-team metrics
             "team_0": {
-                "avg_width_metres": None,
-                "avg_depth_metres": None,
-                "avg_compactness_metres": None,
-                "min_width_metres": None,
-                "max_width_metres": None,
+                "avg_width_metres": safe_avg(team_0_widths),
+                "avg_depth_metres": safe_avg(team_0_depths),
+                "avg_compactness_metres": safe_avg(team_0_compactness),
+                "min_width_metres": safe_min(team_0_widths),
+                "max_width_metres": safe_max(team_0_widths),
             },
             "team_1": {
-                "avg_width_metres": None,
-                "avg_depth_metres": None,
-                "avg_compactness_metres": None,
-                "min_width_metres": None,
-                "max_width_metres": None,
+                "avg_width_metres": safe_avg(team_1_widths),
+                "avg_depth_metres": safe_avg(team_1_depths),
+                "avg_compactness_metres": safe_avg(team_1_compactness),
+                "min_width_metres": safe_min(team_1_widths),
+                "max_width_metres": safe_max(team_1_widths),
             },
-            "combined_width_metres": None,
-            "min_combined_width_metres": None,
-            "max_combined_width_metres": None,
-            "avg_width_metres": None,
-            "avg_depth_metres": None,
-            "avg_compactness_metres": None,
-            "min_width_metres": None,
-            "max_width_metres": None,
+            # Combined spread (how wide the game is overall)
+            "combined_width_metres": safe_avg(combined_widths),
+            "min_combined_width_metres": safe_min(combined_widths),
+            "max_combined_width_metres": safe_max(combined_widths),
         }
 
-    # Collect metrics for each team separately (filtering out None values)
-    team_0_widths = [s["team_0"]["width_metres"] for s in shapes if s["team_0"] and s["team_0"]["width_metres"] is not None]
-    team_1_widths = [s["team_1"]["width_metres"] for s in shapes if s["team_1"] and s["team_1"]["width_metres"] is not None]
-    team_0_depths = [s["team_0"]["depth_metres"] for s in shapes if s["team_0"] and s["team_0"]["depth_metres"] is not None]
-    team_1_depths = [s["team_1"]["depth_metres"] for s in shapes if s["team_1"] and s["team_1"]["depth_metres"] is not None]
-    team_0_compactness = [s["team_0"]["compactness_metres"] for s in shapes if s["team_0"] and s["team_0"]["compactness_metres"] is not None]
-    team_1_compactness = [s["team_1"]["compactness_metres"] for s in shapes if s["team_1"] and s["team_1"]["compactness_metres"] is not None]
-    combined_widths = [s["combined_width_metres"] for s in shapes if s["combined_width_metres"]]
+        # Legacy fields for backward compatibility
+        result["avg_width_metres"] = result["combined_width_metres"]
+        result["avg_depth_metres"] = safe_avg(team_0_depths + team_1_depths)
+        result["avg_compactness_metres"] = safe_avg(team_0_compactness + team_1_compactness)
+        result["min_width_metres"] = result["min_combined_width_metres"]
+        result["max_width_metres"] = result["max_combined_width_metres"]
 
-    def safe_avg(values):
-        """Return average if values exist, else return 'data unavailable'"""
-        return round(sum(values) / len(values), 1) if values else "data unavailable"
+        # Log if width data is unavailable
+        if result["avg_width_metres"] == "data unavailable":
+            logger.warning("Shape data unavailable for this clip (geometry values out of physical limits)")
 
-    def safe_min(values):
-        """Return min if values exist, else return 'data unavailable'"""
-        return round(min(values), 1) if values else "data unavailable"
+        return result
 
-    def safe_max(values):
-        """Return max if values exist, else return 'data unavailable'"""
-        return round(max(values), 1) if values else "data unavailable"
-
-    result = {
-        "frames_analysed": len(shapes),
-        # Per-team metrics
-        "team_0": {
-            "avg_width_metres": safe_avg(team_0_widths),
-            "avg_depth_metres": safe_avg(team_0_depths),
-            "avg_compactness_metres": safe_avg(team_0_compactness),
-            "min_width_metres": safe_min(team_0_widths),
-            "max_width_metres": safe_max(team_0_widths),
-        },
-        "team_1": {
-            "avg_width_metres": safe_avg(team_1_widths),
-            "avg_depth_metres": safe_avg(team_1_depths),
-            "avg_compactness_metres": safe_avg(team_1_compactness),
-            "min_width_metres": safe_min(team_1_widths),
-            "max_width_metres": safe_max(team_1_widths),
-        },
-        # Combined spread (how wide the game is overall)
-        "combined_width_metres": safe_avg(combined_widths),
-        "min_combined_width_metres": safe_min(combined_widths),
-        "max_combined_width_metres": safe_max(combined_widths),
-    }
-
-    # Legacy fields for backward compatibility
-    result["avg_width_metres"] = result["combined_width_metres"]
-    result["avg_depth_metres"] = safe_avg(team_0_depths + team_1_depths)
-    result["avg_compactness_metres"] = safe_avg(team_0_compactness + team_1_compactness)
-    result["min_width_metres"] = result["min_combined_width_metres"]
-    result["max_width_metres"] = result["max_combined_width_metres"]
-
-    # Log if width data is unavailable
-    if result["avg_width_metres"] == "data unavailable":
-        logger.warning("Shape data unavailable for this clip (geometry values out of physical limits)")
-
-    return result
+    except Exception as e:
+        logger.error(f"Exception in compute_shape_summary: {type(e).__name__}: {e}", exc_info=True)
+        return _safe_shape_fallback()
