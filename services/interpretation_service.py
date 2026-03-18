@@ -194,7 +194,7 @@ def build_rich_context(events, tracks, vel_summary, shape_summary, velocities, j
     return "\n".join(lines)
 
 
-def interpret_events(events, tracks, job_id, velocity_summary=None, shape_summary=None, velocities=None, memory=None, team_separation=None, data_confidence=None, brain_summary=None):
+def interpret_events(events, tracks, job_id, velocity_summary=None, shape_summary=None, velocities=None, memory=None, team_separation=None, data_confidence=None, brain_summary=None, voronoi=None, entropy=None):
     if not events:
         return [{"job_id": job_id, "analysis": "No events to analyse.", "events": []}]
 
@@ -227,6 +227,37 @@ def interpret_events(events, tracks, job_id, velocity_summary=None, shape_summar
             "",
         ])
         prompt = brain_prefix + prompt
+
+    # Space control and tactical organisation context
+    if voronoi or entropy:
+        space_lines = []
+        if voronoi and voronoi.get("status") == "ok":
+            space_lines += [
+                "=== SPACE CONTROL ===",
+                f"Team 0 Voronoi control: {voronoi.get('team_0_control_pct')}%",
+                f"Team 1 Voronoi control: {voronoi.get('team_1_control_pct')}%",
+                f"Dominant team by space: {voronoi.get('dominant_team')}",
+            ]
+        if entropy and entropy.get("status") == "ok":
+            t0 = entropy.get("team_0", {})
+            t1 = entropy.get("team_1", {})
+            space_lines += [
+                "",
+                "=== TACTICAL ORGANISATION ===",
+                f"Team 0 entropy: {t0.get('avg_entropy')} — {t0.get('interpretation')}",
+                f"Team 1 entropy: {t1.get('avg_entropy')} — {t1.get('interpretation')}",
+                f"Shape collapse events: {len(entropy.get('shape_collapse_events', []))}",
+            ]
+        space_lines += [
+            "=== END SPACE & ORGANISATION ===",
+            "",
+            "INSTRUCTION: Use space control and entropy data to make "
+            "stronger tactical claims. A team with >55% Voronoi control "
+            "dominated space. Rising entropy = team losing shape. Include "
+            "these insights naturally in the coaching report.",
+            "",
+        ]
+        prompt = "\n".join(space_lines) + prompt
 
     if memory:
         prompt += f"\n\n=== HISTORICAL CONTEXT ===\n{memory}\n\nIMPORTANT: This is historical data from previous matches. Reference it as 'across previous matches' and do not mix it with current match conclusions unless explicitly comparing."

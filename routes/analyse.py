@@ -19,6 +19,8 @@ from services.confidence_service import (
 )
 from services.job_queue_service import create_job, submit_job
 from services.observer_brain import ObserverBrain
+from services.voronoi_service import compute_voronoi_control
+from services.entropy_service import compute_team_entropy
 
 router = APIRouter()
 
@@ -85,6 +87,9 @@ def _run_analysis_pipeline(job_id: str, temp_path: str, skip_cleanup: bool = Fal
         vel_summary = get_team_velocity_summary(velocities) or {}
         shape_summary = compute_shape_summary(tracks, frame_metadata, calibration=calibration) or {}
 
+        voronoi = compute_voronoi_control(tracks, frame_metadata, calibration)
+        entropy = compute_team_entropy(tracks, frame_metadata, calibration)
+
         # Part 1+4: Build confidence summary
         data_confidence = build_data_confidence_summary(tracks, vel_summary, shape_summary)
 
@@ -98,6 +103,8 @@ def _run_analysis_pipeline(job_id: str, temp_path: str, skip_cleanup: bool = Fal
             velocities, memory, team_separation=team_sep,
             data_confidence=data_confidence,
             brain_summary=brain_summary,
+            voronoi=voronoi,
+            entropy=entropy,
         )
         analysis_text = analysis[0]["analysis"] if analysis else ""
         store_match(job_id, {"total_tracks": len(tracks)}, {"events": events}, vel_summary, shape_summary, analysis_text)
@@ -194,6 +201,20 @@ def _run_analysis_pipeline(job_id: str, temp_path: str, skip_cleanup: bool = Fal
                 "fragments_merged": tracks_before_merge - tracks_after_merge,
             },
             "corrections_applied": corrections_applied,
+            "voronoi": {
+                "status": voronoi.get("status"),
+                "team_0_control_pct": voronoi.get("team_0_control_pct"),
+                "team_1_control_pct": voronoi.get("team_1_control_pct"),
+                "dominant_team": voronoi.get("dominant_team"),
+                "control_margin": voronoi.get("control_margin"),
+                "frames_analysed": voronoi.get("frames_analysed"),
+            },
+            "entropy": {
+                "status": entropy.get("status"),
+                "team_0": entropy.get("team_0", {}),
+                "team_1": entropy.get("team_1", {}),
+                "shape_collapse_events": entropy.get("shape_collapse_events", []),
+            },
             "brain": {
                 "verdict": brain_summary.get("brain_verdict", ""),
                 "tracking_health": brain_summary.get("tracking_health", {}),
