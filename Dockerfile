@@ -2,24 +2,25 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-RUN apt-get update && apt-get install -y \
+# System deps for opencv-python-headless
+# libgl1 replaces libgl1-mesa-glx in Debian bookworm
+RUN apt-get update && apt-get install -y --no-install-recommends \
     libglib2.0-0 \
     libsm6 \
     libxext6 \
-    libxrender-dev \
+    libxrender1 \
     libgomp1 \
-    libgl1-mesa-glx \
+    libgl1 \
     ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
-
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-RUN mkdir -p /app/temp /app/memory/matches /app/static
+RUN mkdir -p /app/temp /app/memory/matches /app/static && \
+    chmod +x /app/entrypoint.sh
 
-ENTRYPOINT []
-CMD uvicorn main:app --host 0.0.0.0 --port $PORT
+ENTRYPOINT ["/app/entrypoint.sh"]
