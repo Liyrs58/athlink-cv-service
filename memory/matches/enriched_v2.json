@@ -1,0 +1,86 @@
+{
+  "job_id": "enriched_v2",
+  "timestamp": "2026-03-17T17:16:30.603413",
+  "tracking": {
+    "total_tracks": 102
+  },
+  "situations": {
+    "events": [
+      {
+        "situation": "OPEN_PLAY",
+        "start_frame": 0,
+        "end_frame": 240,
+        "start_time": 0.0,
+        "end_time": 9.6,
+        "duration_seconds": 9.6
+      },
+      {
+        "situation": "OPEN_PLAY",
+        "start_frame": 246,
+        "end_frame": 400,
+        "start_time": 9.84,
+        "end_time": 16.0,
+        "duration_seconds": 6.16
+      },
+      {
+        "situation": "DEAD_BALL",
+        "start_frame": 405,
+        "end_frame": 454,
+        "start_time": 16.2,
+        "end_time": 18.16,
+        "duration_seconds": 1.96
+      },
+      {
+        "situation": "OPEN_PLAY",
+        "start_frame": 454,
+        "end_frame": 550,
+        "start_time": 18.16,
+        "end_time": 22.0,
+        "duration_seconds": 3.84
+      },
+      {
+        "situation": "OPEN_PLAY",
+        "start_frame": 566,
+        "end_frame": 600,
+        "start_time": 22.64,
+        "end_time": 24.0,
+        "duration_seconds": 1.36
+      },
+      {
+        "situation": "DEAD_BALL",
+        "start_frame": 600,
+        "end_frame": 782,
+        "start_time": 24.0,
+        "end_time": 31.28,
+        "duration_seconds": 7.28
+      },
+      {
+        "situation": "OPEN_PLAY",
+        "start_frame": 782,
+        "end_frame": 952,
+        "start_time": 31.28,
+        "end_time": 38.08,
+        "duration_seconds": 6.8
+      }
+    ]
+  },
+  "physical": {
+    "total_distance_metres": 620.0,
+    "total_sprints": 144,
+    "max_speed_ms": 12.0,
+    "max_speed_kmh": 43.2,
+    "players_analysed": 54,
+    "top_sprinter_id": 2903,
+    "top_runner_id": 15,
+    "top_runner_distance": 56.9
+  },
+  "shape": {
+    "avg_width_metres": 88.6,
+    "avg_depth_metres": 29.3,
+    "avg_compactness_metres": 25.8,
+    "min_width_metres": 17.9,
+    "max_width_metres": 116.6,
+    "frames_analysed": 500
+  },
+  "analysis": "## ELITE MATCH ANALYSIS - CLIP enriched_v2\n\n**1. EXECUTIVE SUMMARY**\nThis 38.1s sequence reveals a chaotic defensive structure with width variance of 98.7m indicating complete tactical breakdown. Physical intensity peaked with Player 2903 recording 13 sprints despite covering only 21.7m, suggesting reactive rather than systematic movement. The team operated at 130% of pitch width (88.6m vs 68m pitch), demonstrating fundamental positional indiscipline.\n\n**2. TACTICAL PATTERN**\nSystem undetectable - structural variance of 98.7m indicates no coherent formation. Width fluctuating from 17.9m to 116.6m suggests players operating independently without tactical framework.\n\n**3. PHYSICAL INTENSITY RATING: 7/10**\n144 total sprints across 54 players (2.7 per player) in 38.1s indicates high-tempo engagement. However, low average distance per player (11.5m) suggests inefficient movement patterns - high effort, poor coordination.\n\n**4. SHAPE ANALYSIS**\nCritical structural failure: 25.8m average distance from centroid with 98.7m variance. The 17.9-116.6m width range indicates players either bunching catastrophically or abandoning positions entirely during transitions.\n\n**5. MOMENTUM ANALYSIS**\nGame fragmented with 5 open play phases averaging just 5.6s each. Two dead ball periods (2.0s at 16.2s, 7.3s at 24.0s) suggest discipline issues or tactical fouls disrupting rhythm.\n\n**6. PLAYER FLAGS**\n**Positive:** Player 15 (56.9m distance - exceptional work rate), Player 1150 (42.7km/h max speed with 12 sprints)\n**Negative:** Player 2903 (13 sprints but only 21.7m total - inefficient positioning)\n\n**7. THREE SPECIFIC RECOMMENDATIONS**\n- Implement width discipline training: 88.6m average width must reduce to 45-50m maximum\n- Address Player 2903's positioning: 13 sprints covering 21.7m indicates panic defending\n- Improve phase sustainability: 5.6s average open play phases too short for tactical development\n\n**8. QUESTIONS FOR COACH**\nWas this a set-piece defensive situation explaining the extreme width variance? What tactical instruction caused players to spread beyond pitch boundaries (130% width)?"
+}

@@ -1,0 +1,82 @@
+import json
+import os
+from datetime import datetime
+from pathlib import Path
+
+MEMORY_DIR = Path("memory")
+MEMORY_DIR.mkdir(exist_ok=True)
+(MEMORY_DIR / "matches").mkdir(exist_ok=True)
+(MEMORY_DIR / "teams").mkdir(exist_ok=True)
+(MEMORY_DIR / "patterns").mkdir(exist_ok=True)
+
+def store_match(job_id, tracking, situations, physical, shape, analysis):
+    """Store complete match analysis to memory."""
+    match_data = {
+        "job_id": job_id,
+        "timestamp": datetime.now().isoformat(),
+        "tracking": tracking,
+        "situations": situations,
+        "physical": physical,
+        "shape": shape,
+        "analysis": analysis,
+    }
+    path = MEMORY_DIR / "matches" / f"{job_id}.json"
+    with open(path, "w") as f:
+        json.dump(match_data, f, indent=2)
+    return path
+
+def get_historical_context(limit=5):
+    """Read last N matches and build context string for Claude."""
+    matches_dir = MEMORY_DIR / "matches"
+    files = sorted(matches_dir.glob("*.json"), key=os.path.getmtime, reverse=True)[:limit]
+
+    if not files:
+        return None
+
+    history = []
+    for f in files:
+        with open(f) as fp:
+            m = json.load(fp)
+        physical = m.get("physical", {})
+        shape = m.get("shape", {})
+        history.append(
+            f"Match {m['job_id']} ({m['timestamp'][:10]}): "
+            f"width={shape.get('avg_width_metres')}m, "
+            f"sprints={physical.get('total_sprints')}, "
+            f"max_speed={physical.get('max_speed_kmh')}km/h"
+        )
+
+    return "Previous matches:\n" + "\n".join(history)
+
+def get_match_count():
+    return len(list((MEMORY_DIR / "matches").glob("*.json")))
+
+def get_trend_analysis():
+    """Analyse trends across all stored matches."""
+    matches_dir = MEMORY_DIR / "matches"
+    files = sorted(matches_dir.glob("*.json"), key=os.path.getmtime)
+
+    if len(files) < 2:
+        return None
+
+    widths = []
+    sprints = []
+    for f in files:
+        with open(f) as fp:
+            m = json.load(fp)
+        shape = m.get("shape", {})
+        physical = m.get("physical", {})
+        if shape.get("avg_width_metres"):
+            widths.append(shape["avg_width_metres"])
+        if physical.get("total_sprints"):
+            sprints.append(physical["total_sprints"])
+
+    trends = {}
+    if len(widths) >= 2:
+        trend = "increasing" if widths[-1] > widths[0] else "decreasing"
+        trends["width_trend"] = f"{trend} ({widths[0]}m -> {widths[-1]}m)"
+    if len(sprints) >= 2:
+        trend = "increasing" if sprints[-1] > sprints[0] else "decreasing"
+        trends["sprint_trend"] = f"{trend} ({sprints[0]} -> {sprints[-1]})"
+
+    return trends

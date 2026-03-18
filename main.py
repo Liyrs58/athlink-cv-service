@@ -2,6 +2,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from routes.health import router as health_router
 from routes.analyze import router as analyze_router
+from routes.analyse import router as analyse_router
 from routes.video import router as video_router
 from routes.frames import router as frames_router
 from routes import detect
@@ -78,6 +79,7 @@ app.add_middleware(
 # Include routers
 app.include_router(health_router, prefix="/api/v1", tags=["health"])
 app.include_router(analyze_router, prefix="/api/v1", tags=["analysis"])
+app.include_router(analyse_router, prefix="/api/v1", tags=["analysis"])
 app.include_router(video_router, prefix="/api/v1", tags=["video"])
 app.include_router(frames_router, prefix="/api/v1", tags=["frames"])
 app.include_router(detect.router, prefix="/api/v1/detect", tags=["detect"])

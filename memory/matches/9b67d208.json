@@ -1,0 +1,86 @@
+{
+  "job_id": "9b67d208",
+  "timestamp": "2026-03-17T23:46:00.779882",
+  "tracking": {
+    "total_tracks": 103
+  },
+  "situations": {
+    "events": [
+      {
+        "situation": "OPEN_PLAY",
+        "start_frame": 0,
+        "end_frame": 240,
+        "start_time": 0.0,
+        "end_time": 9.6,
+        "duration_seconds": 9.6
+      },
+      {
+        "situation": "OPEN_PLAY",
+        "start_frame": 246,
+        "end_frame": 400,
+        "start_time": 9.84,
+        "end_time": 16.0,
+        "duration_seconds": 6.16
+      },
+      {
+        "situation": "DEAD_BALL",
+        "start_frame": 405,
+        "end_frame": 454,
+        "start_time": 16.2,
+        "end_time": 18.16,
+        "duration_seconds": 1.96
+      },
+      {
+        "situation": "OPEN_PLAY",
+        "start_frame": 454,
+        "end_frame": 550,
+        "start_time": 18.16,
+        "end_time": 22.0,
+        "duration_seconds": 3.84
+      },
+      {
+        "situation": "OPEN_PLAY",
+        "start_frame": 566,
+        "end_frame": 600,
+        "start_time": 22.64,
+        "end_time": 24.0,
+        "duration_seconds": 1.36
+      },
+      {
+        "situation": "DEAD_BALL",
+        "start_frame": 600,
+        "end_frame": 782,
+        "start_time": 24.0,
+        "end_time": 31.28,
+        "duration_seconds": 7.28
+      },
+      {
+        "situation": "OPEN_PLAY",
+        "start_frame": 782,
+        "end_frame": 998,
+        "start_time": 31.28,
+        "end_time": 39.92,
+        "duration_seconds": 8.64
+      }
+    ]
+  },
+  "physical": {
+    "total_distance_metres": 679.7,
+    "total_sprints": 159,
+    "max_speed_ms": 12.0,
+    "max_speed_kmh": 43.2,
+    "players_analysed": 55,
+    "top_sprinter_id": 2897,
+    "top_runner_id": 15,
+    "top_runner_distance": 56.9
+  },
+  "shape": {
+    "avg_width_metres": 87.8,
+    "avg_depth_metres": 29.3,
+    "avg_compactness_metres": 25.8,
+    "min_width_metres": 17.9,
+    "max_width_metres": 116.6,
+    "frames_analysed": 526
+  },
+  "analysis": "## MATCH ANALYSIS: 9b67d208\n\n### 1. EXECUTIVE SUMMARY\nThis 39.9-second clip reveals tactical indiscipline with width variance of 98.7m indicating poor positional structure. Sprint intensity is exceptional at 159 total sprints (2.9 per player), but the 129% pitch width suggests defensive vulnerability. Player 2897's dominance (19 sprints, 43.2km/h) contrasts sharply with significant passenger elements in the squad.\n\n### 2. TACTICAL PATTERN\nUndetectable formation - the 98.7m width variance and 17.9m-116.6m range indicates structural breakdown or transition chaos rather than organized tactical shape.\n\n### 3. PHYSICAL INTENSITY RATING\n**8/10** - 159 sprints in 39.9s equals 4.0 sprints per second of play. Max speed of 43.2km/h maintained consistently across historical matches shows peak athletic output.\n\n### 4. SHAPE ANALYSIS\nCritical structural failure: 129% pitch width (87.8m vs 68m pitch) creates massive gaps. The 25.8m average distance from centroid with 98.7m variance indicates players operating in isolation rather than coordinated units.\n\n### 5. MOMENTUM ANALYSIS\nGame fragmented after 18.2s with dead ball stopping 3.8s open play phase. The 7.3s stoppage (24.0s-31.3s) killed rhythm, evidenced by final 8.6s phase showing no sprint intensity recovery from top performers.\n\n### 6. PLAYER FLAGS\n**Positive:** Player 2897 (19 sprints, elite 43.2km/h), Player 1150 (16 sprints, 42.7km/h)\n**Negative:** 47 players averaging just 1.2 sprints each while top 5 carry 58 sprints (36% of total workload)\n\n### 7. SPECIFIC RECOMMENDATIONS\n1. **Address width discipline:** 129% pitch coverage creates 19.8m excess width - implement compactness triggers when width exceeds 75m\n2. **Load distribution:** Players 2897/1150 carrying 35 sprints while 47 others underperform - rotate high-intensity players at 20s intervals\n3. **Dead ball transitions:** 7.3s stoppage killed momentum - practice 3-second positioning resets\n\n### 8. QUESTIONS FOR COACH\n1. Was the 98.7m width variance intentional pressing trap or loss of tactical discipline?\n2. Why are 47 players passenger-level while 2 players sprint 35 times in 40 seconds?"
+}

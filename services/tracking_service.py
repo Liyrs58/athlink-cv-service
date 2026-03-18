@@ -14,6 +14,8 @@ CONFIDENCE_THRESHOLD = float(os.getenv("YOLO_CONF", "0.25"))
 IOU_THRESHOLD = float(os.getenv("YOLO_IOU", "0.45"))
 TARGET_CLASSES = [0]
 
+_pending_rescue_bboxes: list = []
+
 _model = None
 _device = None
 _use_half = False
@@ -271,12 +273,37 @@ class BallKalmanTracker:
         )
 
 
+def is_on_pitch(world_x, world_y,
+                 pitch_w=105.0, pitch_h=68.0,
+                 margin=5.0) -> bool:
+    """
+    Returns True if position is within pitch boundary.
+    margin=5.0 allows for players near touchline.
+    Returns False for bench, staff, subs.
+    """
+    return (-margin <= world_x <= pitch_w + margin and
+            -margin <= world_y <= pitch_h + margin)
+
+
+def pixel_to_world(bbox, frame_w, frame_h):
+    """Convert pixel coordinates to world coordinates (metres)."""
+    PIXELS_PER_METRE = 15.5
+    cx = (bbox[0] + bbox[2]) / 2.0
+    cy = (bbox[1] + bbox[3]) / 2.0
+    
+    # Simple scaling - assumes pitch fills frame reasonably well
+    world_x = (cx / frame_w) * 105.0
+    world_y = (cy / frame_h) * 68.0
+    
+    return world_x, world_y
+
+
 def run_tracking(
     video_path: str,
     job_id: str,
     frame_stride: int = 5,
     max_frames: Optional[int] = None,
-    max_track_age: int = 30,  # FIX 2: reduced from 50 to 30 frames for aggressive lifecycle
+    max_track_age: int = 90,  # Frames of inactivity before eviction (in processed frame count)
     adaptive_stride: bool = True,  # FIX 2: process every frame during fast pans
 ) -> Dict[str, Any]:
     """Run BoT-SORT object tracking on video frames with camera motion compensation."""
@@ -294,6 +321,7 @@ def run_tracking(
     # FIX 3: track quality counters (use list for mutable reference in nested scope)
     id_switches_counter = [0]  # [0] = total_id_switches
     last_rescue_frame = -10  # Track last rescue detection frame
+    next_rescue_id = [1000]  # [0] = next ID to allocate for rescue tracks (start at 1000 to avoid collision)
 
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -336,6 +364,18 @@ def run_tracking(
 
         # FIX 2: override stride if previous frame had fast camera motion
         if not force_next_frame and raw_frame_idx % frame_stride != 0:
+            # Feed skipped frames to BoT-SORT silently to keep Kalman state current
+            if prev_gray is not None and prev_gray.shape == detect_frame_gray.shape:
+                model.track(
+                    detect_frame,
+                    tracker="tracker_config/botsort_football.yaml",
+                    persist=True,
+                    verbose=False,
+                    conf=0.20,
+                    iou=0.40,
+                    classes=TARGET_CLASSES,
+                    half=_use_half,
+                )
             raw_frame_idx += 1
             continue
 
@@ -387,8 +427,7 @@ def run_tracking(
 
         # Mask broadcast overlay zones before detection
         detection_frame = frame.copy()
-        detection_frame[:int(frame_h_px * 0.10), :] = 0   # top 10% — scoreboard
-        detection_frame[int(frame_h_px * 0.92):, :] = 0   # bottom 8% — lower thirds
+        detection_frame[int(frame_h_px * 0.92):, :] = 0   # bottom 8% — lower thirds only
 
         # Downscale wide frames so YOLO can detect small players
         MAX_WIDTH = 1920
@@ -413,7 +452,7 @@ def run_tracking(
                 magnitude = np.sqrt(dx_cam ** 2 + dy_cam ** 2)
 
                 # FIX 2: adaptive stride — process next frame if pan is fast
-                if adaptive_stride and magnitude > 40.0:
+                if adaptive_stride and magnitude > 150.0:
                     force_next_frame = True
                     logger.info(
                         f"Frame {current_frame_idx}: fast pan detected "
@@ -459,6 +498,14 @@ def run_tracking(
         # FIX 3: BoT-SORT internal Kalman filters also benefit from tighter track lifecycle
         # The botsort_football.yaml config controls coasting frames (default ~30).
         # Combined with our aggressive MAX_TRACK_AGE=30, weak tracks are eliminated quickly.
+        if _pending_rescue_bboxes:
+            for pb in _pending_rescue_bboxes:
+                x1 = int(pb[0] * scale)
+                y1 = int(pb[1] * scale)
+                x2 = int(pb[2] * scale)
+                y2 = int(pb[3] * scale)
+                cv2.rectangle(detect_frame, (x1, y1), (x2, y2), (255, 255, 255), -1)
+            _pending_rescue_bboxes.clear()
         bt_results = model.track(
             detect_frame,
             tracker="tracker_config/botsort_football.yaml",
@@ -557,6 +604,8 @@ def run_tracking(
                         "_predicted_frames": 0,
                         "_id_switches": 0,
                         "_official_votes": 1 if is_official_detection else 0,
+                        "_first_processed_frame": processed_count,  # Track when first processed
+                        "_last_processed_frame": processed_count,
                     }
                     # FIX 1: Check if this is a ReID recovery from recently_lost
                     best_lost_tid = None
@@ -588,12 +637,15 @@ def run_tracking(
                         new_track["_confirmed_detections"] = old_track.get("_confirmed_detections", 0) + 1
                         new_track["_predicted_frames"] = old_track.get("_predicted_frames", 0)
                         new_track["_id_switches"] = old_track.get("_id_switches", 0) + 1
+                        new_track["_first_processed_frame"] = old_track.get("_first_processed_frame", processed_count)  # Preserve original
+                        new_track["_last_processed_frame"] = processed_count
                         id_switches_counter[0] += 1  # FIX 1: track total ID switches
                         track_id = best_lost_tid
                     active_tracks[track_id] = new_track
                 else:
                     active_tracks[track_id]["hits"] += 1
                     active_tracks[track_id]["lastSeen"] = current_frame_idx
+                    active_tracks[track_id]["_last_processed_frame"] = processed_count
                     active_tracks[track_id]["trajectory"].append(trajectory_entry)
                     active_tracks[track_id]["_confirmed_detections"] += 1
                     active_tracks[track_id]["_official_votes"] += 1 if is_official_detection else 0
@@ -635,12 +687,14 @@ def run_tracking(
                     r_cx = (r_bbox[0] + r_bbox[2]) / 2.0
                     r_cy = (r_bbox[1] + r_bbox[3]) / 2.0
                     already_tracked = False
+                    matched_tid = None
                     for fte in frame_track_entries:
                         e_bbox = fte["bbox"]
                         e_cx = (e_bbox[0] + e_bbox[2]) / 2.0
                         e_cy = (e_bbox[1] + e_bbox[3]) / 2.0
                         if ((r_cx - e_cx) ** 2 + (r_cy - e_cy) ** 2) ** 0.5 < 50.0:
                             already_tracked = True
+                            matched_tid = fte.get("trackId")
                             break
                     # Also check against camera-compensated predicted positions
                     if not already_tracked:
@@ -652,8 +706,13 @@ def run_tracking(
                             p_cy = (pred[1] + pred[3]) / 2.0
                             if ((r_cx - p_cx) ** 2 + (r_cy - p_cy) ** 2) ** 0.5 < 50.0:
                                 already_tracked = True
+                                matched_tid = _tid
                                 break
+                    if already_tracked and matched_tid is not None and matched_tid in active_tracks:
+                        # Update the existing track's _last_processed_frame to keep it alive
+                        active_tracks[matched_tid]["_last_processed_frame"] = processed_count
                     if not already_tracked:
+                        _pending_rescue_bboxes.append(r_bbox)
                         frame_track_entries.append({
                             "trackId": -1,
                             "bbox": r_bbox,
@@ -665,12 +724,12 @@ def run_tracking(
                 )
                 last_rescue_frame = current_frame_idx
 
-        # Move disappeared tracks to recently_lost (FIX 1: for ReID recovery)
-        disappeared = prev_active_ids - current_active_ids
-        for tid in disappeared:
-            if tid in active_tracks:
+        # Age out active tracks based on inactivity (processed frame count)
+        for tid in list(active_tracks.keys()):
+            track = active_tracks[tid]
+            inactivity = processed_count - track.get("_last_processed_frame", processed_count)
+            if inactivity > max_track_age:
                 track = active_tracks.pop(tid)
-                # Store Kalman prediction for ReID matching
                 if track["trajectory"]:
                     last_bbox = track["trajectory"][-1]["bbox"]
                     track["_kalman_pred"] = (
@@ -679,14 +738,50 @@ def run_tracking(
                     )
                 recently_lost[tid] = track
 
-        # Clean up recently_lost: remove tracks lost >30 frames ago
-        to_complete = []
-        for tid, track in recently_lost.items():
-            age = current_frame_idx - track["lastSeen"]
-            if age > 30 * frame_stride:
-                to_complete.append(tid)
+        to_complete = [
+            tid for tid, track in recently_lost.items()
+            if (processed_count - track.get("_last_processed_frame", 0)) > 30
+        ]
         for tid in to_complete:
             completed_tracks.append(recently_lost.pop(tid))
+
+        # --- Process rescue detections into actual tracks ---
+        # Rescue detections added to frame_track_entries with trackId=-1 need to be
+        # converted into real tracks in active_tracks
+        rescue_entries = [fte for fte in frame_track_entries if fte.get("trackId") == -1]
+        if rescue_entries:
+            logger.info(f"Frame {current_frame_idx}: processing {len(rescue_entries)} rescue entries into tracks")
+            for entry in rescue_entries:
+                r_bbox = entry["bbox"]
+                r_conf = entry["confidence"]
+
+                is_official = _is_potential_official(frame, r_bbox)
+                hist = _compute_histogram(frame, r_bbox)
+                trajectory_entry = {
+                    "frameIndex": current_frame_idx,
+                    "timestampSeconds": timestamp,
+                    "bbox": r_bbox,
+                    "confidence": r_conf,
+                }
+
+                new_id = next_rescue_id[0]
+                new_track = {
+                    "trackId": new_id,
+                    "hits": 1,
+                    "firstSeen": current_frame_idx,
+                    "lastSeen": current_frame_idx,
+                    "trajectory": [trajectory_entry],
+                    "_confirmed_detections": 1,
+                    "_predicted_frames": 0,
+                    "_id_switches": 0,
+                    "_official_votes": 1 if is_official else 0,
+                    "_first_processed_frame": processed_count,
+                    "_last_processed_frame": processed_count,
+                    "_histogram": hist,
+                }
+                active_tracks[new_id] = new_track
+                current_active_ids.add(new_id)
+                next_rescue_id[0] += 1
 
         prev_active_ids = current_active_ids
 
@@ -851,6 +946,7 @@ def run_tracking(
                 ti["trajectory"].extend(tj["trajectory"])
                 ti["hits"] += tj["hits"]
                 ti["lastSeen"] = max(ti["lastSeen"], tj["lastSeen"])
+                ti["_last_processed_frame"] = max(ti.get("_last_processed_frame", 0), tj.get("_last_processed_frame", 0))
                 merged_ids.add(j)
 
     all_tracks = [t for i, t in enumerate(all_tracks) if i not in merged_ids]
@@ -881,6 +977,7 @@ def run_tracking(
                 ti["trajectory"].extend(tj["trajectory"])
                 ti["hits"] += tj["hits"]
                 ti["lastSeen"] = max(ti["lastSeen"], tj["lastSeen"])
+                ti["_last_processed_frame"] = max(ti.get("_last_processed_frame", 0), tj.get("_last_processed_frame", 0))
                 reid_merged.add(j)
                 logger.info(
                     f"ReID merged track {tj['trackId']} into {ti['trackId']} "
@@ -904,7 +1001,7 @@ def run_tracking(
         t.pop("_histogram", None)
 
     # FIX 2: Minimum track length requirement — at least 5 confirmed detections
-    MIN_TRACK_DETECTIONS = 5
+    MIN_TRACK_DETECTIONS = 3
     filtered = [t for t in all_tracks if t["hits"] >= MIN_TRACK_DETECTIONS]
     if len(filtered) < 5:
         # Fallback: accept tracks with >= 2 hits
@@ -944,7 +1041,22 @@ def run_tracking(
         # FIX 3: Add quality metadata
         track["_predicted_frames"] = track.get("_predicted_frames", 0) + predicted_frames_count
 
-    # FIX 3: Compute tracking quality metrics and clean up internal fields
+    # FIX 1a: Filter staff/bench tracks based on pitch boundary presence
+    for track in filtered:
+        on_pitch_count = 0
+        total_detections = len(track["trajectory"])
+        
+        for entry in track["trajectory"]:
+            bbox = entry["bbox"]
+            world_x, world_y = pixel_to_world(bbox, frame_w_px, frame_h_px)
+            if is_on_pitch(world_x, world_y):
+                on_pitch_count += 1
+        
+        on_pitch_pct = (on_pitch_count / total_detections) if total_detections > 0 else 0.0
+        track["on_pitch_pct"] = round(on_pitch_pct, 2)
+        track["is_staff"] = on_pitch_pct < 0.3  # Less than 30% on pitch = staff/bench
+
+    # Clean up internal fields and compute quality metrics
     total_confirmed_detections = 0
     total_predicted_frames = 0
     stable_tracks = 0

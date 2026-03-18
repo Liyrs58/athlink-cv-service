@@ -1,0 +1,574 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ATHLINK CV - Elite Football Analytics</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+            background: linear-gradient(135deg, #0a0e27 0%, #1a1f3a 100%);
+            color: #ffffff;
+            min-height: 100vh;
+            line-height: 1.6;
+        }
+
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+
+        header {
+            padding: 30px 0;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+            margin-bottom: 40px;
+        }
+
+        .logo {
+            font-size: 28px;
+            font-weight: 700;
+            color: #00ff88;
+            letter-spacing: 2px;
+            margin-bottom: 8px;
+        }
+
+        .tagline {
+            font-size: 14px;
+            color: #8892b0;
+            letter-spacing: 1px;
+        }
+
+        .upload-section {
+            text-align: center;
+            padding: 60px 20px;
+            margin-bottom: 40px;
+        }
+
+        .upload-zone {
+            border: 2px dashed #00ff88;
+            border-radius: 12px;
+            padding: 60px 40px;
+            background: rgba(0, 255, 136, 0.05);
+            cursor: pointer;
+            transition: all 0.3s ease;
+            max-width: 600px;
+            margin: 0 auto;
+        }
+
+        .upload-zone:hover {
+            border-color: #00ffaa;
+            background: rgba(0, 255, 136, 0.1);
+            transform: translateY(-2px);
+        }
+
+        .upload-zone.dragover {
+            border-color: #00ffaa;
+            background: rgba(0, 255, 136, 0.15);
+        }
+
+        .upload-icon {
+            font-size: 48px;
+            margin-bottom: 20px;
+            color: #00ff88;
+        }
+
+        .upload-text {
+            font-size: 18px;
+            margin-bottom: 10px;
+            color: #ffffff;
+        }
+
+        .upload-subtext {
+            font-size: 14px;
+            color: #8892b0;
+        }
+
+        .file-info {
+            margin-top: 30px;
+            padding: 20px;
+            background: rgba(255, 255, 255, 0.05);
+            border-radius: 8px;
+            display: none;
+        }
+
+        .analyse-btn {
+            background: linear-gradient(135deg, #00ff88 0%, #00cc6a 100%);
+            color: #0a0e27;
+            border: none;
+            padding: 16px 40px;
+            font-size: 18px;
+            font-weight: 600;
+            border-radius: 8px;
+            cursor: pointer;
+            margin-top: 20px;
+            transition: all 0.3s ease;
+            display: none;
+        }
+
+        .analyse-btn:hover:not(:disabled) {
+            transform: translateY(-2px);
+            box-shadow: 0 8px 25px rgba(0, 255, 136, 0.3);
+        }
+
+        .analyse-btn:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+        }
+
+        .loading-section {
+            text-align: center;
+            padding: 60px 20px;
+            display: none;
+        }
+
+        .loading-spinner {
+            width: 60px;
+            height: 60px;
+            border: 3px solid rgba(0, 255, 136, 0.2);
+            border-top: 3px solid #00ff88;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+            margin: 0 auto 30px;
+        }
+
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+
+        .loading-status {
+            font-size: 18px;
+            color: #00ff88;
+            margin-bottom: 10px;
+            min-height: 30px;
+        }
+
+        .loading-progress {
+            font-size: 14px;
+            color: #8892b0;
+        }
+
+        .results-section {
+            display: none;
+        }
+
+        .cards-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+            gap: 20px;
+            margin-bottom: 40px;
+        }
+
+        .card {
+            background: rgba(255, 255, 255, 0.05);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            border-radius: 12px;
+            padding: 24px;
+            backdrop-filter: blur(10px);
+        }
+
+        .card-title {
+            font-size: 14px;
+            color: #8892b0;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            margin-bottom: 16px;
+            font-weight: 600;
+        }
+
+        .card-content {
+            font-size: 24px;
+            font-weight: 700;
+            color: #ffffff;
+            line-height: 1.4;
+        }
+
+        .card-subtitle {
+            font-size: 14px;
+            color: #8892b0;
+            margin-top: 8px;
+        }
+
+        .analysis-section {
+            background: rgba(255, 255, 255, 0.05);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            border-radius: 12px;
+            padding: 32px;
+            margin-bottom: 40px;
+        }
+
+        .analysis-title {
+            font-size: 18px;
+            color: #00ff88;
+            margin-bottom: 20px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+
+        .analysis-content {
+            font-size: 16px;
+            line-height: 1.8;
+            color: #ffffff;
+            white-space: pre-wrap;
+        }
+
+        .events-timeline {
+            max-height: 300px;
+            overflow-y: auto;
+        }
+
+        .event-item {
+            padding: 12px 0;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+        }
+
+        .event-item:last-child {
+            border-bottom: none;
+        }
+
+        .event-time {
+            font-size: 14px;
+            color: #00ff88;
+            font-weight: 600;
+        }
+
+        .event-situation {
+            font-size: 16px;
+            color: #ffffff;
+            margin-top: 4px;
+        }
+
+        .event-duration {
+            font-size: 12px;
+            color: #8892b0;
+            margin-top: 2px;
+        }
+
+        .error-section {
+            text-align: center;
+            padding: 60px 20px;
+            display: none;
+        }
+
+        .error-message {
+            background: rgba(255, 67, 67, 0.1);
+            border: 1px solid rgba(255, 67, 67, 0.3);
+            border-radius: 8px;
+            padding: 20px;
+            color: #ff4343;
+            max-width: 600px;
+            margin: 0 auto;
+        }
+
+        .metric-row {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 8px;
+        }
+
+        .metric-label {
+            color: #8892b0;
+            font-size: 14px;
+        }
+
+        .metric-value {
+            color: #ffffff;
+            font-weight: 600;
+            font-size: 14px;
+        }
+
+        input[type="file"] {
+            display: none;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <div class="logo">ATHLINK CV</div>
+            <div class="tagline">Elite Analysis. Any Match. 90 Seconds.</div>
+        </header>
+
+        <main>
+            <!-- Upload Section -->
+            <section class="upload-section" id="uploadSection">
+                <div class="upload-zone" id="uploadZone">
+                    <div class="upload-icon">📹</div>
+                    <div class="upload-text">Drop your match video here</div>
+                    <div class="upload-subtext">or click to browse (MP4, MOV, AVI supported)</div>
+                </div>
+                <input type="file" id="fileInput" accept="video/*">
+                
+                <div class="file-info" id="fileInfo">
+                    <div>📁 <span id="fileName"></span></div>
+                </div>
+                
+                <button class="analyse-btn" id="analyseBtn">Analyse Match</button>
+            </section>
+
+            <!-- Loading Section -->
+            <section class="loading-section" id="loadingSection">
+                <div class="loading-spinner"></div>
+                <div class="loading-status" id="loadingStatus">Initializing analysis...</div>
+                <div class="loading-progress" id="loadingProgress">This may take up to 90 seconds</div>
+            </section>
+
+            <!-- Results Section -->
+            <section class="results-section" id="resultsSection">
+                <div class="cards-grid">
+                    <!-- Tracking Card -->
+                    <div class="card">
+                        <div class="card-title">TRACKING</div>
+                        <div class="card-content">
+                            <div class="metric-row">
+                                <span class="metric-label">Total Players</span>
+                                <span class="metric-value" id="totalTracks">-</span>
+                            </div>
+                            <div class="metric-row">
+                                <span class="metric-label">Confirmed Tracks</span>
+                                <span class="metric-value" id="confirmedTracks">-</span>
+                            </div>
+                            <div class="metric-row">
+                                <span class="metric-label">Frames Processed</span>
+                                <span class="metric-value" id="framesProcessed">-</span>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Physical Card -->
+                    <div class="card">
+                        <div class="card-title">PHYSICAL</div>
+                        <div class="card-content">
+                            <div class="metric-row">
+                                <span class="metric-label">Total Sprints</span>
+                                <span class="metric-value" id="totalSprints">-</span>
+                            </div>
+                            <div class="metric-row">
+                                <span class="metric-label">Max Speed</span>
+                                <span class="metric-value" id="maxSpeed">-</span>
+                            </div>
+                            <div class="metric-row">
+                                <span class="metric-label">Total Distance</span>
+                                <span class="metric-value" id="totalDistance">-</span>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Team Shape Card -->
+                    <div class="card">
+                        <div class="card-title">TEAM SHAPE</div>
+                        <div class="card-content">
+                            <div class="metric-row">
+                                <span class="metric-label">Avg Width</span>
+                                <span class="metric-value" id="avgWidth">-</span>
+                            </div>
+                            <div class="metric-row">
+                                <span class="metric-label">Avg Depth</span>
+                                <span class="metric-value" id="avgDepth">-</span>
+                            </div>
+                            <div class="metric-row">
+                                <span class="metric-label">Compactness</span>
+                                <span class="metric-value" id="compactness">-</span>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Situations Card -->
+                    <div class="card">
+                        <div class="card-title">SITUATIONS</div>
+                        <div class="card-content">
+                            <div class="events-timeline" id="eventsTimeline">
+                                <div class="event-item">
+                                    <div class="event-time">No events detected</div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Analysis Section -->
+                <div class="analysis-section">
+                    <div class="analysis-title">AI ANALYSIS</div>
+                    <div class="analysis-content" id="analysisContent">
+                        Loading analysis...
+                    </div>
+                </div>
+            </section>
+
+            <!-- Error Section -->
+            <section class="error-section" id="errorSection">
+                <div class="error-message" id="errorMessage">
+                    An error occurred during analysis. Please try again.
+                </div>
+            </section>
+        </main>
+    </div>
+
+    <script>
+        const uploadZone = document.getElementById('uploadZone');
+        const fileInput = document.getElementById('fileInput');
+        const fileInfo = document.getElementById('fileInfo');
+        const fileName = document.getElementById('fileName');
+        const analyseBtn = document.getElementById('analyseBtn');
+        const uploadSection = document.getElementById('uploadSection');
+        const loadingSection = document.getElementById('loadingSection');
+        const resultsSection = document.getElementById('resultsSection');
+        const errorSection = document.getElementById('errorSection');
+        const loadingStatus = document.getElementById('loadingStatus');
+        const loadingProgress = document.getElementById('loadingProgress');
+
+        // Loading states
+        const loadingMessages = [
+            { status: "Tracking players...", progress: "Detecting all 22 players on the pitch" },
+            { status: "Analyzing movement...", progress: "Calculating sprints and physical metrics" },
+            { status: "Mapping team shape...", progress: "Measuring width, depth, and compactness" },
+            { status: "Generating AI report...", progress: "Creating tactical insights and recommendations" }
+        ];
+
+        let currentLoadingIndex = 0;
+        let loadingInterval;
+
+        // Upload handlers
+        uploadZone.addEventListener('click', () => fileInput.click());
+        
+        uploadZone.addEventListener('dragover', (e) => {
+            e.preventDefault();
+            uploadZone.classList.add('dragover');
+        });
+
+        uploadZone.addEventListener('dragleave', () => {
+            uploadZone.classList.remove('dragover');
+        });
+
+        uploadZone.addEventListener('drop', (e) => {
+            e.preventDefault();
+            uploadZone.classList.remove('dragover');
+            const files = e.dataTransfer.files;
+            if (files.length > 0) {
+                handleFileSelect(files[0]);
+            }
+        });
+
+        fileInput.addEventListener('change', (e) => {
+            if (e.target.files.length > 0) {
+                handleFileSelect(e.target.files[0]);
+            }
+        });
+
+        analyseBtn.addEventListener('click', startAnalysis);
+
+        function handleFileSelect(file) {
+            if (!file.type.startsWith('video/')) {
+                alert('Please select a video file');
+                return;
+            }
+
+            fileName.textContent = file.name;
+            fileInfo.style.display = 'block';
+            analyseBtn.style.display = 'inline-block';
+        }
+
+        function startAnalysis() {
+            const file = fileInput.files[0];
+            if (!file) return;
+
+            // Hide upload, show loading
+            uploadSection.style.display = 'none';
+            loadingSection.style.display = 'block';
+            resultsSection.style.display = 'none';
+            errorSection.style.display = 'none';
+
+            // Start loading animation
+            currentLoadingIndex = 0;
+            updateLoadingMessage();
+            loadingInterval = setInterval(updateLoadingMessage, 3000);
+
+            // Create FormData and send request
+            const formData = new FormData();
+            formData.append('video', file);
+
+            fetch('http://localhost:8005/api/v1/analyse', {
+                method: 'POST',
+                body: formData
+            })
+            .then(response => {
+                if (!response.ok) {
+                    throw new Error(`HTTP error! status: ${response.status}`);
+                }
+                return response.json();
+            })
+            .then(data => {
+                clearInterval(loadingInterval);
+                showResults(data);
+            })
+            .catch(error => {
+                clearInterval(loadingInterval);
+                showError(error.message);
+            });
+        }
+
+        function updateLoadingMessage() {
+            const message = loadingMessages[currentLoadingIndex];
+            loadingStatus.textContent = message.status;
+            loadingProgress.textContent = message.progress;
+            currentLoadingIndex = (currentLoadingIndex + 1) % loadingMessages.length;
+        }
+
+        function showResults(data) {
+            // Hide loading, show results
+            loadingSection.style.display = 'none';
+            resultsSection.style.display = 'block';
+
+            // Update tracking metrics
+            document.getElementById('totalTracks').textContent = data.tracking?.total_tracks || '-';
+            document.getElementById('confirmedTracks').textContent = data.tracking?.confirmed_tracks || '-';
+            document.getElementById('framesProcessed').textContent = data.tracking?.frames_processed || '-';
+
+            // Update physical metrics
+            document.getElementById('totalSprints').textContent = data.physical?.total_sprints || '-';
+            document.getElementById('maxSpeed').textContent = data.physical?.max_speed_kmh ? `${data.physical.max_speed_kmh} km/h` : '-';
+            document.getElementById('totalDistance').textContent = data.physical?.total_distance_metres ? `${data.physical.total_distance_metres}m` : '-';
+
+            // Update shape metrics
+            document.getElementById('avgWidth').textContent = data.shape?.avg_width_metres ? `${data.shape.avg_width_metres}m` : '-';
+            document.getElementById('avgDepth').textContent = data.shape?.avg_depth_metres ? `${data.shape.avg_depth_metres}m` : '-';
+            document.getElementById('compactness').textContent = data.shape?.avg_compactness_metres ? `${data.shape.avg_compactness_metres}m` : '-';
+
+            // Update events timeline
+            const eventsTimeline = document.getElementById('eventsTimeline');
+            const events = data.situations?.events || [];
+            
+            if (events.length === 0) {
+                eventsTimeline.innerHTML = '<div class="event-item"><div class="event-time">No events detected</div></div>';
+            } else {
+                eventsTimeline.innerHTML = events.map(event => `
+                    <div class="event-item">
+                        <div class="event-time">${event.start_time}s - ${event.end_time}s</div>
+                        <div class="event-situation">${event.situation}</div>
+                        <div class="event-duration">Duration: ${event.duration_seconds}s</div>
+                    </div>
+                `).join('');
+            }
+
+            // Update analysis
+            document.getElementById('analysisContent').textContent = data.analysis || 'No analysis available';
+        }
+
+        function showError(message) {
+            // Hide loading, show error
+            loadingSection.style.display = 'none';
+            errorSection.style.display = 'block';
+            
+            document.getElementById('errorMessage').textContent = `Analysis failed: ${message}`;
+        }
+    </script>
+</body>
+</html>
