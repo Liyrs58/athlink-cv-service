@@ -1,10 +1,10 @@
 import math
 
 PIXELS_PER_METRE = 15.5   # 1920px frame, pitch ~85% of width, 105m wide
-SPRINT_MS = 7.0
+SPRINT_MS = 6.94  # 25 km/h threshold (25 / 3.6 = 6.944 m/s)
 HIGH_INTENSITY_MS = 5.5
 WALKING_MS = 2.0
-MAX_REALISTIC_SPEED_MS = 12.0  # 43km/h — fastest humans ever recorded
+MAX_REALISTIC_SPEED_MS = 10.0  # 36 km/h — cap to remove tracking artifacts
 
 def get_centre(bbox):
     return ((bbox[0] + bbox[2]) / 2.0, (bbox[1] + bbox[3]) / 2.0)
@@ -25,7 +25,11 @@ def compute_player_velocity(track):
     total_distance_px = 0.0
     sprint_count = 0
     high_intensity_runs = 0
+
+    # Track sprint intervals: (start_time, end_time) for each sustained sprint
+    sprint_intervals = []
     in_sprint = False
+    sprint_start_time = None
     in_high = False
 
     for i in range(1, len(traj)):
@@ -56,19 +60,28 @@ def compute_player_velocity(track):
         speed_px_s = dist_px / dt
         speed_ms = speed_px_s / PIXELS_PER_METRE
 
-        # Sanity cap — no human runs faster than 12m/s
+        # Sanity cap — no human runs faster than 10 m/s (36 km/h)
         if speed_ms > MAX_REALISTIC_SPEED_MS:
             continue
 
         total_distance_px += dist_px
         speeds.append(speed_ms)
 
+        # Sprint detection: require 1.0s sustained >25 km/h + 3s cooldown between sprints
         if speed_ms >= SPRINT_MS:
             if not in_sprint:
-                sprint_count += 1
+                # Start new potential sprint
+                sprint_start_time = curr["timestampSeconds"]
                 in_sprint = True
         else:
+            # Exited sprint zone
+            if in_sprint and sprint_start_time is not None:
+                sprint_duration = curr["timestampSeconds"] - sprint_start_time
+                # Only count if sustained for >= 1.0 second
+                if sprint_duration >= 1.0:
+                    sprint_intervals.append((sprint_start_time, curr["timestampSeconds"]))
             in_sprint = False
+            sprint_start_time = None
 
         if speed_ms >= HIGH_INTENSITY_MS:
             if not in_high:
@@ -76,6 +89,26 @@ def compute_player_velocity(track):
                 in_high = True
         else:
             in_high = False
+
+    # Handle final sprint if still active
+    if in_sprint and sprint_start_time is not None:
+        sprint_duration = traj[-1]["timestampSeconds"] - sprint_start_time
+        if sprint_duration >= 1.0:
+            sprint_intervals.append((sprint_start_time, traj[-1]["timestampSeconds"]))
+
+    # Apply 3-second cooldown: merge sprints separated by less than 3 seconds
+    if sprint_intervals:
+        merged_intervals = [sprint_intervals[0]]
+        for start, end in sprint_intervals[1:]:
+            last_start, last_end = merged_intervals[-1]
+            time_since_last = start - last_end
+            if time_since_last < 3.0:
+                # Merge with previous sprint (extend end time)
+                merged_intervals[-1] = (last_start, max(end, last_end))
+            else:
+                # Add as separate sprint
+                merged_intervals.append((start, end))
+        sprint_count = len(merged_intervals)
 
     total_distance_m = total_distance_px / PIXELS_PER_METRE
 
