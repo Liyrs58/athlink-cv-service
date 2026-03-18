@@ -33,7 +33,7 @@ async def analyse_video(video: UploadFile = File(...)):
         events = extract_situation_events(frame_results, fps=25.0, frame_stride=2)
         velocities = compute_all_velocities(tracks)
         vel_summary = get_team_velocity_summary(velocities)
-        shape_summary = compute_shape_summary(tracks, frame_metadata)
+        shape_summary = compute_shape_summary(tracks, frame_metadata) or {}
         memory = get_historical_context()
         analysis = interpret_events(events, tracks, job_id, vel_summary, shape_summary, velocities, memory)
         analysis_text = analysis[0]["analysis"] if analysis else ""
@@ -51,7 +51,7 @@ async def analyse_video(video: UploadFile = File(...)):
                 "events": events,
                 "counts": {s: sum(1 for f in frame_results if f["situation"]==s) for s in set(f["situation"] for f in frame_results)}
             },
-            "physical": vel_summary,
+            "physical": vel_summary or {},
             "shape": shape_summary,
             "analysis": analysis_text,
         })

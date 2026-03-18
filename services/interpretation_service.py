@@ -25,6 +25,13 @@ def build_rich_context(events, tracks, vel_summary, shape_summary, velocities, j
     total_sprints = vel_summary.get('total_sprints', 0)
     avg_width_m = shape_summary.get('avg_width_metres', 0)
 
+    # Handle None and string values from shape data
+    shape_data_available = (
+        avg_width_m is not None and
+        avg_width_m != "data unavailable" and
+        isinstance(avg_width_m, (int, float))
+    )
+
     if on_pitch_count > 25:
         warnings.append("Note: player count seems high — some duplicates may exist. Treat individual player stats as approximate.")
 
@@ -35,7 +42,7 @@ def build_rich_context(events, tracks, vel_summary, shape_summary, velocities, j
     if total_sprints > 50:
         warnings.append("Sprint count may be inflated by tracking noise. Focus on relative comparison between players, not absolute numbers.")
 
-    if avg_width_m > 70:
+    if shape_data_available and avg_width_m > 70:
         # Will replace with unavailable message
         pass
 
@@ -112,6 +119,16 @@ def build_rich_context(events, tracks, vel_summary, shape_summary, velocities, j
     for timeline_entry in situation_timeline:
         lines.append(f"  {timeline_entry}")
     lines.append("")
+
+    # Add shape data if available
+    if shape_data_available:
+        lines.append("TEAM SHAPE (formation width/depth):")
+        lines.append(f"- Average width: {shape_summary.get('avg_width_metres', 'N/A')}m")
+        lines.append(f"- Average depth: {shape_summary.get('avg_depth_metres', 'N/A')}m")
+        lines.append("")
+    else:
+        lines.append("TEAM SHAPE: Data unavailable for this clip (camera angle or detection issues)")
+        lines.append("")
 
     lines.append("THE ONE THING TO ADDRESS BEFORE SATURDAY:")
     lines.append("[Based only on the most reliable data point — usually the situation timeline")

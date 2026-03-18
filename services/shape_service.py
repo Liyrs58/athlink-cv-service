@@ -111,7 +111,33 @@ def compute_shape_summary(tracks, frame_metadata):
             shapes.append(shape)
 
     if not shapes:
-        return {}
+        # Return complete dict with None values instead of empty dict
+        logger.warning("No valid shape data available for any frame (all geometry invalid)")
+        return {
+            "frames_analysed": 0,
+            "team_0": {
+                "avg_width_metres": None,
+                "avg_depth_metres": None,
+                "avg_compactness_metres": None,
+                "min_width_metres": None,
+                "max_width_metres": None,
+            },
+            "team_1": {
+                "avg_width_metres": None,
+                "avg_depth_metres": None,
+                "avg_compactness_metres": None,
+                "min_width_metres": None,
+                "max_width_metres": None,
+            },
+            "combined_width_metres": None,
+            "min_combined_width_metres": None,
+            "max_combined_width_metres": None,
+            "avg_width_metres": None,
+            "avg_depth_metres": None,
+            "avg_compactness_metres": None,
+            "min_width_metres": None,
+            "max_width_metres": None,
+        }
 
     # Collect metrics for each team separately (filtering out None values)
     team_0_widths = [s["team_0"]["width_metres"] for s in shapes if s["team_0"] and s["team_0"]["width_metres"] is not None]
