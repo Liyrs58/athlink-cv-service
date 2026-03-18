@@ -21,19 +21,18 @@ from services.job_queue_service import create_job, submit_job
 
 router = APIRouter()
 
-def make_json_safe(obj):
+def numpy_safe(obj):
     """Convert numpy types to native Python types for JSON serialization."""
-    if isinstance(obj, np.integer):
-        return int(obj)
-    if isinstance(obj, np.floating):
-        return float(obj)
-    if isinstance(obj, np.ndarray):
-        return obj.tolist()
-    if isinstance(obj, dict):
-        return {k: make_json_safe(v) for k, v in obj.items()}
-    if isinstance(obj, (list, tuple)):
-        return [make_json_safe(i) for i in obj]
+    if isinstance(obj, np.integer): return int(obj)
+    if isinstance(obj, np.floating): return float(obj)
+    if isinstance(obj, np.bool_): return bool(obj)
+    if isinstance(obj, np.ndarray): return obj.tolist()
+    if isinstance(obj, dict): return {k: numpy_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)): return [numpy_safe(i) for i in obj]
     return obj
+
+# Keep alias for any other code that may reference make_json_safe
+make_json_safe = numpy_safe
 
 def _run_analysis_pipeline(job_id: str, temp_path: str):
     """Background task — runs the full analysis pipeline."""
@@ -191,7 +190,7 @@ def _run_analysis_pipeline(job_id: str, temp_path: str):
             "corrections_applied": corrections_applied,
             "analysis": analysis_text,
         }
-        result = make_json_safe(base_result)
+        result = numpy_safe(base_result)
         return result
     finally:
         if os.path.exists(temp_path):
