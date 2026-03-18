@@ -2,6 +2,14 @@ import math
 from typing import Optional, Dict, Any, List
 from statistics import median
 
+def to_scalar(v):
+    """Convert numpy scalars to Python native types for JSON serialization."""
+    if hasattr(v, 'item'):
+        return v.item()
+    if hasattr(v, '__float__'):
+        return float(v)
+    return v
+
 PIXELS_PER_METRE = 15.5
 SPRINT_MS = 5.5  # 19.8 km/h
 HIGH_INTENSITY_MS = 5.5
@@ -228,10 +236,10 @@ def compute_player_velocity(track, calibration: Optional[Dict[str, Any]] = None)
 
     return {
         "track_id": track["trackId"],
-        "distance_metres": round(total_distance_m, 1),
+        "distance_metres": round(to_scalar(total_distance_m), 1),
         "sprint_count": sprint_count,
-        "max_speed_ms": round(max_speed, 2),
-        "avg_speed_ms": round(avg_speed, 2),
+        "max_speed_ms": round(to_scalar(max_speed), 2),
+        "avg_speed_ms": round(to_scalar(avg_speed), 2),
         "high_intensity_runs": high_intensity_runs,
     }
 
@@ -258,10 +266,10 @@ def get_team_velocity_summary(velocity_results):
     top_sprinter = max(valid, key=lambda x: x["sprint_count"])
     top_runner = max(valid, key=lambda x: x["distance_metres"])
     return {
-        "total_distance_metres": round(total_distance, 1),
-        "total_sprints": total_sprints,
-        "max_speed_ms": round(max_speed, 2),
-        "max_speed_kmh": round(max_speed * 3.6, 1),
+        "total_distance_metres": round(to_scalar(total_distance), 1),
+        "total_sprints": int(to_scalar(total_sprints)),
+        "max_speed_ms": round(to_scalar(max_speed), 2),
+        "max_speed_kmh": round(to_scalar(max_speed) * 3.6, 1),
         "players_analysed": len(valid),
         "top_sprinter_id": top_sprinter["track_id"],
         "top_runner_id": top_runner["track_id"],

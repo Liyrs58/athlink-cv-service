@@ -11,6 +11,14 @@ from typing import Optional, Tuple, Dict, Any
 
 logger = logging.getLogger(__name__)
 
+def to_scalar(v):
+    """Convert numpy scalars to Python native types for JSON serialization."""
+    if hasattr(v, 'item'):
+        return v.item()
+    if hasattr(v, '__float__'):
+        return float(v)
+    return v
+
 PITCH_LENGTH = 105.0  # metres
 PITCH_WIDTH = 68.0    # metres
 
@@ -40,7 +48,7 @@ def detect_pitch_lines(frame: np.ndarray) -> list:
     if lines is None:
         return []
 
-    return [(float(l[0][0]), float(l[0][1])) for l in lines]
+    return [(float(to_scalar(l[0][0])), float(to_scalar(l[0][1]))) for l in lines]
 
 
 def _classify_lines(lines: list) -> Tuple[list, list]:
@@ -72,7 +80,7 @@ def _cluster_lines(lines: list, threshold: float = 50.0) -> list:
     for cluster in clusters:
         rhos = [l[0] for l in cluster]
         thetas = [l[1] for l in cluster]
-        result.append((float(np.median(rhos)), float(np.median(thetas))))
+        result.append((float(to_scalar(np.median(rhos))), float(to_scalar(np.median(thetas)))))
     return result
 
 
@@ -113,7 +121,7 @@ def detect_pitch_keypoints(frame: np.ndarray) -> Optional[np.ndarray]:
         if abs(det) < 1e-6:
             return None
         x, y = np.linalg.solve(A, b)
-        return (float(x), float(y))
+        return (float(to_scalar(x)), float(to_scalar(y)))
 
     corners = []
     for h_line, v_line in [(h_top, v_left), (h_top, v_right),
@@ -199,7 +207,7 @@ def estimate_homography(frame: np.ndarray) -> Dict[str, Any]:
             # Validate by checking centre point
             centre = np.array([[[w / 2, h / 2]]], dtype=np.float32)
             world_pt = cv2.perspectiveTransform(centre, H)
-            wx, wy = float(world_pt[0][0][0]), float(world_pt[0][0][1])
+            wx, wy = float(to_scalar(world_pt[0][0][0])), float(to_scalar(world_pt[0][0][1]))
             if 10 < wx < 95 and 10 < wy < 58:
                 # Estimate visible fraction from corner spread
                 span_x = max(corners[:, 0]) - min(corners[:, 0])
@@ -208,8 +216,8 @@ def estimate_homography(frame: np.ndarray) -> Dict[str, Any]:
                 return {
                     'method': 'keypoints',
                     'homography': H.tolist(),
-                    'visible_fraction': round(visible_frac, 3),
-                    'pixels_per_metre': round(ppm, 2),
+                    'visible_fraction': round(to_scalar(visible_frac), 3),
+                    'pixels_per_metre': round(to_scalar(ppm), 2),
                 }
 
     # Fallback: estimate from green pixel fraction
@@ -227,8 +235,8 @@ def estimate_homography(frame: np.ndarray) -> Dict[str, Any]:
     return {
         'method': 'green_fraction',
         'homography': None,
-        'visible_fraction': round(visible_frac, 3),
-        'pixels_per_metre': round(ppm, 2),
+        'visible_fraction': round(to_scalar(visible_frac), 3),
+        'pixels_per_metre': round(to_scalar(ppm), 2),
     }
 
 
@@ -302,8 +310,8 @@ def get_frame_calibration(video_path: str, sample_frames: int = 5) -> Dict[str, 
             'frames_sampled': 0,
         }
 
-    median_frac = float(np.median(fractions))
-    median_ppm = float(np.median(ppms))
+    median_frac = float(to_scalar(np.median(fractions)))
+    median_ppm = float(to_scalar(np.median(ppms)))
 
     method = 'keypoints' if best_homography is not None else 'green_fraction'
 
@@ -335,13 +343,13 @@ def pixels_to_metres(px_x: float, px_y: float, calibration: Dict[str, Any],
         # H is a numpy array — use perspective transform
         pt = np.array([[[px_x, px_y]]], dtype=np.float32)
         world = cv2.perspectiveTransform(pt, np.array(H, dtype=np.float32))
-        return float(world[0][0][0]), float(world[0][0][1])
+        return float(to_scalar(world[0][0][0])), float(to_scalar(world[0][0][1]))
 
     if H is not None and isinstance(H, list):
         H_arr = np.array(H, dtype=np.float32)
         pt = np.array([[[px_x, px_y]]], dtype=np.float32)
         world = cv2.perspectiveTransform(pt, H_arr)
-        return float(world[0][0][0]), float(world[0][0][1])
+        return float(to_scalar(world[0][0][0])), float(to_scalar(world[0][0][1]))
 
     # Fallback: use visible_fraction scaling
     visible_frac = calibration.get('visible_fraction', 0.55)

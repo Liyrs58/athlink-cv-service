@@ -11,6 +11,14 @@ from typing import Dict, Any, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
+def to_scalar(v):
+    """Convert numpy scalars to Python native types for JSON serialization."""
+    if hasattr(v, 'item'):
+        return v.item()
+    if hasattr(v, '__float__'):
+        return float(v)
+    return v
+
 # ── Physical constants ────────────────────────────────────────────
 PITCH_LENGTH = 105.0
 PITCH_WIDTH = 68.0

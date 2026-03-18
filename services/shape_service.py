@@ -3,6 +3,14 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+def to_scalar(v):
+    """Convert numpy scalars to Python native types for JSON serialization."""
+    if hasattr(v, 'item'):
+        return v.item()
+    if hasattr(v, '__float__'):
+        return float(v)
+    return v
+
 _FALLBACK = {
     "frames_analysed": 0,
     "team_0": {
@@ -101,14 +109,14 @@ def compute_team_shape(tracks, frame_idx, calibration=None):
         xs = [p[0] for p in positions]
         ys = [p[1] for p in positions]
 
-        width_m = round(max(xs) - min(xs), 1)
-        depth_m = round(max(ys) - min(ys), 1)
+        width_m = round(to_scalar(max(xs)) - to_scalar(min(xs)), 1)
+        depth_m = round(to_scalar(max(ys)) - to_scalar(min(ys)), 1)
         centroid_x = sum(xs) / len(xs)
         centroid_y = sum(ys) / len(ys)
 
         # Compactness: average distance from centroid (already in metres)
         distances = [math.sqrt((x-centroid_x)**2+(y-centroid_y)**2) for x,y in positions]
-        compactness_m = round(sum(distances) / len(distances), 1)
+        compactness_m = round(to_scalar(sum(distances)) / len(distances), 1)
 
         # Soft handling: set metrics to None if they exceed physical limits
         # With calibration, max visible width is vis_frac * 68m
@@ -130,7 +138,7 @@ def compute_team_shape(tracks, frame_idx, calibration=None):
             "width_metres": width_m,
             "depth_metres": depth_m,
             "compactness_metres": compactness_m,
-            "centroid": [round(centroid_x, 1), round(centroid_y, 1)],
+            "centroid": [round(to_scalar(centroid_x), 1), round(to_scalar(centroid_y), 1)],
             "player_count": len(positions)
         } if (width_m is not None and depth_m is not None) else None
 
@@ -192,15 +200,15 @@ def compute_shape_summary(tracks, frame_metadata, calibration=None):
 
         def safe_avg(values):
             """Return average if values exist, else None (never a string)."""
-            return round(sum(values) / len(values), 1) if values else None
+            return round(to_scalar(sum(values)) / len(values), 1) if values else None
 
         def safe_min(values):
             """Return min if values exist, else None (never a string)."""
-            return round(min(values), 1) if values else None
+            return round(to_scalar(min(values)), 1) if values else None
 
         def safe_max(values):
             """Return max if values exist, else None (never a string)."""
-            return round(max(values), 1) if values else None
+            return round(to_scalar(max(values)), 1) if values else None
 
         result = {
             "frames_analysed": len(shapes),

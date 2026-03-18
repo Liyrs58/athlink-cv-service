@@ -1,6 +1,7 @@
 from fastapi import APIRouter, UploadFile, File
 from fastapi.responses import JSONResponse
 import shutil, uuid, os
+import numpy as np
 from services.tracking_service import run_tracking
 from services.team_separation_service import cluster_teams
 from services.reid_service import merge_fragmented_tracks
@@ -19,6 +20,20 @@ from services.confidence_service import (
 from services.job_queue_service import create_job, submit_job
 
 router = APIRouter()
+
+def make_json_safe(obj):
+    """Convert numpy types to native Python types for JSON serialization."""
+    if isinstance(obj, np.integer):
+        return int(obj)
+    if isinstance(obj, np.floating):
+        return float(obj)
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    if isinstance(obj, dict):
+        return {k: make_json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [make_json_safe(i) for i in obj]
+    return obj
 
 def _run_analysis_pipeline(job_id: str, temp_path: str):
     """Background task — runs the full analysis pipeline."""
@@ -133,7 +148,7 @@ def _run_analysis_pipeline(job_id: str, temp_path: str):
         total_players = high_count + data_confidence.get("medium_confidence_players", 0) + data_confidence.get("low_confidence_players", 0)
         phys_conf = "high" if total_players > 0 and high_count / total_players >= 0.6 else "medium"
 
-        result = {
+        base_result = {
             "job_id": job_id,
             "matches_in_memory": get_match_count(),
             "tracking": {
@@ -176,6 +191,7 @@ def _run_analysis_pipeline(job_id: str, temp_path: str):
             "corrections_applied": corrections_applied,
             "analysis": analysis_text,
         }
+        result = make_json_safe(base_result)
         return result
     finally:
         if os.path.exists(temp_path):
