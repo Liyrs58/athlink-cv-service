@@ -19,6 +19,7 @@ from services.confidence_service import (
 )
 from services.job_queue_service import create_job, submit_job
 from services.observer_brain import ObserverBrain
+from services.fatigue_clock_service import FatigueClock
 from services.voronoi_service import compute_voronoi_control
 from services.entropy_service import compute_team_entropy
 
@@ -92,6 +93,10 @@ def _run_analysis_pipeline(job_id: str, temp_path: str, skip_cleanup: bool = Fal
 
         # Part 1+4: Build confidence summary
         data_confidence = build_data_confidence_summary(tracks, vel_summary, shape_summary)
+
+        # Fatigue Clock — Fourier-based fatigue analysis per player
+        fatigue_clock = FatigueClock()
+        fatigue_result = fatigue_clock.analyse_all_players(tracks, calibration=calibration)
 
         # Observer Brain — continuous belief update across all frames
         brain = ObserverBrain()
@@ -201,6 +206,7 @@ def _run_analysis_pipeline(job_id: str, temp_path: str, skip_cleanup: bool = Fal
                 "fragments_merged": tracks_before_merge - tracks_after_merge,
             },
             "corrections_applied": corrections_applied,
+            "fatigue_clock": fatigue_result,
             "voronoi": {
                 "status": voronoi.get("status"),
                 "team_0_control_pct": voronoi.get("team_0_control_pct"),
