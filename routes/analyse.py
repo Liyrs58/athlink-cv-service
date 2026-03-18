@@ -10,7 +10,8 @@ from services.game_brain import detect_situation, extract_situation_events
 from services.interpretation_service import interpret_events
 from services.velocity_service import compute_all_velocities, get_team_velocity_summary
 from services.shape_service import compute_shape_summary
-from services.memory_service import store_match, get_historical_context, get_match_count
+from services.memory_service import store_match, get_historical_context, get_match_count, get_player_history
+from services.trajectory_service import DevelopmentTrajectory
 from services.physics_corrector import PhysicsCorrector
 from services.confidence_service import (
     score_track_confidence,
@@ -112,7 +113,26 @@ def _run_analysis_pipeline(job_id: str, temp_path: str, skip_cleanup: bool = Fal
             entropy=entropy,
         )
         analysis_text = analysis[0]["analysis"] if analysis else ""
-        store_match(job_id, {"total_tracks": len(tracks)}, {"events": events}, vel_summary, shape_summary, analysis_text)
+
+        # Development Trajectory — player arc prediction across matches
+        trajectory_engine = DevelopmentTrajectory()
+        memory_data = {"player_history": get_player_history()}
+        trajectory_summary = trajectory_engine.compute_team_trajectories(
+            memory_data=memory_data,
+            current_tracks=tracks,
+            current_velocities=velocities,
+            current_fatigue=fatigue_result,
+        )
+
+        store_match(
+            job_id,
+            {"total_tracks": len(tracks)},
+            {"events": events},
+            vel_summary,
+            shape_summary,
+            analysis_text,
+            player_history=trajectory_summary.get("updated_player_history", {}),
+        )
 
         # Part 4: Build per-player physical with confidence
         track_team_map = {}
@@ -228,6 +248,12 @@ def _run_analysis_pipeline(job_id: str, temp_path: str, skip_cleanup: bool = Fal
                 "metrics_to_trust": brain_summary.get("metrics_to_trust", []),
                 "metrics_to_question": brain_summary.get("metrics_to_question", []),
                 "anomalies_summary": brain_summary.get("anomalies_summary", ""),
+            },
+            "trajectory": {
+                "players_with_trajectory": trajectory_summary.get(
+                    "players_with_trajectory", 0),
+                "trajectories": trajectory_summary.get("trajectories", {}),
+                "history_size": trajectory_summary.get("player_history_size", {}),
             },
             "analysis": analysis_text,
         }

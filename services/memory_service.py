@@ -9,7 +9,7 @@ MEMORY_DIR.mkdir(exist_ok=True)
 (MEMORY_DIR / "teams").mkdir(exist_ok=True)
 (MEMORY_DIR / "patterns").mkdir(exist_ok=True)
 
-def store_match(job_id, tracking, situations, physical, shape, analysis):
+def store_match(job_id, tracking, situations, physical, shape, analysis, player_history=None):
     """Store complete match analysis to memory."""
     match_data = {
         "job_id": job_id,
@@ -20,6 +20,8 @@ def store_match(job_id, tracking, situations, physical, shape, analysis):
         "shape": shape,
         "analysis": analysis,
     }
+    if player_history:
+        match_data["player_history"] = player_history
     path = MEMORY_DIR / "matches" / f"{job_id}.json"
     with open(path, "w") as f:
         json.dump(match_data, f, indent=2)
@@ -47,6 +49,33 @@ def get_historical_context(limit=5):
         )
 
     return "Previous matches:\n" + "\n".join(history)
+
+def get_player_history() -> dict:
+    """Returns accumulated player appearance history across all stored matches."""
+    matches_dir = MEMORY_DIR / "matches"
+    files = sorted(matches_dir.glob("*.json"), key=os.path.getmtime)
+    combined = {}
+    for f in files:
+        try:
+            with open(f) as fp:
+                m = json.load(fp)
+            ph = m.get("player_history", {})
+            for pid, appearances in ph.items():
+                combined.setdefault(pid, []).extend(appearances)
+        except Exception:
+            continue
+    # Deduplicate by match_id within each player
+    for pid in combined:
+        seen = set()
+        deduped = []
+        for a in combined[pid]:
+            mid = a.get("match_id", "")
+            if mid not in seen:
+                seen.add(mid)
+                deduped.append(a)
+        combined[pid] = deduped
+    return combined
+
 
 def get_match_count():
     return len(list((MEMORY_DIR / "matches").glob("*.json")))
