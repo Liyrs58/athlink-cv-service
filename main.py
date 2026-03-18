@@ -1,5 +1,6 @@
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
+from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from routes.health import router as health_router
 from routes.analyze import router as analyze_router
@@ -142,3 +143,4 @@ if __name__ == "__main__":
     port = int(os.getenv("PORT", "8005"))
     print(f"[startup] Binding to 0.0.0.0:{port}")
     uvicorn.run(app, host="0.0.0.0", port=port)
+app.mount("/", StaticFiles(directory="static", html=True), name="static")
