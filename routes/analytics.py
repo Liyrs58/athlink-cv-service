@@ -2,8 +2,10 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import JSONResponse
 from pathlib import Path
 import logging
+import numpy as np
 
 from services.analytics_service import build_analytics_report, get_available_services
+from routes.analyse import numpy_safe
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -20,7 +22,7 @@ async def get_analytics(jobId: str):
             detail="track_results.json not found for job '{}'".format(jobId)
         )
     try:
-        result = build_analytics_report(jobId)
+        result = numpy_safe(build_analytics_report(jobId))
         available = get_available_services(jobId)
         dq = result.get("data_quality", {})
         return JSONResponse(
