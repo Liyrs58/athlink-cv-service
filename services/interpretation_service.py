@@ -3,20 +3,25 @@ import json
 import math
 import urllib.request
 
+from services.confidence_service import (
+    score_track_confidence,
+    score_physical_metric,
+    build_data_confidence_summary,
+)
+
 
 def safe_float(val):
-    """Convert any value to float safely. Returns None if not numeric."""
     try:
         return float(val) if val is not None else None
     except (TypeError, ValueError):
         return None
 
 
-def build_rich_context(events, tracks, vel_summary, shape_summary, velocities, job_id, team_separation=None):
+def build_rich_context(events, tracks, vel_summary, shape_summary, velocities, job_id, team_separation=None, data_confidence=None):
     """Build honest, coach-friendly context for Claude AI report."""
     team_sep = team_separation or {}
+    conf = data_confidence or {}
 
-    # FIX 1d: Only include non-staff tracks in analysis
     on_pitch_players = [t for t in tracks if not t.get('is_staff', False)]
     if len(on_pitch_players) > 30:
         on_pitch_players = sorted(
@@ -29,37 +34,20 @@ def build_rich_context(events, tracks, vel_summary, shape_summary, velocities, j
     total_duration = safe_float(events[-1]["end_time"]) if events else 0
     on_pitch_count = len(on_pitch_players)
 
-    # PART A: Data quality checks — safe_float everything before comparing
-    warnings = []
     max_speed_kmh = safe_float(vel_summary.get('max_speed_kmh', 0))
     total_sprints = safe_float(vel_summary.get('total_sprints', 0))
     avg_width_m = safe_float(shape_summary.get('avg_width_metres'))
     avg_depth_m = safe_float(shape_summary.get('avg_depth_metres'))
-
     shape_data_available = avg_width_m is not None
 
-    if isinstance(on_pitch_count, (int, float)) and on_pitch_count > 25:
-        warnings.append("Note: player count seems high — some duplicates may exist. Treat individual player stats as approximate.")
-
-    if max_speed_kmh is not None and max_speed_kmh > 35:
-        # Will exclude from prompt entirely
-        pass
-
-    if total_sprints is not None and total_sprints > 50:
-        warnings.append("Sprint count may be inflated by tracking noise. Focus on relative comparison between players, not absolute numbers.")
-
-    if avg_width_m is not None and avg_width_m > 70:
-        shape_data_available = False
-
-    # Build situation timeline for team rhythm
+    # Situation timeline
     situation_timeline = []
     for e in events:
         start = safe_float(e.get('start_time', 0)) or 0
         end = safe_float(e.get('end_time', 0)) or 0
         situation_timeline.append(f"{start:.0f}s-{end:.0f}s: {e['situation']}")
 
-    # Build per-player stats (only realistic values)
-    # Build a lookup from track_id to teamId for labelling
+    # Track team map
     track_team_map = {}
     for t in tracks:
         tid = t.get("trackId")
@@ -70,20 +58,23 @@ def build_rich_context(events, tracks, vel_summary, shape_summary, velocities, j
     t1_name = team_sep.get("team_1_colour_name", "B")
     has_teams = team_sep.get("status") == "ok"
 
-    per_player_stats = []
-    players_with_5_detections = [v for v in velocities if isinstance(v.get('confirmed_detections', 0), (int, float)) and v.get('confirmed_detections', 0) >= 5]
-    for v in players_with_5_detections:
+    # Build per-player stats with confidence-aware language
+    per_player_lines = []
+    for v in velocities:
         track_id = v['track_id']
-        sprint_count = safe_float(v.get('sprint_count', 0)) or 0
+        # Find the track to get confidence
+        trk = next((t for t in tracks if t.get("trackId") == track_id), None)
+        if not trk or trk.get("confirmed_detections", 0) < 5:
+            continue
+
+        tc = score_track_confidence(trk)
+        conf_level = tc["level"]
+
+        sprint_count = v.get('sprint_count', 0)
         max_speed_ms = safe_float(v.get('max_speed_ms', 0))
         distance = safe_float(v.get('distance_metres', 0)) or 0
+        max_speed_player_kmh = round(max_speed_ms * 3.6, 1) if max_speed_ms else 0
 
-        if max_speed_ms is not None:
-            max_speed_player_kmh = round(max_speed_ms * 3.6, 1)
-        else:
-            max_speed_player_kmh = 0
-
-        # Team label
         team_label = ""
         if has_teams:
             ptid = track_team_map.get(track_id, -1)
@@ -92,14 +83,31 @@ def build_rich_context(events, tracks, vel_summary, shape_summary, velocities, j
             elif ptid == 1:
                 team_label = f" [{t1_name}]"
 
-        # Skip if speed is unrealistic
-        if isinstance(max_speed_player_kmh, (int, float)) and max_speed_player_kmh > 35:
-            per_player_stats.append(f"  PLAYER #{track_id}{team_label}: data unreliable for this player")
-        else:
-            per_player_stats.append(f"  PLAYER #{track_id}{team_label}: {int(sprint_count)} sprints | {max_speed_player_kmh} km/h | {distance}m")
+        if max_speed_player_kmh > 35:
+            per_player_lines.append(f"  PLAYER #{track_id}{team_label} [confidence: {conf_level}]: data unreliable for this player")
+        elif conf_level == "low":
+            per_player_lines.append(f"  PLAYER #{track_id}{team_label} [confidence: LOW]: data insufficient for reliable conclusions")
+        elif conf_level == "medium":
+            sprint_lo = max(0, sprint_count - 2)
+            sprint_hi = sprint_count + 2
+            dist_lo = round(distance * 0.75, 0)
+            dist_hi = round(distance * 1.25, 0)
+            per_player_lines.append(
+                f"  PLAYER #{track_id}{team_label} [confidence: MEDIUM]: "
+                f"approximately {sprint_lo}-{sprint_hi} sprints | "
+                f"~{max_speed_player_kmh} km/h ±20% | "
+                f"{dist_lo}-{dist_hi}m"
+            )
+        else:  # high
+            per_player_lines.append(
+                f"  PLAYER #{track_id}{team_label} [confidence: HIGH]: "
+                f"{sprint_count} sprints | "
+                f"{max_speed_player_kmh} km/h ±10% | "
+                f"{distance}m ±12%"
+            )
 
-    # Start building prompt with honest structure
     duration_str = f"{total_duration:.0f}" if isinstance(total_duration, (int, float)) else "unknown"
+
     lines = [
         "You are a football coach assistant.",
         "Write a coaching report from this match data ONLY.",
@@ -107,97 +115,86 @@ def build_rich_context(events, tracks, vel_summary, shape_summary, velocities, j
         "Be specific with player numbers and stats.",
         "Be honest when data seems unreliable.",
         "",
-        "CRITICAL: Do not make any claim about historical trends unless historical_context is explicitly provided and non-empty.",
-        "Only draw conclusions from the data explicitly passed in this current request.",
-        "If historical_context is provided, reference it as 'across X previous matches' where X is the number of matches.",
-        "Do not extrapolate or infer patterns beyond the current match data.",
+        "CRITICAL HONESTY RULES:",
+        "- For HIGH confidence data: state facts directly. E.g. 'Player 17 made 5 sprints'",
+        "- For MEDIUM confidence data: use hedged language. E.g. 'Player 17 made approximately 4-6 sprints'",
+        "- For LOW confidence data: say 'Player X's data is insufficient for reliable conclusions'",
+        "- NEVER report a number without noting its confidence context",
+        "- The 'one thing to address before Saturday' must come ONLY from HIGH or MEDIUM confidence data",
         "",
-        "CONFIRMED DATA (reliable):",
-        f"- Clip duration: {duration_str}s",
-        f"- Match phases: {', '.join(situation_timeline)}",
-        f"- Players tracked: {on_pitch_count} on-pitch players",
+        "CRITICAL: Do not make any claim about historical trends unless historical_context is explicitly provided and non-empty.",
         "",
     ]
 
-    # Add team separation info if available
+    # Add confidence summary
+    if conf:
+        lines.append(f"DATA QUALITY GRADE: {conf.get('overall_grade', '?')}")
+        lines.append(f"EXPLANATION: {conf.get('grade_explanation', '')}")
+        lines.append(f"High confidence players: {conf.get('high_confidence_players', 0)}")
+        lines.append(f"Medium confidence players: {conf.get('medium_confidence_players', 0)}")
+        lines.append(f"Low confidence players: {conf.get('low_confidence_players', 0)}")
+        lines.append("")
+
+    lines.append("CONFIRMED DATA (reliable):")
+    lines.append(f"- Clip duration: {duration_str}s")
+    lines.append(f"- Match phases: {', '.join(situation_timeline)}")
+    lines.append(f"- Players tracked: {on_pitch_count} on-pitch players")
+    lines.append("")
+
     if team_sep.get("status") == "ok":
-        t0_name = team_sep.get("team_0_colour_name", "unknown")
-        t1_name = team_sep.get("team_1_colour_name", "unknown")
-        t0_count = team_sep.get("team_0_players", 0)
-        t1_count = team_sep.get("team_1_players", 0)
         lines.append("TEAM IDENTIFICATION:")
-        lines.append(f"- Team A ({t0_name} jersey): {t0_count} players detected")
-        lines.append(f"- Team B ({t1_name} jersey): {t1_count} players detected")
-        lines.append("When discussing players, group them by team colour.")
+        lines.append(f"- Team A ({t0_name} jersey): {team_sep.get('team_0_players', 0)} players detected")
+        lines.append(f"- Team B ({t1_name} jersey): {team_sep.get('team_1_players', 0)} players detected")
         lines.append("")
 
-    # Add warnings if any
-    if warnings:
-        lines.append("DATA QUALITY NOTES:")
-        for w in warnings:
-            lines.append(f"- {w}")
-        lines.append("")
+    lines.append("STRUCTURE YOUR REPORT IN THREE SECTIONS:")
+    lines.append("")
+    lines.append("## RELIABLE INSIGHTS (team-level, high confidence)")
+    lines.append("[Team rhythm, situation timeline, team shape — things we can trust]")
+    lines.append("")
+    lines.append("## APPROXIMATE ESTIMATES (player-level, medium confidence)")
+    lines.append("[Individual player stats with ranges and margins of error]")
+    lines.append("")
+    lines.append("## DATA GAPS")
+    lines.append("[What could not be measured and why — ball possession, pass accuracy, dead ball positions]")
+    lines.append("")
 
-    lines.append("PHYSICAL DATA (use with care — broadcast tracking):")
-    if per_player_stats:
-        for stat in per_player_stats:
-            lines.append(stat)
+    lines.append("PHYSICAL DATA BY PLAYER:")
+    if per_player_lines:
+        for line in per_player_lines:
+            lines.append(line)
     else:
         lines.append("  (No players with 5+ confirmed detections)")
     lines.append("")
 
-    lines.append("FOR EACH PLAYER with 5+ confirmed detections:")
-    lines.append("Write exactly this format:")
-    lines.append("")
-    lines.append("PLAYER #{track_id}")
-    lines.append("Sprints: {count} | Top speed: {speed} km/h | Distance: {distance}m")
-    lines.append("")
-    lines.append("What they did: [1 sentence observation]")
-    lines.append("What to work on: [1 sentence]")
-    lines.append("Training focus: [1 specific drill or instruction]")
-    lines.append("")
-    lines.append("---")
+    lines.append("TEAM RHYTHM:")
+    for entry in situation_timeline:
+        lines.append(f"  {entry}")
     lines.append("")
 
-    lines.append("TEAM RHYTHM (most reliable section):")
-    for timeline_entry in situation_timeline:
-        lines.append(f"  {timeline_entry}")
-    lines.append("")
-
-    # Add shape data if available
     if shape_data_available:
-        lines.append("TEAM SHAPE (formation width/depth):")
-        # Per-team shape if team separation succeeded
+        lines.append("TEAM SHAPE:")
         t0_shape = shape_summary.get("team_0", {})
         t1_shape = shape_summary.get("team_1", {})
         if has_teams and t0_shape.get("avg_width_metres") is not None:
             lines.append(f"- Team A ({t0_name}): width {t0_shape['avg_width_metres']}m, depth {t0_shape.get('avg_depth_metres', '?')}m")
         if has_teams and t1_shape.get("avg_width_metres") is not None:
             lines.append(f"- Team B ({t1_name}): width {t1_shape['avg_width_metres']}m, depth {t1_shape.get('avg_depth_metres', '?')}m")
-        # Combined fallback
-        width_str = f"{avg_width_m}m" if avg_width_m is not None else "N/A"
-        depth_str = f"{avg_depth_m}m" if avg_depth_m is not None else "N/A"
-        lines.append(f"- Overall width: {width_str}")
-        lines.append(f"- Overall depth: {depth_str}")
         lines.append("")
     else:
-        lines.append("TEAM SHAPE: Data unavailable for this clip (camera angle or detection issues)")
+        lines.append("TEAM SHAPE: Data unavailable for this clip")
         lines.append("")
 
     lines.append("THE ONE THING TO ADDRESS BEFORE SATURDAY:")
-    lines.append("[Based only on the most reliable data point — usually the situation timeline")
-    lines.append("and relative player comparison, not absolute speed/distance]")
+    lines.append("[Based ONLY on HIGH or MEDIUM confidence data — never from LOW confidence tracks]")
     lines.append("")
 
-    lines.append("IMPORTANT: If any stat seems physically impossible")
-    lines.append("(speed over 35 km/h, distance over 800m in 40s),")
-    lines.append("say 'data unreliable for this player' rather than")
-    lines.append("reporting the number.")
+    lines.append("IMPORTANT: If any stat seems physically impossible (speed over 35 km/h, distance over 800m in 40s), say 'data unreliable' rather than reporting the number.")
 
     return "\n".join(lines)
 
 
-def interpret_events(events, tracks, job_id, velocity_summary=None, shape_summary=None, velocities=None, memory=None, team_separation=None):
+def interpret_events(events, tracks, job_id, velocity_summary=None, shape_summary=None, velocities=None, memory=None, team_separation=None, data_confidence=None):
     if not events:
         return [{"job_id": job_id, "analysis": "No events to analyse.", "events": []}]
 
@@ -208,6 +205,7 @@ def interpret_events(events, tracks, job_id, velocity_summary=None, shape_summar
         velocities or [],
         job_id,
         team_separation=team_separation,
+        data_confidence=data_confidence,
     )
 
     if memory:
@@ -215,7 +213,7 @@ def interpret_events(events, tracks, job_id, velocity_summary=None, shape_summar
 
     data = json.dumps({
         "model": "claude-sonnet-4-20250514",
-        "max_tokens": 800,
+        "max_tokens": 1000,
         "messages": [{"role": "user", "content": prompt}]
     }).encode()
 

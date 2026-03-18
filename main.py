@@ -1,3 +1,4 @@
+from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from routes.health import router as health_router
@@ -57,7 +58,14 @@ TAGS_METADATA = [
     {"name": "conversation", "description": "Conversation Coach — ask questions about your match data"},
 ]
 
+@asynccontextmanager
+async def lifespan(app):
+    """Clean corrupted match data at startup."""
+    clean_memory()
+    yield
+
 app = FastAPI(
+    lifespan=lifespan,
     title="AthLink CV Service",
     description=(
         "Football video analysis backend. Tracks players across frames using "
@@ -109,11 +117,6 @@ app.include_router(analytics_router, prefix="/api/v1", tags=["analytics"])
 app.include_router(match_pipeline_router, prefix="/api/v1/match", tags=["match"])
 app.include_router(analytics_overlay_router, prefix="/api/v1/analytics-overlay", tags=["analytics-overlay"])
 app.include_router(conversation_router, prefix="/api/v1", tags=["conversation"])
-
-@app.on_event("startup")
-async def startup_cleanup():
-    """Clean corrupted match data at startup."""
-    clean_memory()
 
 @app.get("/")
 async def root():
