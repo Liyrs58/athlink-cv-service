@@ -16,17 +16,12 @@ from services.confidence_service import (
     score_physical_metric,
     build_data_confidence_summary,
 )
+from services.job_queue_service import create_job, submit_job
 
 router = APIRouter()
 
-@router.post("/analyse")
-async def analyse_video(video: UploadFile = File(...)):
-    job_id = str(uuid.uuid4())[:8]
-    temp_path = f"/tmp/{job_id}_{video.filename}"
-
-    with open(temp_path, "wb") as f:
-        shutil.copyfileobj(video.file, f)
-
+def _run_analysis_pipeline(job_id: str, temp_path: str):
+    """Background task — runs the full analysis pipeline."""
     try:
         # Pitch calibration
         calibration = get_frame_calibration(temp_path)
@@ -138,7 +133,7 @@ async def analyse_video(video: UploadFile = File(...)):
         total_players = high_count + data_confidence.get("medium_confidence_players", 0) + data_confidence.get("low_confidence_players", 0)
         phys_conf = "high" if total_players > 0 and high_count / total_players >= 0.6 else "medium"
 
-        return JSONResponse({
+        result = {
             "job_id": job_id,
             "matches_in_memory": get_match_count(),
             "tracking": {
@@ -180,7 +175,31 @@ async def analyse_video(video: UploadFile = File(...)):
             },
             "corrections_applied": corrections_applied,
             "analysis": analysis_text,
-        })
+        }
+        return result
     finally:
         if os.path.exists(temp_path):
             os.remove(temp_path)
+
+@router.post("/analyse")
+async def analyse_video(video: UploadFile = File(...)):
+    """Submit video for async background analysis. Returns immediately with job_id."""
+    job_id = str(uuid.uuid4())[:8]
+    temp_path = f"/tmp/{job_id}_{video.filename}"
+
+    # Write video to temp file
+    with open(temp_path, "wb") as f:
+        shutil.copyfileobj(video.file, f)
+
+    # Create job in queue
+    create_job(job_id)
+
+    # Submit async task
+    submit_job(job_id, _run_analysis_pipeline, job_id, temp_path)
+
+    # Return immediately with poll URL
+    return JSONResponse({
+        "job_id": job_id,
+        "status": "processing",
+        "poll_url": f"/api/v1/jobs/status/{job_id}"
+    })

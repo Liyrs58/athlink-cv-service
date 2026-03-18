@@ -506,13 +506,42 @@
                 return response.json();
             })
             .then(data => {
-                clearInterval(loadingInterval);
-                showResults(data);
+                // Got job_id, now poll for status
+                pollJobStatus(data.job_id);
             })
             .catch(error => {
                 clearInterval(loadingInterval);
                 showError(error.message);
             });
+        }
+
+        function pollJobStatus(jobId) {
+            const pollUrl = `http://localhost:8005/api/v1/jobs/status/${jobId}`;
+            const pollInterval = setInterval(() => {
+                fetch(pollUrl)
+                    .then(response => {
+                        if (!response.ok) {
+                            throw new Error(`HTTP error! status: ${response.status}`);
+                        }
+                        return response.json();
+                    })
+                    .then(job => {
+                        if (job.status === 'completed') {
+                            clearInterval(pollInterval);
+                            clearInterval(loadingInterval);
+                            showResults(job.result);
+                        } else if (job.status === 'failed') {
+                            clearInterval(pollInterval);
+                            clearInterval(loadingInterval);
+                            showError(job.error || 'Analysis failed');
+                        }
+                        // else: keep polling for 'processing' or 'queued'
+                    })
+                    .catch(error => {
+                        console.error('Poll error:', error);
+                        // Keep polling even on network errors
+                    });
+            }, 5000); // Poll every 5 seconds
         }
 
         function updateLoadingMessage() {
