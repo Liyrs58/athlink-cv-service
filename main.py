@@ -128,6 +128,8 @@ async def root():
         "docs": "/docs"
     }
 
+app.mount("/", StaticFiles(directory="static", html=True), name="static")
+
 if __name__ == "__main__":
     import uvicorn
     import os
