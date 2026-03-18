@@ -119,7 +119,7 @@ app.include_router(match_pipeline_router, prefix="/api/v1/match", tags=["match"]
 app.include_router(analytics_overlay_router, prefix="/api/v1/analytics-overlay", tags=["analytics-overlay"])
 app.include_router(conversation_router, prefix="/api/v1", tags=["conversation"])
 
-@app.get("/")
+@app.get("/health")
 async def root():
     return {
         "message": "AthLink CV Service",
