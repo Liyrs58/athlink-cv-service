@@ -1,7 +1,8 @@
 import math
+from typing import Optional, Dict, Any
 
-PIXELS_PER_METRE = 15.5   # 1920px frame, pitch ~85% of width, 105m wide
-SPRINT_MS = 6.94  # 25 km/h threshold (25 / 3.6 = 6.944 m/s)
+PIXELS_PER_METRE = 15.5   # 1920px frame, pitch ~85% of width, 105m wide (default fallback)
+SPRINT_MS = 5.5  # 19.8 km/h threshold — realistic for broadcast tracking
 HIGH_INTENSITY_MS = 5.5
 WALKING_MS = 2.0
 MAX_REALISTIC_SPEED_MS = 10.0  # 36 km/h — cap to remove tracking artifacts
@@ -9,7 +10,11 @@ MAX_REALISTIC_SPEED_MS = 10.0  # 36 km/h — cap to remove tracking artifacts
 def get_centre(bbox):
     return ((bbox[0] + bbox[2]) / 2.0, (bbox[1] + bbox[3]) / 2.0)
 
-def compute_player_velocity(track):
+def compute_player_velocity(track, calibration: Optional[Dict[str, Any]] = None):
+    ppm = PIXELS_PER_METRE
+    if calibration and isinstance(calibration.get("pixels_per_metre"), (int, float)):
+        ppm = calibration["pixels_per_metre"]
+
     traj = track.get("trajectory", [])
     if len(traj) < 2:
         return {
@@ -48,7 +53,9 @@ def compute_player_velocity(track):
         cx_curr, cy_curr = get_centre(curr["bbox"])
 
         # FIX 1c: Only count sprints/distance if player is on pitch
-        world_x, world_y = (cx_curr / 1920) * 105.0, (cy_curr / 1080) * 68.0  # Approximate scaling
+        vis_frac = calibration.get("visible_fraction", 0.55) if calibration else 0.55
+        world_x = (cx_curr / 1920) * (105.0 * vis_frac)
+        world_y = (cy_curr / 1080) * (68.0 * vis_frac)
         margin = 5.0
         if not (-margin <= world_x <= 105.0 + margin and
                 -margin <= world_y <= 68.0 + margin):
@@ -58,7 +65,7 @@ def compute_player_velocity(track):
         dy = cy_curr - cy_prev
         dist_px = math.sqrt(dx*dx + dy*dy)
         speed_px_s = dist_px / dt
-        speed_ms = speed_px_s / PIXELS_PER_METRE
+        speed_ms = speed_px_s / ppm
 
         # Sanity cap — no human runs faster than 10 m/s (36 km/h)
         if speed_ms > MAX_REALISTIC_SPEED_MS:
@@ -67,7 +74,7 @@ def compute_player_velocity(track):
         total_distance_px += dist_px
         speeds.append(speed_ms)
 
-        # Sprint detection: require 1.0s sustained >25 km/h + 3s cooldown between sprints
+        # Sprint detection: require 0.4s sustained >19.8 km/h + 2s cooldown between sprints
         if speed_ms >= SPRINT_MS:
             if not in_sprint:
                 # Start new potential sprint
@@ -77,8 +84,8 @@ def compute_player_velocity(track):
             # Exited sprint zone
             if in_sprint and sprint_start_time is not None:
                 sprint_duration = curr["timestampSeconds"] - sprint_start_time
-                # Only count if sustained for >= 1.0 second
-                if sprint_duration >= 1.0:
+                # Only count if sustained for >= 0.4 second
+                if sprint_duration >= 0.4:
                     sprint_intervals.append((sprint_start_time, curr["timestampSeconds"]))
             in_sprint = False
             sprint_start_time = None
@@ -93,16 +100,16 @@ def compute_player_velocity(track):
     # Handle final sprint if still active
     if in_sprint and sprint_start_time is not None:
         sprint_duration = traj[-1]["timestampSeconds"] - sprint_start_time
-        if sprint_duration >= 1.0:
+        if sprint_duration >= 0.4:
             sprint_intervals.append((sprint_start_time, traj[-1]["timestampSeconds"]))
 
-    # Apply 3-second cooldown: merge sprints separated by less than 3 seconds
+    # Apply 2-second cooldown: merge sprints separated by less than 2 seconds
     if sprint_intervals:
         merged_intervals = [sprint_intervals[0]]
         for start, end in sprint_intervals[1:]:
             last_start, last_end = merged_intervals[-1]
             time_since_last = start - last_end
-            if time_since_last < 3.0:
+            if time_since_last < 2.0:
                 # Merge with previous sprint (extend end time)
                 merged_intervals[-1] = (last_start, max(end, last_end))
             else:
@@ -110,7 +117,7 @@ def compute_player_velocity(track):
                 merged_intervals.append((start, end))
         sprint_count = len(merged_intervals)
 
-    total_distance_m = total_distance_px / PIXELS_PER_METRE
+    total_distance_m = total_distance_px / ppm
 
     return {
         "track_id": track["trackId"],
@@ -121,20 +128,20 @@ def compute_player_velocity(track):
         "high_intensity_runs": high_intensity_runs,
     }
 
-def compute_all_velocities(tracks):
+def compute_all_velocities(tracks, calibration: Optional[Dict[str, Any]] = None):
     results = []
     for track in tracks:
         # FIX 1c: Only compute velocities for non-staff tracks
         if (track.get("confirmed_detections", 0) >= 5 and
             not track.get("is_staff", False)):
-            results.append(compute_player_velocity(track))
+            results.append(compute_player_velocity(track, calibration=calibration))
     results.sort(key=lambda x: x["distance_metres"], reverse=True)
     return results
 
 def get_team_velocity_summary(velocity_results):
     if not velocity_results:
         return {}
-    valid = [v for v in velocity_results if v["distance_metres"] > 0]
+    valid = [v for v in velocity_results if isinstance(v.get("distance_metres"), (int, float)) and v["distance_metres"] > 0]
     if not valid:
         return {}
     total_distance = sum(v["distance_metres"] for v in valid)

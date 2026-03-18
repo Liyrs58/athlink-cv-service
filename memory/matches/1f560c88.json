@@ -1,0 +1,56 @@
+{
+  "job_id": "1f560c88",
+  "timestamp": "2026-03-18T03:31:28.922696",
+  "tracking": {
+    "total_tracks": 14
+  },
+  "situations": {
+    "events": [
+      {
+        "situation": "DEAD_BALL",
+        "start_frame": 0,
+        "end_frame": 998,
+        "start_time": 0.0,
+        "end_time": 39.92,
+        "duration_seconds": 39.92
+      }
+    ]
+  },
+  "physical": {
+    "total_distance_metres": 63.9,
+    "total_sprints": 0,
+    "max_speed_ms": 9.93,
+    "max_speed_kmh": 35.7,
+    "players_analysed": 7,
+    "top_sprinter_id": 5203,
+    "top_runner_id": 5203,
+    "top_runner_distance": 17.5
+  },
+  "shape": {
+    "frames_analysed": 21,
+    "team_0": {
+      "avg_width_metres": null,
+      "avg_depth_metres": null,
+      "avg_compactness_metres": null,
+      "min_width_metres": null,
+      "max_width_metres": null
+    },
+    "team_1": {
+      "avg_width_metres": null,
+      "avg_depth_metres": null,
+      "avg_compactness_metres": null,
+      "min_width_metres": null,
+      "max_width_metres": null
+    },
+    "combined_width_metres": null,
+    "min_combined_width_metres": null,
+    "max_combined_width_metres": null,
+    "avg_width_metres": null,
+    "avg_depth_metres": null,
+    "avg_compactness_metres": null,
+    "min_width_metres": null,
+    "max_width_metres": null,
+    "data_quality": "unavailable"
+  },
+  "analysis": "# COACHING REPORT\n\n## MATCH SITUATION\nThis 40-second clip shows a dead ball situation from start to finish. With 14 players tracked on the pitch, this was likely a set piece or stoppage in play.\n\n## INDIVIDUAL PLAYER ANALYSIS\nNo individual player analysis available - the broadcast tracking didn't capture enough reliable movement data for any player during this dead ball period.\n\n## TEAM RHYTHM\n**0s-40s: DEAD_BALL**\nThe entire clip was a stoppage in play. No active game phases to analyze.\n\n## TEAM SHAPE\nData unavailable for this clip due to camera angle or detection issues.\n\n## PHYSICAL PERFORMANCE CONTEXT\nAcross 2 previous matches, the team recorded a maximum speed of 35.9 km/h and completed 12 sprints in one match versus 0 sprints in another, showing variable intensity levels between games.\n\n## THE ONE THING TO ADDRESS BEFORE SATURDAY\n**Set piece organization and positioning**\n\nSince this entire clip was a dead ball situation, use this as an opportunity to review your set piece routines. Make sure players know their exact positions and responsibilities during stoppages - these moments often decide tight matches.\n\n**Training Focus:** Spend 15 minutes on set piece positioning drills, emphasizing quick organization when play stops.\n\n---\n*Note: Limited movement data available due to the static nature of this dead ball situation.*"
+}

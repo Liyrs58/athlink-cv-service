@@ -1,0 +1,56 @@
+{
+  "job_id": "d420fabe",
+  "timestamp": "2026-03-18T03:25:31.864564",
+  "tracking": {
+    "total_tracks": 15
+  },
+  "situations": {
+    "events": [
+      {
+        "situation": "DEAD_BALL",
+        "start_frame": 0,
+        "end_frame": 998,
+        "start_time": 0.0,
+        "end_time": 39.92,
+        "duration_seconds": 39.92
+      }
+    ]
+  },
+  "physical": {
+    "total_distance_metres": 70.1,
+    "total_sprints": 0,
+    "max_speed_ms": 9.93,
+    "max_speed_kmh": 35.7,
+    "players_analysed": 8,
+    "top_sprinter_id": 1360,
+    "top_runner_id": 1360,
+    "top_runner_distance": 17.5
+  },
+  "shape": {
+    "frames_analysed": 21,
+    "team_0": {
+      "avg_width_metres": null,
+      "avg_depth_metres": null,
+      "avg_compactness_metres": null,
+      "min_width_metres": null,
+      "max_width_metres": null
+    },
+    "team_1": {
+      "avg_width_metres": null,
+      "avg_depth_metres": null,
+      "avg_compactness_metres": null,
+      "min_width_metres": null,
+      "max_width_metres": null
+    },
+    "combined_width_metres": null,
+    "min_combined_width_metres": null,
+    "max_combined_width_metres": null,
+    "avg_width_metres": null,
+    "avg_depth_metres": null,
+    "avg_compactness_metres": null,
+    "min_width_metres": null,
+    "max_width_metres": null,
+    "data_quality": "unavailable"
+  },
+  "analysis": "# COACHING REPORT\n\n## MATCH SITUATION\nThis 40-second clip shows a dead ball situation from start to finish. 15 players were tracked on the pitch, but the broadcast tracking couldn't reliably capture individual player movements during this static phase.\n\n## INDIVIDUAL PLAYER ANALYSIS\nNo players had enough reliable tracking data (5+ detections) to provide meaningful physical statistics. The dead ball nature of this clip means most players were stationary or making minimal movements.\n\n## TEAM RHYTHM\n**0s-40s: DEAD_BALL**\nThe entire clip was a set piece or stoppage situation with no active play.\n\n## TEAM SHAPE\nData unavailable for this clip due to camera angle or detection limitations during the dead ball phase.\n\n## THE ONE THING TO ADDRESS BEFORE SATURDAY\nFocus on set piece organization and positioning. Since this entire clip was a dead ball situation, use it to review how players position themselves and communicate during stoppages. Work on maintaining focus and proper spacing even when play is stopped.\n\n## DATA RELIABILITY NOTE\nThe physical tracking data for this clip is unreliable due to the static nature of dead ball situations and broadcast tracking limitations. Individual player statistics cannot be confidently reported from this footage.\n\n## HISTORICAL REFERENCE\nAcross 1 previous match, the team showed good movement with 12 sprints and a maximum speed of 35.9 km/h, suggesting the tracking issues are specific to this dead ball clip rather than a broader data problem."
+}

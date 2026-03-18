@@ -28,6 +28,7 @@ from routes.storage import router as storage_router
 from routes.analytics import router as analytics_router
 from routes.match_pipeline import router as match_pipeline_router
 from routes.analytics_overlay import router as analytics_overlay_router
+from routes.conversation import router as conversation_router
 from services.memory_service import clean_memory
 
 TAGS_METADATA = [
@@ -53,6 +54,7 @@ TAGS_METADATA = [
     {"name": "analytics", "description": "Unified EPL analytics report"},
     {"name": "match", "description": "Full match pipeline with checkpointing"},
     {"name": "analytics-overlay", "description": "Analytics overlay video rendering"},
+    {"name": "conversation", "description": "Conversation Coach — ask questions about your match data"},
 ]
 
 app = FastAPI(
@@ -106,6 +108,7 @@ app.include_router(storage_router, prefix="/api/v1/storage", tags=["storage"])
 app.include_router(analytics_router, prefix="/api/v1", tags=["analytics"])
 app.include_router(match_pipeline_router, prefix="/api/v1/match", tags=["match"])
 app.include_router(analytics_overlay_router, prefix="/api/v1/analytics-overlay", tags=["analytics-overlay"])
+app.include_router(conversation_router, prefix="/api/v1", tags=["conversation"])
 
 @app.on_event("startup")
 async def startup_cleanup():

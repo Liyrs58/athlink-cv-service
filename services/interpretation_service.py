@@ -3,8 +3,18 @@ import json
 import math
 import urllib.request
 
-def build_rich_context(events, tracks, vel_summary, shape_summary, velocities, job_id):
+
+def safe_float(val):
+    """Convert any value to float safely. Returns None if not numeric."""
+    try:
+        return float(val) if val is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def build_rich_context(events, tracks, vel_summary, shape_summary, velocities, job_id, team_separation=None):
     """Build honest, coach-friendly context for Claude AI report."""
+    team_sep = team_separation or {}
 
     # FIX 1d: Only include non-staff tracks in analysis
     on_pitch_players = [t for t in tracks if not t.get('is_staff', False)]
@@ -16,80 +26,80 @@ def build_rich_context(events, tracks, vel_summary, shape_summary, velocities, j
         )[:30]
 
     confirmed = [t for t in on_pitch_players if t.get("confirmed_detections", 0) >= 5]
-    total_duration = events[-1]["end_time"] if events else 0
+    total_duration = safe_float(events[-1]["end_time"]) if events else 0
     on_pitch_count = len(on_pitch_players)
 
-    # PART A: Data quality checks
+    # PART A: Data quality checks — safe_float everything before comparing
     warnings = []
-    max_speed_kmh = vel_summary.get('max_speed_kmh', 0)
-    total_sprints = vel_summary.get('total_sprints', 0)
-    avg_width_m = shape_summary.get('avg_width_metres', 0)
+    max_speed_kmh = safe_float(vel_summary.get('max_speed_kmh', 0))
+    total_sprints = safe_float(vel_summary.get('total_sprints', 0))
+    avg_width_m = safe_float(shape_summary.get('avg_width_metres'))
+    avg_depth_m = safe_float(shape_summary.get('avg_depth_metres'))
 
-    # Safe numeric conversions (handle None and string values)
-    try:
-        max_speed_float = float(max_speed_kmh) if max_speed_kmh not in (None, "data unavailable") else None
-    except (TypeError, ValueError):
-        max_speed_float = None
+    shape_data_available = avg_width_m is not None
 
-    try:
-        total_sprints_float = float(total_sprints) if total_sprints not in (None, "data unavailable") else None
-    except (TypeError, ValueError):
-        total_sprints_float = None
-
-    try:
-        avg_width_float = float(avg_width_m) if avg_width_m not in (None, "data unavailable") else None
-    except (TypeError, ValueError):
-        avg_width_float = None
-
-    # Handle None and string values from shape data
-    shape_data_available = (
-        avg_width_m is not None and
-        avg_width_m != "data unavailable" and
-        isinstance(avg_width_m, (int, float))
-    )
-
-    if on_pitch_count > 25:
+    if isinstance(on_pitch_count, (int, float)) and on_pitch_count > 25:
         warnings.append("Note: player count seems high — some duplicates may exist. Treat individual player stats as approximate.")
 
-    if max_speed_float and max_speed_float > 35:
+    if max_speed_kmh is not None and max_speed_kmh > 35:
         # Will exclude from prompt entirely
         pass
 
-    if total_sprints_float and total_sprints_float > 50:
+    if total_sprints is not None and total_sprints > 50:
         warnings.append("Sprint count may be inflated by tracking noise. Focus on relative comparison between players, not absolute numbers.")
 
-    if shape_data_available and avg_width_float and avg_width_float > 70:
-        # Will replace with unavailable message
-        pass
+    if avg_width_m is not None and avg_width_m > 70:
+        shape_data_available = False
 
     # Build situation timeline for team rhythm
     situation_timeline = []
     for e in events:
-        situation_timeline.append(f"{e['start_time']:.0f}s-{e['end_time']:.0f}s: {e['situation']}")
+        start = safe_float(e.get('start_time', 0)) or 0
+        end = safe_float(e.get('end_time', 0)) or 0
+        situation_timeline.append(f"{start:.0f}s-{end:.0f}s: {e['situation']}")
 
     # Build per-player stats (only realistic values)
+    # Build a lookup from track_id to teamId for labelling
+    track_team_map = {}
+    for t in tracks:
+        tid = t.get("trackId")
+        if tid is not None:
+            track_team_map[tid] = t.get("teamId", -1)
+
+    t0_name = team_sep.get("team_0_colour_name", "A")
+    t1_name = team_sep.get("team_1_colour_name", "B")
+    has_teams = team_sep.get("status") == "ok"
+
     per_player_stats = []
-    players_with_5_detections = [v for v in velocities if v.get('confirmed_detections', 0) >= 5]
+    players_with_5_detections = [v for v in velocities if isinstance(v.get('confirmed_detections', 0), (int, float)) and v.get('confirmed_detections', 0) >= 5]
     for v in players_with_5_detections:
         track_id = v['track_id']
-        sprint_count = v.get('sprint_count', 0)
-        max_speed_ms = v.get('max_speed_ms', 0)
-        distance = v.get('distance_metres', 0)
+        sprint_count = safe_float(v.get('sprint_count', 0)) or 0
+        max_speed_ms = safe_float(v.get('max_speed_ms', 0))
+        distance = safe_float(v.get('distance_metres', 0)) or 0
 
-        # Safe numeric conversion for player speed
-        try:
-            max_speed_float = float(max_speed_ms) if max_speed_ms not in (None, "data unavailable") else None
-            max_speed_player_kmh = round(max_speed_float * 3.6, 1) if max_speed_float else 0
-        except (TypeError, ValueError):
+        if max_speed_ms is not None:
+            max_speed_player_kmh = round(max_speed_ms * 3.6, 1)
+        else:
             max_speed_player_kmh = 0
 
+        # Team label
+        team_label = ""
+        if has_teams:
+            ptid = track_team_map.get(track_id, -1)
+            if ptid == 0:
+                team_label = f" [{t0_name}]"
+            elif ptid == 1:
+                team_label = f" [{t1_name}]"
+
         # Skip if speed is unrealistic
-        if max_speed_player_kmh > 35:
-            per_player_stats.append(f"  PLAYER #{track_id}: data unreliable for this player")
+        if isinstance(max_speed_player_kmh, (int, float)) and max_speed_player_kmh > 35:
+            per_player_stats.append(f"  PLAYER #{track_id}{team_label}: data unreliable for this player")
         else:
-            per_player_stats.append(f"  PLAYER #{track_id}: {sprint_count} sprints | {max_speed_player_kmh} km/h | {distance}m")
+            per_player_stats.append(f"  PLAYER #{track_id}{team_label}: {int(sprint_count)} sprints | {max_speed_player_kmh} km/h | {distance}m")
 
     # Start building prompt with honest structure
+    duration_str = f"{total_duration:.0f}" if isinstance(total_duration, (int, float)) else "unknown"
     lines = [
         "You are a football coach assistant.",
         "Write a coaching report from this match data ONLY.",
@@ -103,11 +113,23 @@ def build_rich_context(events, tracks, vel_summary, shape_summary, velocities, j
         "Do not extrapolate or infer patterns beyond the current match data.",
         "",
         "CONFIRMED DATA (reliable):",
-        f"- Clip duration: {total_duration:.0f}s",
+        f"- Clip duration: {duration_str}s",
         f"- Match phases: {', '.join(situation_timeline)}",
         f"- Players tracked: {on_pitch_count} on-pitch players",
         "",
     ]
+
+    # Add team separation info if available
+    if team_sep.get("status") == "ok":
+        t0_name = team_sep.get("team_0_colour_name", "unknown")
+        t1_name = team_sep.get("team_1_colour_name", "unknown")
+        t0_count = team_sep.get("team_0_players", 0)
+        t1_count = team_sep.get("team_1_players", 0)
+        lines.append("TEAM IDENTIFICATION:")
+        lines.append(f"- Team A ({t0_name} jersey): {t0_count} players detected")
+        lines.append(f"- Team B ({t1_name} jersey): {t1_count} players detected")
+        lines.append("When discussing players, group them by team colour.")
+        lines.append("")
 
     # Add warnings if any
     if warnings:
@@ -145,8 +167,18 @@ def build_rich_context(events, tracks, vel_summary, shape_summary, velocities, j
     # Add shape data if available
     if shape_data_available:
         lines.append("TEAM SHAPE (formation width/depth):")
-        lines.append(f"- Average width: {shape_summary.get('avg_width_metres', 'N/A')}m")
-        lines.append(f"- Average depth: {shape_summary.get('avg_depth_metres', 'N/A')}m")
+        # Per-team shape if team separation succeeded
+        t0_shape = shape_summary.get("team_0", {})
+        t1_shape = shape_summary.get("team_1", {})
+        if has_teams and t0_shape.get("avg_width_metres") is not None:
+            lines.append(f"- Team A ({t0_name}): width {t0_shape['avg_width_metres']}m, depth {t0_shape.get('avg_depth_metres', '?')}m")
+        if has_teams and t1_shape.get("avg_width_metres") is not None:
+            lines.append(f"- Team B ({t1_name}): width {t1_shape['avg_width_metres']}m, depth {t1_shape.get('avg_depth_metres', '?')}m")
+        # Combined fallback
+        width_str = f"{avg_width_m}m" if avg_width_m is not None else "N/A"
+        depth_str = f"{avg_depth_m}m" if avg_depth_m is not None else "N/A"
+        lines.append(f"- Overall width: {width_str}")
+        lines.append(f"- Overall depth: {depth_str}")
         lines.append("")
     else:
         lines.append("TEAM SHAPE: Data unavailable for this clip (camera angle or detection issues)")
@@ -165,7 +197,7 @@ def build_rich_context(events, tracks, vel_summary, shape_summary, velocities, j
     return "\n".join(lines)
 
 
-def interpret_events(events, tracks, job_id, velocity_summary=None, shape_summary=None, velocities=None, memory=None):
+def interpret_events(events, tracks, job_id, velocity_summary=None, shape_summary=None, velocities=None, memory=None, team_separation=None):
     if not events:
         return [{"job_id": job_id, "analysis": "No events to analyse.", "events": []}]
 
@@ -174,7 +206,8 @@ def interpret_events(events, tracks, job_id, velocity_summary=None, shape_summar
         velocity_summary or {},
         shape_summary or {},
         velocities or [],
-        job_id
+        job_id,
+        team_separation=team_separation,
     )
 
     if memory:

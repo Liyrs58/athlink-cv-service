@@ -1,0 +1,136 @@
+{
+  "job_id": "69213a7d",
+  "timestamp": "2026-03-18T05:18:30.021300",
+  "tracking": {
+    "total_tracks": 42
+  },
+  "situations": {
+    "events": [
+      {
+        "situation": "OPEN_PLAY",
+        "start_frame": 0,
+        "end_frame": 226,
+        "start_time": 0.0,
+        "end_time": 9.04,
+        "duration_seconds": 9.04
+      },
+      {
+        "situation": "DEAD_BALL",
+        "start_frame": 226,
+        "end_frame": 262,
+        "start_time": 9.04,
+        "end_time": 10.48,
+        "duration_seconds": 1.44
+      },
+      {
+        "situation": "OPEN_PLAY",
+        "start_frame": 262,
+        "end_frame": 376,
+        "start_time": 10.48,
+        "end_time": 15.04,
+        "duration_seconds": 4.56
+      },
+      {
+        "situation": "DEAD_BALL",
+        "start_frame": 384,
+        "end_frame": 454,
+        "start_time": 15.36,
+        "end_time": 18.16,
+        "duration_seconds": 2.8
+      },
+      {
+        "situation": "OPEN_PLAY",
+        "start_frame": 454,
+        "end_frame": 550,
+        "start_time": 18.16,
+        "end_time": 22.0,
+        "duration_seconds": 3.84
+      },
+      {
+        "situation": "DEAD_BALL",
+        "start_frame": 560,
+        "end_frame": 566,
+        "start_time": 22.4,
+        "end_time": 22.64,
+        "duration_seconds": 0.24
+      },
+      {
+        "situation": "OPEN_PLAY",
+        "start_frame": 566,
+        "end_frame": 582,
+        "start_time": 22.64,
+        "end_time": 23.28,
+        "duration_seconds": 0.64
+      },
+      {
+        "situation": "OPEN_PLAY",
+        "start_frame": 586,
+        "end_frame": 600,
+        "start_time": 23.44,
+        "end_time": 24.0,
+        "duration_seconds": 0.56
+      },
+      {
+        "situation": "DEAD_BALL",
+        "start_frame": 600,
+        "end_frame": 784,
+        "start_time": 24.0,
+        "end_time": 31.36,
+        "duration_seconds": 7.36
+      },
+      {
+        "situation": "OPEN_PLAY",
+        "start_frame": 784,
+        "end_frame": 816,
+        "start_time": 31.36,
+        "end_time": 32.64,
+        "duration_seconds": 1.28
+      },
+      {
+        "situation": "OPEN_PLAY",
+        "start_frame": 817,
+        "end_frame": 998,
+        "start_time": 32.68,
+        "end_time": 39.92,
+        "duration_seconds": 7.24
+      }
+    ]
+  },
+  "physical": {
+    "total_distance_metres": 337.6,
+    "total_sprints": 22,
+    "max_speed_ms": 9.93,
+    "max_speed_kmh": 35.7,
+    "players_analysed": 27,
+    "top_sprinter_id": 15,
+    "top_runner_id": 855,
+    "top_runner_distance": 36.5
+  },
+  "shape": {
+    "frames_analysed": 251,
+    "team_0": {
+      "avg_width_metres": 39.5,
+      "avg_depth_metres": 13.1,
+      "avg_compactness_metres": 14.5,
+      "min_width_metres": 0.0,
+      "max_width_metres": 53.9
+    },
+    "team_1": {
+      "avg_width_metres": 22.2,
+      "avg_depth_metres": 6.6,
+      "avg_compactness_metres": 11.6,
+      "min_width_metres": 4.5,
+      "max_width_metres": 55.1
+    },
+    "combined_width_metres": 37.3,
+    "min_combined_width_metres": 5.2,
+    "max_combined_width_metres": 55.1,
+    "avg_width_metres": 37.3,
+    "avg_depth_metres": 10.5,
+    "avg_compactness_metres": 13.3,
+    "min_width_metres": 5.2,
+    "max_width_metres": 55.1,
+    "data_quality": "ok"
+  },
+  "analysis": "API error: HTTP Error 401: Unauthorized"
+}

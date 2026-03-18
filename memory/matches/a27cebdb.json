@@ -1,0 +1,56 @@
+{
+  "job_id": "a27cebdb",
+  "timestamp": "2026-03-18T03:48:59.790566",
+  "tracking": {
+    "total_tracks": 88
+  },
+  "situations": {
+    "events": [
+      {
+        "situation": "DEAD_BALL",
+        "start_frame": 0,
+        "end_frame": 998,
+        "start_time": 0.0,
+        "end_time": 39.92,
+        "duration_seconds": 39.92
+      }
+    ]
+  },
+  "physical": {
+    "total_distance_metres": 496.3,
+    "total_sprints": 37,
+    "max_speed_ms": 9.96,
+    "max_speed_kmh": 35.9,
+    "players_analysed": 46,
+    "top_sprinter_id": 2017,
+    "top_runner_id": 2017,
+    "top_runner_distance": 31.1
+  },
+  "shape": {
+    "frames_analysed": 440,
+    "team_0": {
+      "avg_width_metres": 57.1,
+      "avg_depth_metres": 20.0,
+      "avg_compactness_metres": 20.1,
+      "min_width_metres": 38.8,
+      "max_width_metres": 67.3
+    },
+    "team_1": {
+      "avg_width_metres": null,
+      "avg_depth_metres": null,
+      "avg_compactness_metres": null,
+      "min_width_metres": null,
+      "max_width_metres": null
+    },
+    "combined_width_metres": 57.1,
+    "min_combined_width_metres": 38.8,
+    "max_combined_width_metres": 67.3,
+    "avg_width_metres": 57.1,
+    "avg_depth_metres": 20.0,
+    "avg_compactness_metres": 20.1,
+    "min_width_metres": 38.8,
+    "max_width_metres": 67.3,
+    "data_quality": "ok"
+  },
+  "analysis": "API error: HTTP Error 401: Unauthorized"
+}

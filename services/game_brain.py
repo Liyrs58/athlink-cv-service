@@ -23,8 +23,8 @@ def detect_situation(tracks, ball, frame_idx, pitch_w=105.0, pitch_h=68.0):
 
     all_bboxes = [t for t in tracks if t.get("bbox")]
 
-    if len(all_bboxes) < 6:
-        # Very few players visible — likely bench cutaway or stadium shot
+    if len(all_bboxes) < 4:
+        # Very few players visible — dead ball / bench cutaway / stadium shot
         return {"situation": "DEAD_BALL", "confidence": 0.95, "details": {"reason": "low_detection", "tracks": len(all_bboxes)}}
 
     # Calculate average bbox movement from previous frame if available
@@ -60,9 +60,16 @@ def detect_situation(tracks, ball, frame_idx, pitch_w=105.0, pitch_h=68.0):
     # Determine average movement per player
     avg_movement = total_movement / max(movement_samples, 1)
 
-    # DEAD_BALL: requires BOTH low movement AND few players visible
-    # Only trigger if movement < 2 pixels AND fewer than 8 players on pitch
-    if avg_movement < 2.0 and len(all_bboxes) < 8 and movement_samples >= 4:
+    # DEAD_BALL: requires BOTH very low movement AND very few players visible
+    # Logic:
+    # - If 5+ players detected with 4+ movement samples → OPEN_PLAY (enough players playing)
+    # - If fewer than 4 players AND movement < 3 pixels → DEAD_BALL (bench/cutaway)
+    # - Otherwise → OPEN_PLAY (default for normal play)
+    if len(all_bboxes) >= 5 and movement_samples >= 4:
+        # Enough moving players — continue to OPEN_PLAY at line 95
+        pass
+    elif len(all_bboxes) < 4 and avg_movement < 3.0 and movement_samples >= 4:
+        # Very few players AND almost no movement — this is dead ball (bench/cutaway)
         return {
             "situation": "DEAD_BALL",
             "confidence": 0.85,

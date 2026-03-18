@@ -1,6 +1,7 @@
 import os
 import json
 import logging
+import math
 from typing import Dict, Any, Optional, List, Tuple
 from pathlib import Path
 import cv2
@@ -312,21 +313,23 @@ def get_median_position(trajectory, frame_w, frame_h, homography=None):
     return median_x, median_y
 
 
-def is_near_pitch_boundary(median_x, median_y, pitch_w=105.0, pitch_h=68.0, boundary_margin=10.0) -> bool:
+def is_on_or_near_pitch(median_x, median_y, pitch_w=105.0, pitch_h=68.0, expand_margin=15.0) -> bool:
     """
-    Returns True if median position is within boundary_margin of any pitch edge.
-    This filters out tracks that are always in crowd/bench area far from play.
+    Returns True if median position is within the pitch bounding box expanded
+    by expand_margin on each side, OR within 20m of pitch centre.
+    Forgiving of homography errors from broadcast cameras.
     """
-    # Check if within boundary_margin of any edge:
-    # Left/right edges (x: -boundary_margin to pitch_w+boundary_margin)
-    # Top/bottom edges (y: -boundary_margin to pitch_h+boundary_margin)
-    near_x_edge = (-boundary_margin <= median_x <= boundary_margin) or (
-        (pitch_w - boundary_margin) <= median_x <= (pitch_w + boundary_margin)
+    # Check 1: within expanded pitch bounding box
+    in_expanded_box = (
+        -expand_margin <= median_x <= pitch_w + expand_margin and
+        -expand_margin <= median_y <= pitch_h + expand_margin
     )
-    near_y_edge = (-boundary_margin <= median_y <= boundary_margin) or (
-        (pitch_h - boundary_margin) <= median_y <= (pitch_h + boundary_margin)
-    )
-    return near_x_edge or near_y_edge
+    # Check 2: within 20m of pitch centre
+    centre_x, centre_y = pitch_w / 2.0, pitch_h / 2.0
+    dist_from_centre = math.sqrt((median_x - centre_x)**2 + (median_y - centre_y)**2)
+    near_centre = dist_from_centre <= 20.0
+
+    return in_expanded_box or near_centre
 
 
 def pixel_to_world(bbox, frame_w, frame_h, homography: Optional[np.ndarray] = None) -> Tuple[float, float]:
@@ -1044,7 +1047,7 @@ def run_tracking(
             if gap < 0 or gap > 60 * frame_stride:
                 continue
             dist = cv2.compareHist(hist_i, hist_j, cv2.HISTCMP_BHATTACHARYYA)
-            if dist < 0.25:
+            if dist < 0.40:
                 ti["trajectory"].extend(tj["trajectory"])
                 ti["hits"] += tj["hits"]
                 ti["lastSeen"] = max(ti["lastSeen"], tj["lastSeen"])
@@ -1071,8 +1074,8 @@ def run_tracking(
     for t in all_tracks:
         t.pop("_histogram", None)
 
-    # FIX 2: Minimum track length requirement — at least 15 detections (was 3, reduced false positives)
-    MIN_TRACK_DETECTIONS = 15
+    # Minimum track length requirement — at least 8 detections
+    MIN_TRACK_DETECTIONS = 8
     filtered = [t for t in all_tracks if t["hits"] >= MIN_TRACK_DETECTIONS]
     if len(filtered) < 5:
         # Fallback: accept tracks with >= 5 hits if we're too aggressive
@@ -1142,7 +1145,7 @@ def run_tracking(
     for track in filtered:
         median_x, median_y = get_median_position(track["trajectory"], frame_w_px, frame_h_px, homography_H)
         if median_x is not None and median_y is not None:
-            if is_near_pitch_boundary(median_x, median_y, boundary_margin=10.0):
+            if is_on_or_near_pitch(median_x, median_y, expand_margin=15.0):
                 zone_filtered.append(track)
                 track["median_x"] = round(median_x, 1)
                 track["median_y"] = round(median_y, 1)
