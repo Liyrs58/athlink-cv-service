@@ -1,24 +1,94 @@
 from typing import Dict, List, Any
+import math
 
 SITUATIONS = ["OPEN_PLAY", "SET_PIECE", "TRANSITION", "HIGH_PRESS", "DEAD_BALL"]
 
+# Track movement history for dead ball detection
+_movement_history = {}
+
 def detect_situation(tracks, ball, frame_idx, pitch_w=105.0, pitch_h=68.0):
-    if len(tracks) < 6:
-        return {"situation": "DEAD_BALL", "confidence": 0.9, "details": {"reason": "low_detection"}}
-    if ball and abs(ball.get("vx", 1.0)) < 0.5 and abs(ball.get("vy", 1.0)) < 0.5:
-        return {"situation": "SET_PIECE", "confidence": 0.8, "details": {}}
-    if ball and abs(ball.get("vx", 0)) > 3.0:
-        return {"situation": "TRANSITION", "confidence": 0.75, "details": {}}
-    all_bboxes = [t.get("bbox", []) for t in tracks if t.get("bbox")]
-    if all_bboxes:
-        heights = [b[3] for b in all_bboxes if len(b) >= 4]
-        if heights:
-            max_y = max(heights)
-            frame_h = max_y / 0.88
-            pressing = [b for b in all_bboxes if len(b) >= 4 and b[3] < frame_h * 0.35]
-            if len(pressing) >= 3:
-                return {"situation": "HIGH_PRESS", "confidence": 0.7, "details": {"pressing": len(pressing)}}
-    return {"situation": "OPEN_PLAY", "confidence": 0.7, "details": {"active_tracks": len(tracks)}}
+    """
+    Detect match situation from tracks and ball.
+
+    DEAD_BALL triggers when:
+    - Very few players detected (< 6), OR
+    - Average player movement drops to near-zero (bench/cutaway)
+
+    OPEN_PLAY/SET_PIECE based on ball and pitch activity.
+    """
+
+    # Calculate average movement velocity across all visible players
+    total_movement = 0.0
+    movement_samples = 0
+
+    all_bboxes = [t for t in tracks if t.get("bbox")]
+
+    if len(all_bboxes) < 6:
+        # Very few players visible — likely bench cutaway or stadium shot
+        return {"situation": "DEAD_BALL", "confidence": 0.95, "details": {"reason": "low_detection", "tracks": len(all_bboxes)}}
+
+    # Calculate average bbox movement from previous frame if available
+    for track in all_bboxes:
+        track_id = track.get("trackId", None)
+        bbox = track.get("bbox", [])
+
+        if track_id is None or len(bbox) < 4:
+            continue
+
+        # Get center of current bbox
+        cx_curr = (bbox[0] + bbox[2]) / 2.0
+        cy_curr = (bbox[1] + bbox[3]) / 2.0
+
+        # Check if we have previous position
+        if track_id in _movement_history:
+            cx_prev, cy_prev = _movement_history[track_id]
+            dx = cx_curr - cx_prev
+            dy = cy_curr - cy_prev
+            movement = math.sqrt(dx*dx + dy*dy)
+            total_movement += movement
+            movement_samples += 1
+
+        # Update movement history
+        _movement_history[track_id] = (cx_curr, cy_curr)
+
+    # Clean up stale track history (tracks not seen for 5+ frames)
+    seen_ids = {t.get("trackId") for t in all_bboxes if t.get("trackId")}
+    stale_ids = set(_movement_history.keys()) - seen_ids
+    for stale_id in stale_ids:
+        _movement_history.pop(stale_id, None)
+
+    # Determine average movement per player
+    avg_movement = total_movement / max(movement_samples, 1)
+
+    # DEAD_BALL: average movement < 5 pixels (near-zero activity)
+    if avg_movement < 5.0 and movement_samples >= 4:
+        return {
+            "situation": "DEAD_BALL",
+            "confidence": 0.85,
+            "details": {"reason": "low_movement", "avg_movement": round(avg_movement, 1), "tracks": len(all_bboxes)}
+        }
+
+    # Ball-based classification (if available)
+    if ball:
+        ball_vx = abs(ball.get("vx", 1.0))
+        ball_vy = abs(ball.get("vy", 1.0))
+        ball_speed = math.sqrt(ball_vx**2 + ball_vy**2)
+
+        if ball_speed < 0.5:
+            return {"situation": "SET_PIECE", "confidence": 0.8, "details": {"reason": "stationary_ball"}}
+        elif ball_speed > 3.0:
+            return {"situation": "TRANSITION", "confidence": 0.75, "details": {"reason": "fast_ball"}}
+
+    # Pressing detection: players in upper half of frame (aggressive positioning)
+    heights = [b[3] for b in [t.get("bbox", []) for t in all_bboxes] if len(b) >= 4]
+    if heights:
+        max_y = max(heights)
+        frame_h = max_y / 0.88
+        pressing = [b for b in [t.get("bbox", []) for t in all_bboxes] if len(b) >= 4 and b[3] < frame_h * 0.35]
+        if len(pressing) >= 3:
+            return {"situation": "HIGH_PRESS", "confidence": 0.7, "details": {"pressing": len(pressing)}}
+
+    return {"situation": "OPEN_PLAY", "confidence": 0.7, "details": {"active_tracks": len(all_bboxes), "avg_movement": round(avg_movement, 1)}}
 
 def get_situation_history(history, window=10):
     if not history:
@@ -53,7 +123,9 @@ def extract_situation_events(frame_results, fps=25.0, frame_stride=2):
         if situation != current_situation:
             if current_situation is not None:
                 duration = (frame_idx - current_start_frame) / fps
-                if duration >= 0.5:
+                # Detect DEAD_BALL faster (0.2s min), but still filter flicker for other situations
+                min_duration = 0.2 if current_situation == "DEAD_BALL" else 0.5
+                if duration >= min_duration:
                     events.append({
                         'situation': current_situation,
                         'start_frame': current_start_frame,
@@ -71,7 +143,8 @@ def extract_situation_events(frame_results, fps=25.0, frame_stride=2):
         last = frame_results[-1]
         last_frame = last.get('frameIndex', 0)
         duration = (last_frame - current_start_frame) / fps
-        if duration >= 0.5:
+        min_duration = 0.2 if current_situation == "DEAD_BALL" else 0.5
+        if duration >= min_duration:
             events.append({
                 'situation': current_situation,
                 'start_frame': current_start_frame,
