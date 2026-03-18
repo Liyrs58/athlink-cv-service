@@ -28,6 +28,7 @@ from routes.storage import router as storage_router
 from routes.analytics import router as analytics_router
 from routes.match_pipeline import router as match_pipeline_router
 from routes.analytics_overlay import router as analytics_overlay_router
+from services.memory_service import clean_memory
 
 TAGS_METADATA = [
     {"name": "health", "description": "Service health and device info"},
@@ -105,6 +106,11 @@ app.include_router(storage_router, prefix="/api/v1/storage", tags=["storage"])
 app.include_router(analytics_router, prefix="/api/v1", tags=["analytics"])
 app.include_router(match_pipeline_router, prefix="/api/v1/match", tags=["match"])
 app.include_router(analytics_overlay_router, prefix="/api/v1/analytics-overlay", tags=["analytics-overlay"])
+
+@app.on_event("startup")
+async def startup_cleanup():
+    """Clean corrupted match data at startup."""
+    clean_memory()
 
 @app.get("/")
 async def root():

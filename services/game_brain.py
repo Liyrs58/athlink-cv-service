@@ -60,8 +60,9 @@ def detect_situation(tracks, ball, frame_idx, pitch_w=105.0, pitch_h=68.0):
     # Determine average movement per player
     avg_movement = total_movement / max(movement_samples, 1)
 
-    # DEAD_BALL: average movement < 5 pixels (near-zero activity)
-    if avg_movement < 5.0 and movement_samples >= 4:
+    # DEAD_BALL: requires BOTH low movement AND few players visible
+    # Only trigger if movement < 2 pixels AND fewer than 8 players on pitch
+    if avg_movement < 2.0 and len(all_bboxes) < 8 and movement_samples >= 4:
         return {
             "situation": "DEAD_BALL",
             "confidence": 0.85,

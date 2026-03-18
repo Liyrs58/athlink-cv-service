@@ -51,6 +51,36 @@ def get_historical_context(limit=5):
 def get_match_count():
     return len(list((MEMORY_DIR / "matches").glob("*.json")))
 
+def clean_memory():
+    """Delete stored matches with corrupted data from old pipeline runs."""
+    matches_dir = MEMORY_DIR / "matches"
+    files = list(matches_dir.glob("*.json"))
+
+    deleted_count = 0
+    for f in files:
+        try:
+            with open(f) as fp:
+                m = json.load(fp)
+
+            physical = m.get("physical", {})
+            shape = m.get("shape", {})
+
+            total_sprints = physical.get("total_sprints", 0)
+            max_speed_kmh = physical.get("max_speed_kmh", 0)
+            avg_width_m = shape.get("avg_width_metres", 0)
+
+            # Delete if any metric exceeds thresholds from old pipeline
+            if total_sprints > 50 or max_speed_kmh > 36 or avg_width_m > 70:
+                f.unlink()
+                deleted_count += 1
+                print(f"Deleted corrupted match {f.name}: sprints={total_sprints}, speed={max_speed_kmh}km/h, width={avg_width_m}m")
+        except Exception as e:
+            print(f"Error checking {f.name}: {e}")
+
+    if deleted_count > 0:
+        print(f"Cleaned memory: deleted {deleted_count} corrupted matches")
+    return deleted_count
+
 def get_trend_analysis():
     """Analyse trends across all stored matches."""
     matches_dir = MEMORY_DIR / "matches"

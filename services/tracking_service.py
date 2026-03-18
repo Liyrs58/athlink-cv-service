@@ -286,6 +286,49 @@ def is_on_pitch(world_x, world_y,
             -margin <= world_y <= pitch_h + margin)
 
 
+def get_median_position(trajectory, frame_w, frame_h, homography=None):
+    """
+    Calculate median world position of a track.
+    Returns (median_x, median_y) in metres.
+    """
+    if not trajectory:
+        return None, None
+
+    positions = []
+    for entry in trajectory:
+        bbox = entry["bbox"]
+        world_x, world_y = pixel_to_world(bbox, frame_w, frame_h, homography)
+        positions.append((world_x, world_y))
+
+    if not positions:
+        return None, None
+
+    # Sort by x and y, take medians
+    xs = sorted([p[0] for p in positions])
+    ys = sorted([p[1] for p in positions])
+    median_x = xs[len(xs) // 2]
+    median_y = ys[len(ys) // 2]
+
+    return median_x, median_y
+
+
+def is_near_pitch_boundary(median_x, median_y, pitch_w=105.0, pitch_h=68.0, boundary_margin=10.0) -> bool:
+    """
+    Returns True if median position is within boundary_margin of any pitch edge.
+    This filters out tracks that are always in crowd/bench area far from play.
+    """
+    # Check if within boundary_margin of any edge:
+    # Left/right edges (x: -boundary_margin to pitch_w+boundary_margin)
+    # Top/bottom edges (y: -boundary_margin to pitch_h+boundary_margin)
+    near_x_edge = (-boundary_margin <= median_x <= boundary_margin) or (
+        (pitch_w - boundary_margin) <= median_x <= (pitch_w + boundary_margin)
+    )
+    near_y_edge = (-boundary_margin <= median_y <= boundary_margin) or (
+        (pitch_h - boundary_margin) <= median_y <= (pitch_h + boundary_margin)
+    )
+    return near_x_edge or near_y_edge
+
+
 def pixel_to_world(bbox, frame_w, frame_h, homography: Optional[np.ndarray] = None) -> Tuple[float, float]:
     """Convert pixel coordinates to world coordinates (metres).
 
@@ -1092,6 +1135,23 @@ def run_tracking(
 
     filtered = final_tracks
     logger.info(f"After pitch boundary filter: {len(filtered)} tracks (from {len(all_tracks)} total)")
+
+    # FIX 4: Additional pitch zone filter — keep only tracks whose median position is near pitch edge
+    # This removes tracks that stay in crowd/bench area away from active play
+    zone_filtered = []
+    for track in filtered:
+        median_x, median_y = get_median_position(track["trajectory"], frame_w_px, frame_h_px, homography_H)
+        if median_x is not None and median_y is not None:
+            if is_near_pitch_boundary(median_x, median_y, boundary_margin=10.0):
+                zone_filtered.append(track)
+                track["median_x"] = round(median_x, 1)
+                track["median_y"] = round(median_y, 1)
+        else:
+            # If we can't compute median, exclude the track
+            logger.warning(f"Could not compute median position for track {track.get('trackId')}, excluding")
+
+    filtered = zone_filtered
+    logger.info(f"After pitch zone filter: {len(filtered)} tracks (from {len(all_tracks)} total)")
 
     # Clean up internal fields and compute quality metrics
     total_confirmed_detections = 0
