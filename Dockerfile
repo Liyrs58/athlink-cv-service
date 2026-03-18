@@ -3,7 +3,6 @@ FROM python:3.11-slim
 WORKDIR /app
 
 # System deps for opencv-python-headless
-# libgl1 replaces libgl1-mesa-glx in Debian bookworm
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libglib2.0-0 \
     libsm6 \
@@ -20,7 +19,6 @@ RUN pip install --no-cache-dir --upgrade pip && \
 
 COPY . .
 
-RUN mkdir -p /app/temp /app/memory/matches /app/static && \
-    chmod +x /app/entrypoint.sh
+RUN mkdir -p /app/temp /app/memory/matches /app/static
 
-ENTRYPOINT ["/app/entrypoint.sh"]
+CMD ["python", "main.py"]

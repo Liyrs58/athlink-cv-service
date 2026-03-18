@@ -127,5 +127,15 @@ async def root():
 if __name__ == "__main__":
     import uvicorn
     import os
-    port = int(os.getenv("PORT", 8000))
+
+    # Startup checks — catch import errors before uvicorn binds
+    try:
+        import cv2
+        print(f"[startup] cv2 OK: {cv2.__version__}")
+    except ImportError as e:
+        print(f"[startup] FATAL: {e}")
+        raise SystemExit(1)
+
+    port = int(os.getenv("PORT", "8005"))
+    print(f"[startup] Binding to 0.0.0.0:{port}")
     uvicorn.run(app, host="0.0.0.0", port=port)
