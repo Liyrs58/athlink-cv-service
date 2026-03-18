@@ -9,3 +9,4 @@ numpy==2.0.2
 supabase>=2.0.0
 pillow>=8.0.0
 reportlab>=4.0.0
+# numpy pinned for Railway compatibility
