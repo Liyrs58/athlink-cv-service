@@ -1,8 +1,8 @@
 [phases.setup]
-nixPkgs = ["python311", "gcc", "libffi", "zlib", "ffmpeg", "glib", "libGL", "libSM", "libXext", "libXrender"]
+nixPkgs = ["python311", "python311Packages.pip", "gcc", "libffi", "zlib", "ffmpeg", "glib", "libGL", "xorg.libSM", "xorg.libXext", "xorg.libXrender"]
 
 [phases.install]
-cmds = ["pip install --upgrade pip", "pip install -r requirements.txt"]
+cmds = ["python3.11 -m pip install --upgrade pip", "python3.11 -m pip install -r requirements.txt"]
 
 [start]
-cmd = "python main.py"
+cmd = "python3.11 main.py"
