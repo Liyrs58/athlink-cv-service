@@ -10,6 +10,7 @@ from services.interpretation_service import interpret_events
 from services.velocity_service import compute_all_velocities, get_team_velocity_summary
 from services.shape_service import compute_shape_summary
 from services.memory_service import store_match, get_historical_context, get_match_count
+from services.physics_corrector import PhysicsCorrector
 from services.confidence_service import (
     score_track_confidence,
     score_physical_metric,
@@ -38,6 +39,17 @@ async def analyse_video(video: UploadFile = File(...)):
         tracks_before_merge = len(tracks)
         tracks = merge_fragmented_tracks(tracks, temp_path)
         tracks_after_merge = len(tracks)
+
+        # Physics corrections — apply hard constraints
+        corrector = PhysicsCorrector()
+        correction_report = corrector.apply_all_constraints(
+            tracks=tracks,
+            frame_metadata=frame_metadata,
+            calibration=calibration,
+        )
+        tracks = correction_report["corrected_tracks"]
+        calibration = correction_report["calibration"]
+        corrections_applied = correction_report["corrections_applied"]
 
         # Team separation
         team_sep = cluster_teams(tracks, temp_path)
@@ -166,6 +178,7 @@ async def analyse_video(video: UploadFile = File(...)):
                 "tracks_after_merge": tracks_after_merge,
                 "fragments_merged": tracks_before_merge - tracks_after_merge,
             },
+            "corrections_applied": corrections_applied,
             "analysis": analysis_text,
         })
     finally:
