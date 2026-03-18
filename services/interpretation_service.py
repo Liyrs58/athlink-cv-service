@@ -63,10 +63,15 @@ def build_rich_context(events, tracks, vel_summary, shape_summary, velocities, j
     # Start building prompt with honest structure
     lines = [
         "You are a football coach assistant.",
-        "Write a coaching report from this match data.",
+        "Write a coaching report from this match data ONLY.",
         "Use plain English only — no jargon, no analytics terms.",
         "Be specific with player numbers and stats.",
         "Be honest when data seems unreliable.",
+        "",
+        "CRITICAL: Do not make any claim about historical trends unless historical_context is explicitly provided and non-empty.",
+        "Only draw conclusions from the data explicitly passed in this current request.",
+        "If historical_context is provided, reference it as 'across X previous matches' where X is the number of matches.",
+        "Do not extrapolate or infer patterns beyond the current match data.",
         "",
         "CONFIRMED DATA (reliable):",
         f"- Clip duration: {total_duration:.0f}s",
@@ -134,7 +139,7 @@ def interpret_events(events, tracks, job_id, velocity_summary=None, shape_summar
     )
 
     if memory:
-        prompt += f"\n\n=== HISTORICAL CONTEXT ===\n{memory}"
+        prompt += f"\n\n=== HISTORICAL CONTEXT ===\n{memory}\n\nIMPORTANT: This is historical data from previous matches. Reference it as 'across previous matches' and do not mix it with current match conclusions unless explicitly comparing."
 
     data = json.dumps({
         "model": "claude-sonnet-4-20250514",

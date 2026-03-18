@@ -1,4 +1,7 @@
 import math
+import logging
+
+logger = logging.getLogger(__name__)
 
 def get_centre(bbox):
     return ((bbox[0] + bbox[2]) / 2.0, (bbox[1] + bbox[3]) / 2.0)
@@ -59,14 +62,19 @@ def compute_team_shape(tracks, frame_idx):
         depth_m = round(depth_px / PIXELS_PER_METRE, 1)
         compactness_m = round(compactness / PIXELS_PER_METRE, 1)
 
-        # FIX 1: Assertion to catch impossible values
-        assert width_m < 80.0, f"Team {team_name} width {width_m}m exceeds physical limits"
-        assert depth_m < 120.0, f"Team {team_name} depth {depth_m}m exceeds physical limits"
-        
-        # FIX 3: Clamp to physical limits
-        width_m = max(0, min(68, width_m))  # Pitch is 68m wide
-        depth_m = max(0, min(105, depth_m))  # Pitch is 105m long
-        compactness_m = max(0, min(50, compactness_m))
+        # Soft handling: set metrics to None if they exceed physical limits
+        # (instead of crashing with assertions)
+        if width_m > 68.0:
+            logger.warning(f"Team {team_name} width {width_m}m exceeds pitch width (68m), marking as unreliable")
+            width_m = None
+
+        if depth_m > 105.0:
+            logger.warning(f"Team {team_name} depth {depth_m}m exceeds pitch length (105m), marking as unreliable")
+            depth_m = None
+
+        if compactness_m > 80.0:
+            logger.warning(f"Team {team_name} compactness {compactness_m}m exceeds limits, marking as unreliable")
+            compactness_m = None
 
         return {
             "width_metres": width_m,
@@ -74,7 +82,7 @@ def compute_team_shape(tracks, frame_idx):
             "compactness_metres": compactness_m,
             "centroid": [round(centroid_x, 1), round(centroid_y, 1)],
             "player_count": len(positions)
-        }
+        } if (width_m is not None and depth_m is not None) else None
 
     team_0_metrics = calculate_team_metrics(team_0_positions, "team_0")
     team_1_metrics = calculate_team_metrics(team_1_positions, "team_1")
@@ -105,27 +113,30 @@ def compute_shape_summary(tracks, frame_metadata):
     if not shapes:
         return {}
 
-    # Collect metrics for each team separately
-    team_0_widths = [s["team_0"]["width_metres"] for s in shapes if s["team_0"]]
-    team_1_widths = [s["team_1"]["width_metres"] for s in shapes if s["team_1"]]
-    team_0_depths = [s["team_0"]["depth_metres"] for s in shapes if s["team_0"]]
-    team_1_depths = [s["team_1"]["depth_metres"] for s in shapes if s["team_1"]]
-    team_0_compactness = [s["team_0"]["compactness_metres"] for s in shapes if s["team_0"]]
-    team_1_compactness = [s["team_1"]["compactness_metres"] for s in shapes if s["team_1"]]
-    combined_widths = [s["combined_width_metres"] for s in shapes]
+    # Collect metrics for each team separately (filtering out None values)
+    team_0_widths = [s["team_0"]["width_metres"] for s in shapes if s["team_0"] and s["team_0"]["width_metres"] is not None]
+    team_1_widths = [s["team_1"]["width_metres"] for s in shapes if s["team_1"] and s["team_1"]["width_metres"] is not None]
+    team_0_depths = [s["team_0"]["depth_metres"] for s in shapes if s["team_0"] and s["team_0"]["depth_metres"] is not None]
+    team_1_depths = [s["team_1"]["depth_metres"] for s in shapes if s["team_1"] and s["team_1"]["depth_metres"] is not None]
+    team_0_compactness = [s["team_0"]["compactness_metres"] for s in shapes if s["team_0"] and s["team_0"]["compactness_metres"] is not None]
+    team_1_compactness = [s["team_1"]["compactness_metres"] for s in shapes if s["team_1"] and s["team_1"]["compactness_metres"] is not None]
+    combined_widths = [s["combined_width_metres"] for s in shapes if s["combined_width_metres"]]
 
     def safe_avg(values):
-        return round(sum(values) / len(values), 1) if values else 0.0
+        """Return average if values exist, else return 'data unavailable'"""
+        return round(sum(values) / len(values), 1) if values else "data unavailable"
 
     def safe_min(values):
-        return round(min(values), 1) if values else 0.0
+        """Return min if values exist, else return 'data unavailable'"""
+        return round(min(values), 1) if values else "data unavailable"
 
     def safe_max(values):
-        return round(max(values), 1) if values else 0.0
+        """Return max if values exist, else return 'data unavailable'"""
+        return round(max(values), 1) if values else "data unavailable"
 
     result = {
         "frames_analysed": len(shapes),
-        # FIX 2: Per-team metrics
+        # Per-team metrics
         "team_0": {
             "avg_width_metres": safe_avg(team_0_widths),
             "avg_depth_metres": safe_avg(team_0_depths),
@@ -153,8 +164,8 @@ def compute_shape_summary(tracks, frame_metadata):
     result["min_width_metres"] = result["min_combined_width_metres"]
     result["max_width_metres"] = result["max_combined_width_metres"]
 
-    # FIX 1: Validation check
-    if result["avg_width_metres"] > 80:
-        print(f"WARNING: Average width {result['avg_width_metres']}m exceeds physical limits")
+    # Log if width data is unavailable
+    if result["avg_width_metres"] == "data unavailable":
+        logger.warning("Shape data unavailable for this clip (geometry values out of physical limits)")
 
     return result
