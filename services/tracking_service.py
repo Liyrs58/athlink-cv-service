@@ -1,10 +1,11 @@
 import os
 import json
 import logging
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Tuple
 from pathlib import Path
 import cv2
 import numpy as np
+from services.pitch_service import _estimate_homography, validate_homography, _transform_point
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -285,16 +286,27 @@ def is_on_pitch(world_x, world_y,
             -margin <= world_y <= pitch_h + margin)
 
 
-def pixel_to_world(bbox, frame_w, frame_h):
-    """Convert pixel coordinates to world coordinates (metres)."""
-    PIXELS_PER_METRE = 15.5
+def pixel_to_world(bbox, frame_w, frame_h, homography: Optional[np.ndarray] = None) -> Tuple[float, float]:
+    """Convert pixel coordinates to world coordinates (metres).
+
+    Uses homography if available (accurate, accounts for camera angle).
+    Falls back to proportional scaling if homography is unavailable.
+    """
     cx = (bbox[0] + bbox[2]) / 2.0
     cy = (bbox[1] + bbox[3]) / 2.0
-    
-    # Simple scaling - assumes pitch fills frame reasonably well
+
+    if homography is not None:
+        # Use homography-based transformation (handles camera angle/perspective)
+        try:
+            world_x, world_y = _transform_point(homography, cx, cy)
+            return world_x, world_y
+        except Exception as e:
+            logger.warning(f"Homography transform failed: {e}, falling back to proportional scaling")
+
+    # Fallback: proportional scaling (used for dirt pitches or when homography unavailable)
     world_x = (cx / frame_w) * 105.0
     world_y = (cy / frame_h) * 68.0
-    
+
     return world_x, world_y
 
 
@@ -356,6 +368,10 @@ def run_tracking(
     scene_cut_flag = False
     frame_is_valid = False
     valid_frames_count = 0
+
+    # Estimate homography once from first valid frame (for accurate world coordinate conversion)
+    homography_H = None
+    homography_found = False
 
     while True:
         ret, frame = cap.read()
@@ -420,6 +436,18 @@ def run_tracking(
         scene_cut_flag = detect_scene_cut(prev_gray, curr_gray, threshold=45.0)
         if scene_cut_flag:
             logger.info(f"Frame {current_frame_idx}: scene cut detected")
+
+        # Estimate homography from first valid frame (for accurate coordinate conversion)
+        if not homography_found:
+            try:
+                homography_H = _estimate_homography(frame)
+                if homography_H is not None and validate_homography(homography_H, frame.shape[1], frame.shape[0]):
+                    homography_found = True
+                    logger.info(f"Homography estimated from frame {current_frame_idx}")
+                else:
+                    logger.info(f"Homography validation failed, will use proportional scaling")
+            except Exception as e:
+                logger.warning(f"Homography estimation failed: {e}, will use proportional scaling")
 
         timestamp = current_frame_idx / fps if fps > 0 else 0.0
         frame_h_px = frame.shape[0]
@@ -1000,12 +1028,12 @@ def run_tracking(
     for t in all_tracks:
         t.pop("_histogram", None)
 
-    # FIX 2: Minimum track length requirement — at least 5 confirmed detections
-    MIN_TRACK_DETECTIONS = 3
+    # FIX 2: Minimum track length requirement — at least 15 detections (was 3, reduced false positives)
+    MIN_TRACK_DETECTIONS = 15
     filtered = [t for t in all_tracks if t["hits"] >= MIN_TRACK_DETECTIONS]
     if len(filtered) < 5:
-        # Fallback: accept tracks with >= 2 hits
-        filtered = [t for t in all_tracks if t["hits"] >= 2]
+        # Fallback: accept tracks with >= 5 hits if we're too aggressive
+        filtered = [t for t in all_tracks if t["hits"] >= 5]
 
     # Gap-filling: linearly interpolate bbox for gaps of 2-4 frame-strides
     for track in filtered:
@@ -1042,19 +1070,28 @@ def run_tracking(
         track["_predicted_frames"] = track.get("_predicted_frames", 0) + predicted_frames_count
 
     # FIX 1a: Filter staff/bench tracks based on pitch boundary presence
+    # Also exclude tracks whose average position is outside the pitch
+    final_tracks = []
     for track in filtered:
         on_pitch_count = 0
         total_detections = len(track["trajectory"])
-        
+
         for entry in track["trajectory"]:
             bbox = entry["bbox"]
-            world_x, world_y = pixel_to_world(bbox, frame_w_px, frame_h_px)
+            world_x, world_y = pixel_to_world(bbox, frame_w_px, frame_h_px, homography_H)
             if is_on_pitch(world_x, world_y):
                 on_pitch_count += 1
-        
+
         on_pitch_pct = (on_pitch_count / total_detections) if total_detections > 0 else 0.0
         track["on_pitch_pct"] = round(on_pitch_pct, 2)
         track["is_staff"] = on_pitch_pct < 0.3  # Less than 30% on pitch = staff/bench
+
+        # FILTER: exclude tracks that are mostly outside the pitch (staff/bench)
+        if on_pitch_pct >= 0.3:
+            final_tracks.append(track)
+
+    filtered = final_tracks
+    logger.info(f"After pitch boundary filter: {len(filtered)} tracks (from {len(all_tracks)} total)")
 
     # Clean up internal fields and compute quality metrics
     total_confirmed_detections = 0
