@@ -159,6 +159,47 @@
         .shape-count { font-size: 12px; color: #4b5563; margin-bottom: 8px; }
         .shape-val { font-size: 32px; font-weight: 800; }
 
+        /* Space Control */
+        .ctrl-nums { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; text-align: center; margin-bottom: 16px; }
+        .ctrl-pct { font-size: 36px; font-weight: 800; }
+        .ctrl-name { font-size: 12px; color: #6b7280; text-transform: uppercase; font-weight: 600; margin-bottom: 4px; }
+        .ctrl-bar { height: 12px; border-radius: 6px; overflow: hidden; display: flex; margin-bottom: 12px; }
+        .ctrl-bar-left { height: 100%; background: #3b82f6; }
+        .ctrl-bar-right { height: 100%; background: #ef4444; }
+        .ctrl-verdict { font-size: 13px; color: #9ca3af; margin-bottom: 4px; }
+        .ctrl-frames { font-size: 11px; color: #4b5563; }
+
+        /* Tactical Organisation */
+        .tact-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; }
+        .tact-team { text-align: center; }
+        .tact-name { font-size: 12px; color: #6b7280; text-transform: uppercase; font-weight: 600; margin-bottom: 6px; }
+        .tact-entropy { font-size: 32px; font-weight: 800; margin-bottom: 8px; }
+        .tact-interp { font-size: 12px; color: #6b7280; margin-top: 8px; line-height: 1.5; }
+        .trend-pill { display: inline-block; padding: 3px 10px; border-radius: 12px; font-size: 10px; font-weight: 700; text-transform: uppercase; }
+        .trend-rising { background: rgba(239,68,68,0.2); color: #fca5a5; }
+        .trend-stable { background: rgba(107,114,128,0.2); color: #d1d5db; }
+        .trend-falling { background: rgba(16,185,129,0.2); color: #6ee7b7; }
+        .collapse-warn { background: rgba(245,158,11,0.1); border: 1px solid rgba(245,158,11,0.3); border-radius: 8px; padding: 12px; margin-top: 16px; font-size: 13px; color: #fcd34d; text-align: center; }
+
+        /* Development Trajectory */
+        .traj-empty { color: #6b7280; font-style: italic; font-size: 13px; }
+        .traj-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 16px; }
+        .traj-card { background: #0a0e1a; border: 1px solid #1f2937; border-radius: 8px; padding: 18px; }
+        .traj-header { display: flex; align-items: center; gap: 10px; margin-bottom: 14px; }
+        .traj-pid { font-weight: 700; font-size: 15px; }
+        .traj-label { display: inline-block; padding: 3px 10px; border-radius: 12px; font-size: 10px; font-weight: 700; text-transform: uppercase; }
+        .traj-rows { font-size: 13px; color: #d1d5db; line-height: 2; }
+        .traj-arrow { font-weight: 700; margin-right: 4px; }
+        .traj-predict { background: rgba(59,130,246,0.08); border: 1px solid rgba(59,130,246,0.2); border-radius: 8px; padding: 12px; margin-top: 12px; font-size: 12px; color: #93c5fd; }
+        .traj-predict-title { font-weight: 700; margin-bottom: 6px; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; }
+        .traj-consistency { margin-top: 10px; font-size: 12px; color: #6b7280; }
+        .traj-consistency span { color: #d1d5db; font-weight: 700; }
+        .traj-report-toggle { margin-top: 12px; }
+        .traj-report-btn { background: none; border: 1px solid #1f2937; color: #6b7280; padding: 6px 14px; border-radius: 6px; font-size: 11px; cursor: pointer; font-weight: 600; }
+        .traj-report-btn:hover { border-color: #374151; color: #9ca3af; }
+        .traj-report-body { display: none; margin-top: 10px; font-size: 12px; color: #9ca3af; line-height: 1.8; white-space: pre-wrap; background: #0d1117; border-radius: 6px; padding: 14px; }
+        .traj-report-body.open { display: block; }
+
         /* Physical */
         .phys-grid { display: grid; grid-template-columns: repeat(3,1fr); gap: 24px; text-align: center; }
         .phys-num { font-size: 28px; font-weight: 800; }
@@ -221,9 +262,9 @@
         @media (max-width: 640px) {
             .container { padding: 20px 16px; }
             .upload-zone { padding: 48px 20px; }
-            .shape-grid, .fatigue-teams { grid-template-columns: 1fr; }
+            .shape-grid, .fatigue-teams, .ctrl-nums, .tact-grid { grid-template-columns: 1fr; }
             .phys-grid { grid-template-columns: 1fr; gap: 16px; }
-            .p-grid, .fatigue-grid { grid-template-columns: 1fr; }
+            .p-grid, .fatigue-grid, .traj-grid { grid-template-columns: 1fr; }
         }
 
         .results-section { display: none; }
@@ -465,7 +506,106 @@ function render(d) {
         </div>
     </div>`);
 
-    // F. Physical Summary
+    // F. Space Control
+    const vor = d.voronoi || {};
+    if (vor.status === 'ok') {
+        const t0n = ts.team_0_colour_name || 'Team A';
+        const t1n = ts.team_1_colour_name || 'Team B';
+        const t0p = vor.team_0_control_pct || 0;
+        const t1p = vor.team_1_control_pct || 0;
+        const domName = vor.dominant_team === 0 ? t0n : t1n;
+        parts.push(`<div class="card" id="voronoi"><div class="card-title">\u{1F5FA}\uFE0F Space Control</div>
+            <div class="ctrl-nums">
+                <div><div class="ctrl-name">${esc(t0n)}</div><div class="ctrl-pct" style="color:#3b82f6">${t0p.toFixed(1)}%</div></div>
+                <div><div class="ctrl-name">${esc(t1n)}</div><div class="ctrl-pct" style="color:#ef4444">${t1p.toFixed(1)}%</div></div>
+            </div>
+            <div class="ctrl-bar"><div class="ctrl-bar-left" style="width:${t0p}%"></div><div class="ctrl-bar-right" style="width:${t1p}%"></div></div>
+            <div class="ctrl-verdict">${esc(domName)} controlled ${(vor.control_margin||0).toFixed(1)}% more pitch space</div>
+            <div class="ctrl-frames">${vor.frames_analysed||0} frames analysed</div>
+        </div>`);
+    }
+
+    // G. Tactical Organisation
+    const ent = d.entropy || {};
+    if (ent.status === 'ok') {
+        const t0n = ts.team_0_colour_name || 'Team A';
+        const t1n = ts.team_1_colour_name || 'Team B';
+        const e0 = ent.team_0 || {};
+        const e1 = ent.team_1 || {};
+        const trendCls = t => t === 'rising' ? 'trend-rising' : t === 'falling' ? 'trend-falling' : 'trend-stable';
+        const collapses = ent.shape_collapse_events || [];
+        let entHtml = `<div class="card" id="entropy"><div class="card-title">\u{1F52C} Tactical Organisation</div>
+            <div class="tact-grid">
+                <div class="tact-team">
+                    <div class="tact-name">${esc(t0n)}</div>
+                    <div class="tact-entropy">${e0.avg_entropy != null ? e0.avg_entropy.toFixed(2) : '-'}</div>
+                    <span class="trend-pill ${trendCls(e0.trend)}">${e0.trend||'stable'}</span>
+                    <div class="tact-interp">${esc(e0.interpretation||'')}</div>
+                </div>
+                <div class="tact-team">
+                    <div class="tact-name">${esc(t1n)}</div>
+                    <div class="tact-entropy">${e1.avg_entropy != null ? e1.avg_entropy.toFixed(2) : '-'}</div>
+                    <span class="trend-pill ${trendCls(e1.trend)}">${e1.trend||'stable'}</span>
+                    <div class="tact-interp">${esc(e1.interpretation||'')}</div>
+                </div>
+            </div>`;
+        if (collapses.length > 0) {
+            entHtml += `<div class="collapse-warn">\u26A0\uFE0F Shape collapse detected at ${collapses.length} moment${collapses.length>1?'s':''}</div>`;
+        }
+        entHtml += '</div>';
+        parts.push(entHtml);
+    }
+
+    // H. Development Trajectory
+    const traj = d.trajectory || {};
+    if (traj.players_with_trajectory != null) {
+        const trajs = traj.trajectories || {};
+        const trajKeys = Object.keys(trajs).filter(k => trajs[k].status === 'ok');
+        let trajHtml = `<div class="card" id="trajectory"><div class="card-title">\u{1F4C8} Development Trajectory</div>`;
+        if (trajKeys.length === 0) {
+            trajHtml += '<div class="traj-empty">Upload more clips featuring the same players to unlock development tracking.</div>';
+        } else {
+            const labelColors = {BREAKTHROUGH:'#f59e0b',EMERGING:'#10b981',DEVELOPING:'#3b82f6',PLATEAUING:'#6b7280',DECLINING:'#ef4444',FATIGUING:'#f97316'};
+            const arrow = dir => dir === 'improving' ? '\u2191' : dir === 'declining' ? '\u2193' : '\u2192';
+            trajHtml += '<div class="traj-grid">';
+            trajKeys.forEach(k => {
+                const p = trajs[k];
+                const lbl = p.development_label || 'PLATEAUING';
+                const lc = labelColors[lbl] || '#6b7280';
+                const cur = p.current || {};
+                const pred = p.predicted_next_match || {};
+                const trends = p.trends || {};
+                const uid = 'traj_' + k;
+                trajHtml += `<div class="traj-card">
+                    <div class="traj-header">
+                        <span class="traj-pid">Player #${esc(p.player_id||k)}</span>
+                        <span class="traj-label" style="background:${lc}22;color:${lc}">${lbl}</span>
+                    </div>
+                    <div class="traj-rows">
+                        <span class="traj-arrow">${arrow((trends.speed||{}).direction)}</span> Speed: ${cur.avg_speed_kmh!=null?cur.avg_speed_kmh.toFixed(1):'-'} km/h avg<br>
+                        <span class="traj-arrow">${arrow((trends.sprints||{}).direction)}</span> Sprints: ${cur.avg_sprints!=null?cur.avg_sprints.toFixed(1):'-'} per match avg<br>
+                        <span class="traj-arrow">${arrow((trends.distance||{}).direction)}</span> Distance: ${cur.avg_distance_metres!=null?cur.avg_distance_metres.toFixed(0):'-'}m avg
+                    </div>
+                    <div class="traj-predict">
+                        <div class="traj-predict-title">Next match prediction</div>
+                        Speed: ${pred.speed_kmh!=null?pred.speed_kmh.toFixed(1):'-'} km/h &nbsp;&bull;&nbsp; Sprints: ${pred.sprints!=null?pred.sprints:'-'}
+                    </div>
+                    <div class="traj-consistency">Consistency: <span>${p.consistency_score!=null?p.consistency_score.toFixed(1):'-'}/100</span></div>`;
+                if (p.trajectory_report) {
+                    trajHtml += `<div class="traj-report-toggle">
+                        <button class="traj-report-btn" onclick="this.nextElementSibling.classList.toggle('open');this.textContent=this.nextElementSibling.classList.contains('open')?'Hide Report':'Development Report'">Development Report</button>
+                        <div class="traj-report-body">${esc(p.trajectory_report)}</div>
+                    </div>`;
+                }
+                trajHtml += '</div>';
+            });
+            trajHtml += '</div>';
+        }
+        trajHtml += '</div>';
+        parts.push(trajHtml);
+    }
+
+    // I. Physical Summary
     const ph = d.physical || {};
     parts.push(`<div class="card" id="phys"><div class="card-title">Physical Summary</div>
         <div class="phys-grid">
@@ -475,7 +615,7 @@ function render(d) {
         </div>
     </div>`);
 
-    // G. Situation Timeline
+    // J. Situation Timeline
     const evts = (d.situations || {}).events || [];
     let tlInner = '';
     if (evts.length) {
@@ -498,7 +638,7 @@ function render(d) {
     }
     parts.push(`<div class="card" id="timeline"><div class="card-title">Situation Timeline</div>${tlInner}</div>`);
 
-    // H. Player Cards
+    // K. Player Cards
     const players = ph.players || [];
     if (players.length) {
         let pHtml = '<div class="card" id="players"><div class="card-title">Player Performance</div><div class="p-grid">';
@@ -523,7 +663,7 @@ function render(d) {
         parts.push(pHtml);
     }
 
-    // I. Data Quality
+    // L. Data Quality
     const trust = brain.metrics_to_trust || [];
     const question = brain.metrics_to_question || [];
     const anomalies = brain.anomalies_summary || '';
