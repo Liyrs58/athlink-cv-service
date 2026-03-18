@@ -35,7 +35,7 @@ def numpy_safe(obj):
 # Keep alias for any other code that may reference make_json_safe
 make_json_safe = numpy_safe
 
-def _run_analysis_pipeline(job_id: str, temp_path: str):
+def _run_analysis_pipeline(job_id: str, temp_path: str, skip_cleanup: bool = False):
     """Background task — runs the full analysis pipeline."""
     try:
         # Pitch calibration
@@ -207,7 +207,7 @@ def _run_analysis_pipeline(job_id: str, temp_path: str):
         result = numpy_safe(base_result)
         return result
     finally:
-        if os.path.exists(temp_path):
+        if not skip_cleanup and os.path.exists(temp_path):
             os.remove(temp_path)
 
 @router.post("/analyse")
