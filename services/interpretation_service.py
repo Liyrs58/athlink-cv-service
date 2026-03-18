@@ -25,6 +25,22 @@ def build_rich_context(events, tracks, vel_summary, shape_summary, velocities, j
     total_sprints = vel_summary.get('total_sprints', 0)
     avg_width_m = shape_summary.get('avg_width_metres', 0)
 
+    # Safe numeric conversions (handle None and string values)
+    try:
+        max_speed_float = float(max_speed_kmh) if max_speed_kmh not in (None, "data unavailable") else None
+    except (TypeError, ValueError):
+        max_speed_float = None
+
+    try:
+        total_sprints_float = float(total_sprints) if total_sprints not in (None, "data unavailable") else None
+    except (TypeError, ValueError):
+        total_sprints_float = None
+
+    try:
+        avg_width_float = float(avg_width_m) if avg_width_m not in (None, "data unavailable") else None
+    except (TypeError, ValueError):
+        avg_width_float = None
+
     # Handle None and string values from shape data
     shape_data_available = (
         avg_width_m is not None and
@@ -35,14 +51,14 @@ def build_rich_context(events, tracks, vel_summary, shape_summary, velocities, j
     if on_pitch_count > 25:
         warnings.append("Note: player count seems high — some duplicates may exist. Treat individual player stats as approximate.")
 
-    if max_speed_kmh > 35:
+    if max_speed_float and max_speed_float > 35:
         # Will exclude from prompt entirely
         pass
 
-    if total_sprints > 50:
+    if total_sprints_float and total_sprints_float > 50:
         warnings.append("Sprint count may be inflated by tracking noise. Focus on relative comparison between players, not absolute numbers.")
 
-    if shape_data_available and avg_width_m > 70:
+    if shape_data_available and avg_width_float and avg_width_float > 70:
         # Will replace with unavailable message
         pass
 
@@ -58,8 +74,14 @@ def build_rich_context(events, tracks, vel_summary, shape_summary, velocities, j
         track_id = v['track_id']
         sprint_count = v.get('sprint_count', 0)
         max_speed_ms = v.get('max_speed_ms', 0)
-        max_speed_player_kmh = round(max_speed_ms * 3.6, 1)
         distance = v.get('distance_metres', 0)
+
+        # Safe numeric conversion for player speed
+        try:
+            max_speed_float = float(max_speed_ms) if max_speed_ms not in (None, "data unavailable") else None
+            max_speed_player_kmh = round(max_speed_float * 3.6, 1) if max_speed_float else 0
+        except (TypeError, ValueError):
+            max_speed_player_kmh = 0
 
         # Skip if speed is unrealistic
         if max_speed_player_kmh > 35:
