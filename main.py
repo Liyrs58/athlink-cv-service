@@ -145,10 +145,3 @@ if __name__ == "__main__":
     port = int(os.getenv("PORT", "8005"))
     print(f"[startup] Binding to 0.0.0.0:{port}")
     uvicorn.run(app, host="0.0.0.0", port=port)
-app.mount("/", StaticFiles(directory="static", html=True), name="static")
-
-# Serve static UI - must be after all API routes
-from fastapi.responses import FileResponse
-@app.get("/ui")
-async def serve_ui():
-    return FileResponse("static/index.html")
