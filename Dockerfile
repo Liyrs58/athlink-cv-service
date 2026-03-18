@@ -1,13 +1,27 @@
-FROM python:3.12-slim
+FROM python:3.11-slim
 
 WORKDIR /app
 
+# Install system dependencies required by opencv
+RUN apt-get update && apt-get install -y \
+    libglib2.0-0 \
+    libsm6 \
+    libxext6 \
+    libxrender-dev \
+    libgomp1 \
+    libgl1-mesa-glx \
+    ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY requirements.txt .
 
-RUN pip install --no-cache-dir -r requirements.txt && \
-    pip uninstall -y opencv-python || true && \
-    pip install --no-cache-dir opencv-python-headless>=4.9.0
+# Install Python dependencies
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8001}"]
+# Create directories that the app needs at runtime
+RUN mkdir -p /app/temp /app/memory/matches /app/static
+
+CMD ["sh", "-c", "python startup_check.py && uvicorn main:app --host 0.0.0.0 --port ${PORT:-8005}"]
