@@ -18,6 +18,7 @@ from services.confidence_service import (
     build_data_confidence_summary,
 )
 from services.job_queue_service import create_job, submit_job
+from services.observer_brain import ObserverBrain
 
 router = APIRouter()
 
@@ -87,11 +88,16 @@ def _run_analysis_pipeline(job_id: str, temp_path: str):
         # Part 1+4: Build confidence summary
         data_confidence = build_data_confidence_summary(tracks, vel_summary, shape_summary)
 
+        # Observer Brain — continuous belief update across all frames
+        brain = ObserverBrain()
+        brain_summary = brain.process_full_match(tracks, frame_metadata, calibration)
+
         memory = get_historical_context()
         analysis = interpret_events(
             events, tracks, job_id, vel_summary, shape_summary,
             velocities, memory, team_separation=team_sep,
             data_confidence=data_confidence,
+            brain_summary=brain_summary,
         )
         analysis_text = analysis[0]["analysis"] if analysis else ""
         store_match(job_id, {"total_tracks": len(tracks)}, {"events": events}, vel_summary, shape_summary, analysis_text)
@@ -188,6 +194,14 @@ def _run_analysis_pipeline(job_id: str, temp_path: str):
                 "fragments_merged": tracks_before_merge - tracks_after_merge,
             },
             "corrections_applied": corrections_applied,
+            "brain": {
+                "verdict": brain_summary.get("brain_verdict", ""),
+                "tracking_health": brain_summary.get("tracking_health", {}),
+                "match_phases": brain_summary.get("match_phases", []),
+                "metrics_to_trust": brain_summary.get("metrics_to_trust", []),
+                "metrics_to_question": brain_summary.get("metrics_to_question", []),
+                "anomalies_summary": brain_summary.get("anomalies_summary", ""),
+            },
             "analysis": analysis_text,
         }
         result = numpy_safe(base_result)

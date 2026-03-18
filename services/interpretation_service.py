@@ -194,7 +194,7 @@ def build_rich_context(events, tracks, vel_summary, shape_summary, velocities, j
     return "\n".join(lines)
 
 
-def interpret_events(events, tracks, job_id, velocity_summary=None, shape_summary=None, velocities=None, memory=None, team_separation=None, data_confidence=None):
+def interpret_events(events, tracks, job_id, velocity_summary=None, shape_summary=None, velocities=None, memory=None, team_separation=None, data_confidence=None, brain_summary=None):
     if not events:
         return [{"job_id": job_id, "analysis": "No events to analyse.", "events": []}]
 
@@ -207,6 +207,26 @@ def interpret_events(events, tracks, job_id, velocity_summary=None, shape_summar
         team_separation=team_separation,
         data_confidence=data_confidence,
     )
+
+    # Prefix with Observer Brain analysis when available
+    if brain_summary:
+        health = brain_summary.get("tracking_health", {})
+        brain_prefix = "\n".join([
+            "=== BRAIN ANALYSIS ===",
+            f"Tracking health: {health.get('data_reliability', 'unknown')}",
+            f"Brain verdict: {brain_summary.get('brain_verdict', '')}",
+            f"Metrics to trust: {brain_summary.get('metrics_to_trust', [])}",
+            f"Metrics to question: {brain_summary.get('metrics_to_question', [])}",
+            f"Anomalies detected: {brain_summary.get('anomalies_summary', 'none')}",
+            f"Match phases with confidence: {brain_summary.get('match_phases', [])}",
+            "=== END BRAIN ANALYSIS ===",
+            "",
+            "INSTRUCTION: Your coaching report must reflect the brain's confidence levels. "
+            "Only make strong claims about metrics the brain says to trust. "
+            "For metrics to question, use hedged language ('approximately', 'suggests', 'may indicate').",
+            "",
+        ])
+        prompt = brain_prefix + prompt
 
     if memory:
         prompt += f"\n\n=== HISTORICAL CONTEXT ===\n{memory}\n\nIMPORTANT: This is historical data from previous matches. Reference it as 'across previous matches' and do not mix it with current match conclusions unless explicitly comparing."
