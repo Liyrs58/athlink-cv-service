@@ -39,7 +39,7 @@ def numpy_safe(obj):
 # Keep alias for any other code that may reference make_json_safe
 make_json_safe = numpy_safe
 
-def _run_analysis_pipeline(job_id: str, temp_path: str, skip_cleanup: bool = False, validate: bool = False):
+def _run_analysis_pipeline(job_id: str, temp_path: str, skip_cleanup: bool = False, validate: bool = False, pre_confirmed_labels: dict = None):
     """Background task — runs the full analysis pipeline."""
     try:
         # Pitch calibration
@@ -64,6 +64,14 @@ def _run_analysis_pipeline(job_id: str, temp_path: str, skip_cleanup: bool = Fal
         tracks = correction_report["corrected_tracks"]
         calibration = correction_report["calibration"]
         corrections_applied = correction_report["corrections_applied"]
+
+        # Apply coach-confirmed labels from stream session
+        if pre_confirmed_labels:
+            for track in tracks:
+                tid = track.get("trackId")
+                if tid in pre_confirmed_labels:
+                    track["coach_label"] = pre_confirmed_labels[tid]
+                    track["coach_confirmed"] = True
 
         # Team separation
         team_sep = cluster_teams(tracks, temp_path)
@@ -177,8 +185,11 @@ def _run_analysis_pipeline(job_id: str, temp_path: str, skip_cleanup: bool = Fal
             if v.get("speed_confidence_downgraded") and conf_level == "high":
                 effective_conf = "medium"
 
+            display_label = trk.get("coach_label") if trk.get("coach_confirmed") else None
+
             players_physical.append({
                 "track_id": v["track_id"],
+                "display_label": display_label,
                 "team": team_name,
                 "confidence": conf_level,
                 "speed_confidence": effective_conf,
