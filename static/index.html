@@ -1280,11 +1280,13 @@ async function startLiveAnalysis() {
 
     try {
         await new Promise((resolve, reject) => {
-            video.onloadedmetadata = resolve;
-            video.onerror = reject;
+            const timeout = setTimeout(() => reject(new Error('Video load timeout')), 10000);
+            video.onloadedmetadata = () => { clearTimeout(timeout); resolve(); };
+            video.onerror = (e) => { clearTimeout(timeout); reject(e); };
         });
     } catch (e) {
-        fallbackToQuick('Video load failed');
+        console.error('Video load error:', e);
+        fallbackToQuick('Video load failed: ' + (e.message || 'unknown error'));
         return;
     }
 
@@ -1300,6 +1302,7 @@ async function startLiveAnalysis() {
 
     // Start session
     try {
+        console.log('Starting stream session...');
         const res = await fetch(`${API_BASE}/api/v1/stream/start`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -1308,8 +1311,10 @@ async function startLiveAnalysis() {
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const data = await res.json();
         liveSessionId = data.session_id;
+        console.log('Session started:', liveSessionId);
     } catch (e) {
-        fallbackToQuick('Session start failed');
+        console.error('Session start failed:', e);
+        fallbackToQuick('Session start failed: ' + (e.message || 'unknown error'));
         return;
     }
 
@@ -1405,7 +1410,8 @@ async function startLiveAnalysis() {
 
                 updateLivePlayerInfo();
             } catch (e) {
-                fallbackToQuick('Frame processing failed');
+                console.error('Frame batch error:', e);
+                fallbackToQuick('Frame processing failed: ' + (e.message || 'unknown error'));
                 return;
             }
             batch = [];
@@ -1419,6 +1425,7 @@ async function startLiveAnalysis() {
     $('liveFrameInfo').textContent = 'Generating report...';
 
     try {
+        console.log('Finalising session:', liveSessionId);
         const res = await fetch(`${API_BASE}/api/v1/stream/${liveSessionId}/finalise`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -1426,6 +1433,7 @@ async function startLiveAnalysis() {
         });
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const data = await res.json();
+        console.log('Session finalised, job_id:', data.job_id);
 
         // Switch to existing poll/results flow
         hide('liveSection');
@@ -1436,7 +1444,8 @@ async function startLiveAnalysis() {
         timerIv = setInterval(updateTimer, 1000);
         poll(data.job_id);
     } catch (e) {
-        fallbackToQuick('Finalise failed');
+        console.error('Finalise failed:', e);
+        fallbackToQuick('Finalise failed: ' + (e.message || 'unknown error'));
     }
 }
 
@@ -1446,6 +1455,8 @@ function fallbackToQuick(reason) {
     hide('liveSection');
     liveSessionId = null;
     analysisMode = 'quick';
+    // Show error briefly then fall back
+    alert('Live analysis unavailable — switching to quick analysis.\n\n' + reason);
     startAnalysis();
 }
 
