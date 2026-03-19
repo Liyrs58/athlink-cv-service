@@ -85,7 +85,7 @@ def _run_analysis_pipeline(job_id: str, temp_path: str, skip_cleanup: bool = Fal
             frame_results.append({"frameIndex": frame_idx, "situation": result["situation"]})
 
         events = extract_situation_events(frame_results, fps=25.0, frame_stride=2)
-        velocities = compute_all_velocities(tracks, calibration=calibration)
+        velocities = compute_all_velocities(tracks, calibration=calibration, video_path=temp_path)
         vel_summary = get_team_velocity_summary(velocities) or {}
         shape_summary = compute_shape_summary(tracks, frame_metadata, calibration=calibration) or {}
 
@@ -172,15 +172,22 @@ def _run_analysis_pipeline(job_id: str, temp_path: str, skip_cleanup: bool = Fal
             if dist == 0 and sprints == 0 and max_spd_kmh < 5.0:
                 continue
 
+            # Optical flow cross-check: downgrade speed confidence if unreliable
+            effective_conf = conf_level
+            if v.get("speed_confidence_downgraded") and conf_level == "high":
+                effective_conf = "medium"
+
             players_physical.append({
                 "track_id": v["track_id"],
                 "team": team_name,
                 "confidence": conf_level,
+                "speed_confidence": effective_conf,
                 "sprints": sprints,
                 "distance_metres": dist,
                 "distance_range": f"{dist_lo:.0f}-{dist_hi:.0f}m",
                 "max_speed_kmh": max_spd_kmh,
                 "max_speed_display": spd_metric["display_value"],
+                "unreliable_speed_frames": v.get("unreliable_speed_frames", 0),
             })
 
         # Multi-pass validation (only if ?validate=true)

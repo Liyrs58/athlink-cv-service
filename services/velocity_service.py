@@ -1,6 +1,9 @@
 import math
+import logging
 from typing import Optional, Dict, Any, List
 from statistics import median
+
+logger = logging.getLogger(__name__)
 
 def to_scalar(v):
     """Convert numpy scalars to Python native types for JSON serialization."""
@@ -56,7 +59,132 @@ def _rolling_median_speed(speeds_raw: List[float], window: int = 5) -> List[floa
     return result
 
 
-def compute_player_velocity(track, calibration: Optional[Dict[str, Any]] = None):
+def _optical_flow_speed_check(
+    track: Dict[str, Any],
+    video_path: Optional[str],
+    ppm: float,
+) -> Dict[str, Any]:
+    """
+    Estimate per-frame speeds using Lucas-Kanade optical flow on bbox centres,
+    then compare against homography-based speeds.
+
+    Returns:
+      {
+        "unreliable_speed_frames": int,
+        "total_frames_checked": int,
+        "speed_confidence_downgraded": bool,
+      }
+    """
+    result = {
+        "unreliable_speed_frames": 0,
+        "total_frames_checked": 0,
+        "speed_confidence_downgraded": False,
+    }
+
+    if video_path is None:
+        return result
+
+    traj = track.get("trajectory", [])
+    if len(traj) < 4:
+        return result
+
+    try:
+        import cv2
+        import numpy as np
+    except ImportError:
+        return result
+
+    try:
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            return result
+
+        raw_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        raw_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        needs_rotation = raw_h > raw_w
+
+        FLOW_DISAGREEMENT = 0.20   # 20% threshold
+
+        lk_params = dict(
+            winSize=(15, 15),
+            maxLevel=2,
+            criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 10, 0.03),
+        )
+
+        unreliable = 0
+        checked = 0
+
+        for i in range(1, len(traj)):
+            prev_entry = traj[i - 1]
+            curr_entry = traj[i]
+
+            dt = curr_entry.get("timestampSeconds", 0) - prev_entry.get("timestampSeconds", 0)
+            if dt <= 0:
+                continue
+
+            # Homography-based speed (from smoothed positions, recomputed simply)
+            cx_p, cy_p = get_centre(prev_entry["bbox"])
+            cx_c, cy_c = get_centre(curr_entry["bbox"])
+            dist_px_hom = math.sqrt((cx_c - cx_p) ** 2 + (cy_c - cy_p) ** 2)
+            speed_hom = (dist_px_hom / ppm) / dt
+            if speed_hom > MAX_REALISTIC_SPEED_MS:
+                continue  # already flagged elsewhere
+
+            # Read the two frames for optical flow
+            fi_prev = prev_entry.get("frameIndex", 0)
+            fi_curr = curr_entry.get("frameIndex", 0)
+
+            cap.set(cv2.CAP_PROP_POS_FRAMES, fi_prev)
+            ret_p, frame_p = cap.read()
+            if not ret_p:
+                continue
+            cap.set(cv2.CAP_PROP_POS_FRAMES, fi_curr)
+            ret_c, frame_c = cap.read()
+            if not ret_c:
+                continue
+
+            if needs_rotation:
+                frame_p = cv2.rotate(frame_p, cv2.ROTATE_90_COUNTERCLOCKWISE)
+                frame_c = cv2.rotate(frame_c, cv2.ROTATE_90_COUNTERCLOCKWISE)
+
+            gray_p = cv2.cvtColor(frame_p, cv2.COLOR_BGR2GRAY)
+            gray_c = cv2.cvtColor(frame_c, cv2.COLOR_BGR2GRAY)
+
+            # Use bbox centre as the point to track
+            pt = np.array([[[float(cx_p), float(cy_p)]]], dtype=np.float32)
+
+            next_pts, status, _ = cv2.calcOpticalFlowPyrLK(gray_p, gray_c, pt, None, **lk_params)
+
+            if status is None or status[0][0] == 0:
+                continue
+
+            nx, ny = float(next_pts[0][0][0]), float(next_pts[0][0][1])
+            dist_px_flow = math.sqrt((nx - cx_p) ** 2 + (ny - cy_p) ** 2)
+            speed_flow = (dist_px_flow / ppm) / dt
+
+            checked += 1
+
+            # Compare
+            denom = max(speed_hom, speed_flow, 1e-9)
+            if abs(speed_hom - speed_flow) / denom > FLOW_DISAGREEMENT:
+                unreliable += 1
+
+        cap.release()
+
+        result["unreliable_speed_frames"] = unreliable
+        result["total_frames_checked"] = checked
+
+        # Downgrade if >30% of checked frames are unreliable
+        if checked > 0 and (unreliable / checked) > 0.30:
+            result["speed_confidence_downgraded"] = True
+
+    except Exception as e:
+        logger.debug(f"Optical flow check failed for track {track.get('trackId')}: {e}")
+
+    return result
+
+
+def compute_player_velocity(track, calibration: Optional[Dict[str, Any]] = None, video_path: Optional[str] = None):
     ppm = PIXELS_PER_METRE
     if calibration and isinstance(calibration.get("pixels_per_metre"), (int, float)):
         ppm = calibration["pixels_per_metre"]
@@ -234,6 +362,9 @@ def compute_player_velocity(track, calibration: Optional[Dict[str, Any]] = None)
     max_speed = max(speeds) if speeds else 0.0
     avg_speed = sum(speeds) / len(speeds) if speeds else 0.0
 
+    # Optical flow cross-check
+    flow_check = _optical_flow_speed_check(track, video_path, ppm)
+
     return {
         "track_id": track["trackId"],
         "distance_metres": round(to_scalar(total_distance_m), 1),
@@ -241,15 +372,17 @@ def compute_player_velocity(track, calibration: Optional[Dict[str, Any]] = None)
         "max_speed_ms": round(to_scalar(max_speed), 2),
         "avg_speed_ms": round(to_scalar(avg_speed), 2),
         "high_intensity_runs": high_intensity_runs,
+        "unreliable_speed_frames": flow_check["unreliable_speed_frames"],
+        "speed_confidence_downgraded": flow_check["speed_confidence_downgraded"],
     }
 
 
-def compute_all_velocities(tracks, calibration: Optional[Dict[str, Any]] = None):
+def compute_all_velocities(tracks, calibration: Optional[Dict[str, Any]] = None, video_path: Optional[str] = None):
     results = []
     for track in tracks:
         if (track.get("confirmed_detections", 0) >= 5 and
             not track.get("is_staff", False)):
-            results.append(compute_player_velocity(track, calibration=calibration))
+            results.append(compute_player_velocity(track, calibration=calibration, video_path=video_path))
     results.sort(key=lambda x: x["distance_metres"], reverse=True)
     return results
 
