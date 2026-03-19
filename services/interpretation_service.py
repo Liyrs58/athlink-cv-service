@@ -109,10 +109,31 @@ def build_rich_context(events, tracks, vel_summary, shape_summary, velocities, j
     # Number players within each team by distance (Player 1 = most distance)
     team_player_velocities = {"team_0": [], "team_1": [], "unassigned": []}
     track_team_map = {}
+    track_position_map = {}
     for t in tracks:
         tid = t.get("trackId")
         if tid is not None:
             track_team_map[tid] = t.get("teamId", -1)
+            # Infer position from trajectory
+            traj = t.get("trajectory", [])
+            positions_list = []
+            vis_frac = calibration.get("visible_fraction", 0.55) if calibration else 0.55
+            for entry in traj:
+                bbox = entry.get("bbox", [])
+                if len(bbox) >= 4:
+                    px = (bbox[0] + bbox[2]) / 2.0
+                    positions_list.append({"pixel_x": px, "visible_fraction": vis_frac})
+            # Simplified position inference
+            if positions_list:
+                avg_x = sum((p["pixel_x"] / 1920.0) * (105.0 * p["visible_fraction"]) for p in positions_list) / len(positions_list)
+                if avg_x < 35:
+                    track_position_map[tid] = "Defender"
+                elif avg_x < 70:
+                    track_position_map[tid] = "Midfielder"
+                else:
+                    track_position_map[tid] = "Forward"
+            else:
+                track_position_map[tid] = "Unknown"
 
     for v in velocities:
         track_id = v['track_id']
@@ -136,6 +157,8 @@ def build_rich_context(events, tracks, vel_summary, shape_summary, velocities, j
         dist_lo = round(distance * (1 - pct), 0)
         dist_hi = round(distance * (1 + pct), 0)
 
+        position = track_position_map.get(track_id, "Unknown")
+
         team_player_velocities[team_key].append({
             "track_id": track_id,
             "conf_level": conf_level,
@@ -143,6 +166,7 @@ def build_rich_context(events, tracks, vel_summary, shape_summary, velocities, j
             "dist_range": f"{dist_lo:.0f}\u2013{dist_hi:.0f}m",
             "max_speed_kmh": max_speed_kmh,
             "sprint_count": sprint_count,
+            "position": position,
         })
 
     # Sort by distance descending, assign sequential player numbers per team
@@ -150,7 +174,8 @@ def build_rich_context(events, tracks, vel_summary, shape_summary, velocities, j
     for team_key, team_name in [("team_0", t0_name), ("team_1", t1_name), ("unassigned", "Unassigned")]:
         sorted_players = sorted(team_player_velocities[team_key], key=lambda p: p["distance"], reverse=True)
         for idx, p in enumerate(sorted_players, 1):
-            player_label = f"{team_name} Player {idx}"
+            position = p.get("position", "Unknown")
+            player_label = f"{team_name} {position}"
             conf = p["conf_level"]
             if conf == "high":
                 if sprints_trusted:
@@ -303,7 +328,7 @@ def build_rich_context(events, tracks, vel_summary, shape_summary, velocities, j
     lines.append("")
 
     lines.append("PLAYER DISTANCES (use these for 'who covered the most ground'):")
-    lines.append("Players numbered 1, 2, 3\u2026 within each team by distance covered (Player 1 = most distance).")
+    lines.append("Players listed by position and distance covered (top = most distance).")
     if not sprints_trusted:
         lines.append("NOTE: Sprint data is unreliable for this clip. Do NOT mention sprints in the report.")
     if player_lines:

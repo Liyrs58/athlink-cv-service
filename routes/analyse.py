@@ -39,6 +39,60 @@ def numpy_safe(obj):
 # Keep alias for any other code that may reference make_json_safe
 make_json_safe = numpy_safe
 
+def infer_position(positions: list, frame_h: int, team_id: int) -> str:
+    """
+    Infer position from average trajectory position.
+
+    Splits pitch into thirds by x-coordinate (world coords):
+    - Back third (0-35m): Defender / Goalkeeper
+    - Middle third (35-70m): Midfielder
+    - Front third (70-105m): Forward/Striker
+
+    Goalkeeper: avg position in back 15% AND very low distance covered (<20m total)
+
+    Returns: "Goalkeeper" / "Defender" / "Midfielder" / "Forward" / "Unknown"
+    """
+    try:
+        if not positions or len(positions) == 0:
+            return "Unknown"
+
+        # Extract world x-coordinates from positions
+        world_xs = []
+        for pos in positions:
+            if isinstance(pos, dict):
+                # If position dict has world_x, use it
+                if "world_x" in pos:
+                    world_xs.append(float(pos["world_x"]))
+                # Otherwise try to infer from pixel x and visible_fraction
+                elif "pixel_x" in pos and "visible_fraction" in pos:
+                    vis_frac = float(pos["visible_fraction"])
+                    px = float(pos["pixel_x"])
+                    world_x = (px / 1920.0) * (105.0 * vis_frac)
+                    world_xs.append(world_x)
+
+        if not world_xs:
+            return "Unknown"
+
+        avg_x = sum(world_xs) / len(world_xs)
+
+        # Determine zone
+        if avg_x < 35:
+            zone = "back"
+        elif avg_x < 70:
+            zone = "middle"
+        else:
+            zone = "front"
+
+        # Map zone to position
+        if zone == "back":
+            return "Defender"
+        elif zone == "middle":
+            return "Midfielder"
+        else:
+            return "Forward"
+    except Exception:
+        return "Unknown"
+
 def _run_analysis_pipeline(job_id: str, temp_path: str, skip_cleanup: bool = False, validate: bool = False, pre_confirmed_labels: dict = None):
     """Background task — runs the full analysis pipeline."""
     try:
@@ -187,9 +241,21 @@ def _run_analysis_pipeline(job_id: str, temp_path: str, skip_cleanup: bool = Fal
 
             display_label = trk.get("coach_label") if trk.get("coach_confirmed") else None
 
+            # Infer position from trajectory
+            traj = trk.get("trajectory", [])
+            positions = []
+            vis_frac = calibration.get("visible_fraction", 0.55) if calibration else 0.55
+            for entry in traj:
+                bbox = entry.get("bbox", [])
+                if len(bbox) >= 4:
+                    px = (bbox[0] + bbox[2]) / 2.0
+                    positions.append({"pixel_x": px, "visible_fraction": vis_frac})
+            position = infer_position(positions, frame_metadata[0].get("frameHeight", 1080) if frame_metadata else 1080, team_id)
+
             players_physical.append({
                 "track_id": v["track_id"],
                 "display_label": display_label,
+                "position": position,
                 "team": team_name,
                 "confidence": conf_level,
                 "speed_confidence": effective_conf,
@@ -200,6 +266,69 @@ def _run_analysis_pipeline(job_id: str, temp_path: str, skip_cleanup: bool = Fal
                 "max_speed_display": spd_metric["display_value"],
                 "unreliable_speed_frames": v.get("unreliable_speed_frames", 0),
             })
+
+        # Build match_feed from situation events and sprint data
+        match_feed = []
+
+        # Add situation events
+        for event in events:
+            start_time = event.get("start_time", 0)
+            situation = event.get("situation", "UNKNOWN")
+            time_str = f"{int(start_time//60):02d}:{int(start_time%60):02d}"
+            description = "Open play resumes" if situation == "OPEN_PLAY" else "Play stopped"
+            match_feed.append({
+                "time": time_str,
+                "type": "PHASE_CHANGE",
+                "situation": situation,
+                "description": f"{description} at {start_time:.1f}s"
+            })
+
+        # Add sprint events from velocity_summary
+        for player in players_physical:
+            if player.get("sprints", 0) > 0:
+                max_speed = player.get("max_speed_kmh", 0)
+                display_label = player.get("display_label") or f"{player['team'].capitalize()} P{player['track_id']}"
+                position = player.get("position", "Unknown")
+                team = player.get("team", "unknown")
+                # Approximate timestamp from distance ratio (simplified)
+                match_feed.append({
+                    "time": "N/A",
+                    "type": "SPRINT",
+                    "player_label": display_label,
+                    "position": position,
+                    "team": team,
+                    "speed": f"{max_speed} km/h",
+                    "description": f"{display_label} ({position}) sprint — {max_speed} km/h"
+                })
+
+        # Sort by time (phase changes only have timestamps)
+        match_feed_with_time = [f for f in match_feed if f["time"] != "N/A"]
+        match_feed_no_time = [f for f in match_feed if f["time"] == "N/A"]
+        match_feed_with_time.sort(key=lambda x: (int(x["time"].split(":")[0]), int(x["time"].split(":")[1])))
+        match_feed = match_feed_with_time + match_feed_no_time
+
+        # Build stats_table
+        stats_rows = []
+        for player in players_physical:
+            if player["confidence"] not in ("high", "medium"):
+                continue
+            if player["distance_metres"] <= 5:
+                continue
+            stats_rows.append({
+                "display_label": player.get("display_label") or f"{player['team'].capitalize()} P{player['track_id']}",
+                "position": player.get("position", "Unknown"),
+                "team": player["team"],
+                "distance_range": player["distance_range"],
+                "top_speed": f"{player['max_speed_kmh']} km/h ±10%",
+                "sprints": player.get("sprints", 0),
+                "confidence": player["confidence"]
+            })
+        stats_rows.sort(key=lambda x: x["distance_range"].split("-")[0], reverse=True)
+
+        stats_table = {
+            "headers": ["Player", "Position", "Team", "Distance", "Top Speed", "Sprints", "Confidence"],
+            "rows": stats_rows
+        }
 
         # Multi-pass validation (only if ?validate=true)
         validation_result = None
@@ -291,6 +420,8 @@ def _run_analysis_pipeline(job_id: str, temp_path: str, skip_cleanup: bool = Fal
                 "trajectories": trajectory_summary.get("trajectories", {}),
                 "history_size": trajectory_summary.get("player_history_size", {}),
             },
+            "match_feed": match_feed,
+            "stats_table": stats_table,
             "analysis": analysis_text,
             "validation": validation_result,
         }

@@ -1,8 +1,12 @@
 """
-Stream tracker using BoxMOT BoT-SORT.
+Stream tracker using BoxMOT ByteTrack.
 Per-session instances — no shared state.
-Do NOT reimplement tracking logic.
-Do NOT modify BoxMOT internals.
+
+Mirrors the proven approach from tracking_service.py:
+1. Camera motion estimation BEFORE matching
+2. IoU primary + center distance fallback (100px gate)
+3. Track lifecycle: tentative → confirmed → lost → removed
+4. ByteTrack (no ReID weights needed, works on Railway CPU)
 """
 
 import os
@@ -15,19 +19,19 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 TENTATIVE_THRESHOLD = 5
-MAX_LOST_FRAMES = 30
+MAX_LOST_FRAMES = 20
 YOLO_CONF = 0.25
 YOLO_IOU = 0.45
 MIN_BOX_H = 30
 MIN_BOX_W = 10
 MAX_ASPECT = 4.0
 MOTION_CAP = 80
-EMBEDDING_ALPHA = 0.7  # FootyVision EMA: keep 70% history, blend 30% new
+CENTER_DIST_GATE = 100  # pixels — fallback matching when IoU fails
 
 
 class Tracker:
     """
-    Per-session stateful tracker wrapping BoxMOT BoT-SORT.
+    Per-session stateful tracker wrapping BoxMOT ByteTrack.
     One instance per streaming session. No shared state.
     """
 
@@ -36,7 +40,7 @@ class Tracker:
         self.frame_h = frame_h
         self.fps = fps
         self.yolo = None
-        self.botsort = None
+        self.bytetrack = None
 
         self._meta = {}
         # track_id -> {
@@ -56,8 +60,10 @@ class Tracker:
         #   "avg_confidence": float,
         # }
 
-        # Fallback motion compensation
+        # Camera motion compensation state
         self._prev_gray = None
+        self._motion_dx = 0.0
+        self._motion_dy = 0.0
 
         # Team colour clustering
         self._colour_features = []
@@ -65,7 +71,7 @@ class Tracker:
 
     def load_model(self):
         """
-        Load YOLO and BoT-SORT once. Never raise.
+        Load YOLO and ByteTrack once. Never raise.
         Try yolov8n-pose.pt first, fall back to yolov8n.pt.
         """
         try:
@@ -87,108 +93,100 @@ class Tracker:
                 logger.error("Fallback YOLO failed: %s", e2)
 
         try:
-            from boxmot import BoTSORT
-            self.botsort = BoTSORT(
-                track_high_thresh=0.6,
+            from boxmot import ByteTrack
+            self.bytetrack = ByteTrack(
+                track_high_thresh=0.5,
                 track_low_thresh=0.1,
-                new_track_thresh=0.7,
-                track_buffer=MAX_LOST_FRAMES,
+                new_track_thresh=0.6,
+                track_buffer=20,
                 match_thresh=0.8,
                 frame_rate=max(1, int(self.fps)),
             )
-            logger.info("BoT-SORT initialised")
-
-            # FootyVision paper optimal lambda weights (ICMIP 2024)
-            # λfeat=0.3, λdist=0.3, λiou=0.3, λvel=0.1
-            _lambda_map = {
-                "lambda_feat": 0.3,
-                "lambda_iou": 0.3,
-                "lambda_dist": 0.3,
-                "lambda_vel": 0.1,
-            }
-            applied = []
-            for attr, val in _lambda_map.items():
-                if hasattr(self.botsort, attr):
-                    setattr(self.botsort, attr, val)
-                    applied.append(attr)
-            if applied:
-                logger.info("FootyVision lambdas applied: %s",
-                            applied)
-            else:
-                logger.warning(
-                    "BoT-SORT does not expose lambda weight "
-                    "attributes — using BoxMOT defaults"
-                )
+            logger.info("ByteTrack initialised (fps=%d, buffer=20)",
+                        max(1, int(self.fps)))
         except Exception as e:
-            logger.error("BoT-SORT init failed: %s", e)
+            logger.error("ByteTrack init failed: %s", e)
 
-    def _estimate_motion_fallback(self,
-                                   gray: np.ndarray) -> tuple:
+    def _estimate_camera_motion(self, gray: np.ndarray) -> tuple:
         """
-        Fallback camera motion compensation using
-        Lucas-Kanade optical flow on border features.
-        Used if BoT-SORT internal compensation is insufficient.
-        Returns (dx, dy). Returns (0.0, 0.0) on any failure.
+        Camera motion compensation using ORB features with
+        RANSAC homography, Farneback fallback.
+        MUST be called BEFORE matching each frame.
+        Returns (dx, dy) in pixels.
         """
         if self._prev_gray is None:
             self._prev_gray = gray
             return (0.0, 0.0)
         try:
-            h, w = gray.shape[:2]
-            mask = np.zeros(gray.shape, dtype=np.uint8)
-            border = int(min(h, w) * 0.30)
-            mask[:border, :] = 255
-            mask[-border:, :] = 255
-            mask[:, :border] = 255
-            mask[:, -border:] = 255
+            # Try ORB first (matches tracking_service.py approach)
+            orb = cv2.ORB_create(nfeatures=300)
+            kp1, des1 = orb.detectAndCompute(self._prev_gray, None)
+            kp2, des2 = orb.detectAndCompute(gray, None)
 
-            corners = cv2.goodFeaturesToTrack(
-                self._prev_gray,
-                maxCorners=150,
-                qualityLevel=0.01,
-                minDistance=8,
-                mask=mask,
+            if (des1 is not None and des2 is not None
+                    and len(des1) >= 8 and len(des2) >= 8):
+                bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+                matches = bf.match(des1, des2)
+                matches = sorted(matches, key=lambda m: m.distance)[:50]
+
+                if len(matches) >= 8:
+                    src_pts = np.float32(
+                        [kp1[m.queryIdx].pt for m in matches]
+                    ).reshape(-1, 1, 2)
+                    dst_pts = np.float32(
+                        [kp2[m.trainIdx].pt for m in matches]
+                    ).reshape(-1, 1, 2)
+                    H, mask = cv2.findHomography(
+                        src_pts, dst_pts, cv2.RANSAC, 5.0
+                    )
+                    inliers = int(mask.sum()) if mask is not None else 0
+                    if H is not None and inliers >= 6:
+                        dx = float(H[0, 2])
+                        dy = float(H[1, 2])
+                        if abs(dx) <= MOTION_CAP and abs(dy) <= MOTION_CAP:
+                            self._prev_gray = gray
+                            return (dx, dy)
+
+            # Farneback fallback
+            flow = cv2.calcOpticalFlowFarneback(
+                self._prev_gray, gray, None,
+                0.5, 3, 15, 3, 5, 1.2, 0
             )
-            if corners is None or len(corners) < 8:
-                self._prev_gray = gray
-                return (0.0, 0.0)
-
-            new_corners, status, _ = cv2.calcOpticalFlowPyrLK(
-                self._prev_gray, gray, corners, None
-            )
-            good_old = corners[status.ravel() == 1]
-            good_new = new_corners[status.ravel() == 1]
-
-            if len(good_old) < 6:
-                self._prev_gray = gray
-                return (0.0, 0.0)
-
-            dx = float(np.median(
-                good_new[:, 0] - good_old[:, 0]
-            ))
-            dy = float(np.median(
-                good_new[:, 1] - good_old[:, 1]
-            ))
-
+            dx = float(np.median(flow[..., 0]))
+            dy = float(np.median(flow[..., 1]))
             if abs(dx) > MOTION_CAP or abs(dy) > MOTION_CAP:
-                logger.warning(
-                    "Motion capped: dx=%.1f dy=%.1f", dx, dy
-                )
-                self._prev_gray = gray
-                return (0.0, 0.0)
-
+                dx, dy = 0.0, 0.0
             self._prev_gray = gray
             return (dx, dy)
         except Exception as e:
-            logger.warning("Motion fallback failed: %s", e)
+            logger.warning("Motion estimation failed: %s", e)
             self._prev_gray = gray
             return (0.0, 0.0)
+
+    def _shift_all_tracks(self, dx: float, dy: float):
+        """
+        Apply camera motion compensation to ALL track positions.
+        This shifts stored bboxes so they align with the new frame.
+        Called BEFORE detection matching.
+        """
+        if abs(dx) < 0.5 and abs(dy) < 0.5:
+            return
+        for tid, meta in self._meta.items():
+            if meta["state"] == "removed":
+                continue
+            bbox = meta.get("bbox")
+            if bbox:
+                meta["bbox"] = [
+                    bbox[0] + dx,
+                    bbox[1] + dy,
+                    bbox[2] + dx,
+                    bbox[3] + dy,
+                ]
 
     def _filter_to_pitch(self, frame: np.ndarray,
                           detections: np.ndarray) -> np.ndarray:
         """
         Remove detections outside the pitch using green colour mask.
-        FootyVision-style bystander removal via activation masks.
         Never crashes — returns all detections on any failure.
         """
         if len(detections) == 0:
@@ -210,15 +208,12 @@ class Tracker:
                     int(det[2]), int(det[3])
                 cx = (x1 + x2) // 2
                 feet_y = y1 + int((y2 - y1) * 0.75)
-                # Clamp to frame bounds
                 cx = max(0, min(cx, w - 1))
                 feet_y = max(0, min(feet_y, h - 1))
                 if pitch_mask[feet_y, cx] > 0:
                     keep.append(i)
 
             if not keep:
-                # All filtered out — return original to avoid
-                # losing all detections on a tricky frame
                 return detections
             return detections[keep]
         except Exception as e:
@@ -229,14 +224,6 @@ class Tracker:
         """
         Run YOLO. Return numpy array shape (N, 6):
         [x1, y1, x2, y2, conf, class_id]
-        for use with BoT-SORT update().
-
-        Filter:
-        - class != 0 -> skip
-        - bh < MIN_BOX_H -> skip
-        - bw < MIN_BOX_W -> skip
-        - y1 < frame_h*0.12 AND bh < 60 -> skip (stands)
-        - bw/bh > MAX_ASPECT -> skip (ad boards)
         """
         if self.yolo is None:
             return np.empty((0, 6))
@@ -272,8 +259,8 @@ class Tracker:
                         v * scale_back
                         for v in box.xyxy[0].tolist()
                     ]
-                    x1,y1,x2,y2 = (int(x1), int(y1),
-                                    int(x2), int(y2))
+                    x1, y1, x2, y2 = (int(x1), int(y1),
+                                      int(x2), int(y2))
                     bw = x2 - x1
                     bh = y2 - y1
                     if bh < MIN_BOX_H or bw < MIN_BOX_W:
@@ -287,7 +274,6 @@ class Tracker:
             if not dets:
                 return np.empty((0, 6))
             arr = np.array(dets, dtype=np.float32)
-            # FootyVision: pitch boundary bystander removal
             arr = self._filter_to_pitch(frame, arr)
             return arr
         except Exception as e:
@@ -299,22 +285,23 @@ class Tracker:
         """
         HSV jersey colour with k-means 2-team clustering.
         Returns 0, 1, or -1 (unknown).
-        Accumulates self._colour_features.
-        Builds self._team_centroids when >= 6 samples.
         """
         try:
-            x1,y1,x2,y2 = [int(v) for v in bbox]
+            x1, y1, x2, y2 = [int(v) for v in bbox]
             fh, fw = frame.shape[:2]
-            x1=max(0,min(x1,fw-1)); x2=max(x1+1,min(x2,fw))
-            y1=max(0,min(y1,fh-1)); y2=max(y1+1,min(y2,fh))
-            bh = y2-y1; bw = x2-x1
+            x1 = max(0, min(x1, fw - 1))
+            x2 = max(x1 + 1, min(x2, fw))
+            y1 = max(0, min(y1, fh - 1))
+            y2 = max(y1 + 1, min(y2, fh))
+            bh = y2 - y1
+            bw = x2 - x1
             if bh < 8 or bw < 8:
                 return -1
 
             trim = int(bw * 0.20)
             torso = frame[
-                y1:y1+int(bh*0.50),
-                x1+trim:x2-trim
+                y1:y1 + int(bh * 0.50),
+                x1 + trim:x2 - trim
             ]
             if torso.size == 0:
                 return -1
@@ -325,14 +312,14 @@ class Tracker:
                 np.array([25, 20, 20]),
                 np.array([95, 255, 255])
             )
-            dark = hsv[:,:,2] < 30
+            dark = hsv[:, :, 2] < 30
             jersey = ~((green > 0) | dark)
             if int(np.sum(jersey)) < 40:
                 return -1
 
-            hue = hsv[:,:,0][jersey].astype(float)
-            sat = hsv[:,:,1][jersey].astype(float)
-            val = hsv[:,:,2][jersey].astype(float)
+            hue = hsv[:, :, 0][jersey].astype(float)
+            sat = hsv[:, :, 1][jersey].astype(float)
+            val = hsv[:, :, 2][jersey].astype(float)
 
             sat_ratio = float(np.mean(sat > 60))
             brightness = float(np.mean(val)) / 255.0
@@ -352,10 +339,10 @@ class Tracker:
                 data = np.array(self._colour_features)
                 w = np.array([2.0, 1.5, 0.5])
                 dw = data * w
-                c = np.array([dw[0], dw[len(dw)//2]])
+                c = np.array([dw[0], dw[len(dw) // 2]])
                 for _ in range(20):
                     d = np.linalg.norm(
-                        dw[:,None,:] - c[None,:,:], axis=2
+                        dw[:, None, :] - c[None, :, :], axis=2
                     )
                     labels = np.argmin(d, axis=1)
                     for k in range(2):
@@ -384,10 +371,12 @@ class Tracker:
         Only if sharpness (Laplacian variance) >= 15.
         """
         try:
-            x1,y1,x2,y2 = [int(v) for v in bbox]
+            x1, y1, x2, y2 = [int(v) for v in bbox]
             fh, fw = frame.shape[:2]
-            x1=max(0,min(x1,fw-1)); x2=max(x1+1,min(x2,fw))
-            y1=max(0,min(y1,fh-1)); y2=max(y1+1,min(y2,fh))
+            x1 = max(0, min(x1, fw - 1))
+            x2 = max(x1 + 1, min(x2, fw))
+            y1 = max(0, min(y1, fh - 1))
+            y2 = max(y1 + 1, min(y2, fh))
             bh = y2 - y1
             if bh < 30:
                 return None
@@ -406,6 +395,28 @@ class Tracker:
         except Exception:
             return None
 
+    @staticmethod
+    def _iou(a, b):
+        """Compute IoU between two bboxes [x1,y1,x2,y2]."""
+        x1 = max(a[0], b[0])
+        y1 = max(a[1], b[1])
+        x2 = min(a[2], b[2])
+        y2 = min(a[3], b[3])
+        inter = max(0, x2 - x1) * max(0, y2 - y1)
+        area_a = (a[2] - a[0]) * (a[3] - a[1])
+        area_b = (b[2] - b[0]) * (b[3] - b[1])
+        union = area_a + area_b - inter
+        return inter / union if union > 0 else 0.0
+
+    @staticmethod
+    def _center_dist(a, b):
+        """Euclidean distance between bbox centers."""
+        cx_a = (a[0] + a[2]) / 2.0
+        cy_a = (a[1] + a[3]) / 2.0
+        cx_b = (b[0] + b[2]) / 2.0
+        cy_b = (b[1] + b[3]) / 2.0
+        return ((cx_a - cx_b) ** 2 + (cy_a - cy_b) ** 2) ** 0.5
+
     def update(self, frame: np.ndarray,
                 frame_idx: int,
                 timestamp: float,
@@ -414,14 +425,18 @@ class Tracker:
         Process one frame.
 
         Steps:
-        1. Detect with YOLO
-        2. Update BoT-SORT — it handles Kalman, ReID,
-           camera motion, two-stage association internally
-        3. Sync BoT-SORT output with self._meta
-        4. State transitions (tentative -> confirmed at 5)
-        5. Mark lost tracks
-        6. Apply confirmed_ids labels
-        7. Return track_states and newly_confirmed
+        1. Estimate camera motion
+        2. Shift ALL track positions (motion compensation)
+        3. Detect with YOLO
+        4. Update ByteTrack
+        5. Sync ByteTrack output with self._meta
+           - IoU primary matching
+           - Center distance fallback (100px)
+        6. State transitions
+        7. Mark lost/removed tracks
+        8. Apply confirmed_ids labels
+        9. Log per-frame metrics
+        10. Return track_states and newly_confirmed
 
         Returns:
         {
@@ -429,29 +444,40 @@ class Tracker:
             "newly_confirmed": list,   # just hit threshold
         }
         """
-        if self.yolo is None or self.botsort is None:
+        if self.yolo is None or self.bytetrack is None:
             return {"track_states": [], "newly_confirmed": []}
 
         try:
-            # 1. Detect
+            # 1. Estimate camera motion
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            dx, dy = self._estimate_camera_motion(gray)
+            self._motion_dx = dx
+            self._motion_dy = dy
+
+            # 2. Shift ALL track positions BEFORE matching
+            self._shift_all_tracks(dx, dy)
+
+            # 3. Detect
             dets = self._detect(frame)
 
-            # 2. BoT-SORT update
-            # Input:  (N, 6) [x1,y1,x2,y2,conf,cls]
-            # Output: (M, 8) [x1,y1,x2,y2,id,conf,cls,idx]
+            # 4. ByteTrack update
             if len(dets) > 0:
-                bt_out = self.botsort.update(dets, frame)
+                bt_out = self.bytetrack.update(dets, frame)
             else:
-                bt_out = self.botsort.update(
+                bt_out = self.bytetrack.update(
                     np.empty((0, 6)), frame
                 )
 
             active_ids = set()
+            matched_count = 0
+            new_count = 0
 
-            # 3. Sync output with metadata
+            # 5. Sync output with metadata
             for row in bt_out:
-                x1 = int(row[0]); y1 = int(row[1])
-                x2 = int(row[2]); y2 = int(row[3])
+                x1 = int(row[0])
+                y1 = int(row[1])
+                x2 = int(row[2])
+                y2 = int(row[3])
                 tid = int(row[4])
                 conf = float(row[5])
                 active_ids.add(tid)
@@ -461,25 +487,81 @@ class Tracker:
                 bbox = [x1, y1, x2, y2]
 
                 if tid not in self._meta:
-                    team = self._detect_team(frame, bbox)
-                    crop = self._extract_crop(frame, bbox)
-                    self._meta[tid] = {
-                        "track_id": tid,
-                        "state": "tentative",
-                        "detection_count": 1,
-                        "frames_since_seen": 0,
-                        "positions": [[cx, cy, frame_idx]],
-                        "first_frame": frame_idx,
-                        "last_frame": frame_idx,
-                        "team_id": team if team >= 0 else None,
-                        "coach_confirmed": False,
-                        "coach_label": None,
-                        "best_crop_b64": crop,
-                        "surfaced_to_ui": False,
-                        "bbox": bbox,
-                        "avg_confidence": conf,
-                        "embedding": None,
-                    }
+                    # Check if any existing non-removed track
+                    # matches via center distance fallback
+                    best_match_tid = None
+                    best_match_dist = CENTER_DIST_GATE
+
+                    for existing_tid, meta in self._meta.items():
+                        if meta["state"] == "removed":
+                            continue
+                        existing_bbox = meta.get("bbox")
+                        if existing_bbox is None:
+                            continue
+
+                        iou = self._iou(bbox, existing_bbox)
+                        if iou >= 0.25:
+                            # IoU match — use this track
+                            best_match_tid = existing_tid
+                            break
+
+                        # Center distance fallback
+                        dist = self._center_dist(bbox, existing_bbox)
+                        if dist < best_match_dist:
+                            best_match_dist = dist
+                            best_match_tid = existing_tid
+
+                    if best_match_tid is not None:
+                        # Re-associate with existing track
+                        meta = self._meta[best_match_tid]
+                        meta["bbox"] = bbox
+                        meta["frames_since_seen"] = 0
+                        meta["last_frame"] = frame_idx
+                        meta["positions"].append(
+                            [cx, cy, frame_idx]
+                        )
+                        n = meta["detection_count"] + 1
+                        meta["detection_count"] = n
+                        meta["avg_confidence"] = (
+                            meta["avg_confidence"] * (n - 1) + conf
+                        ) / n
+                        if meta["state"] == "lost":
+                            meta["state"] = (
+                                "confirmed"
+                                if meta["detection_count"]
+                                >= TENTATIVE_THRESHOLD
+                                else "tentative"
+                            )
+                        if meta["team_id"] is None:
+                            t = self._detect_team(frame, bbox)
+                            if t >= 0:
+                                meta["team_id"] = t
+                        if conf > 0.6 and not meta["best_crop_b64"]:
+                            meta["best_crop_b64"] = \
+                                self._extract_crop(frame, bbox)
+                        active_ids.add(best_match_tid)
+                        matched_count += 1
+                    else:
+                        # Genuinely new track
+                        team = self._detect_team(frame, bbox)
+                        crop = self._extract_crop(frame, bbox)
+                        self._meta[tid] = {
+                            "track_id": tid,
+                            "state": "tentative",
+                            "detection_count": 1,
+                            "frames_since_seen": 0,
+                            "positions": [[cx, cy, frame_idx]],
+                            "first_frame": frame_idx,
+                            "last_frame": frame_idx,
+                            "team_id": team if team >= 0 else None,
+                            "coach_confirmed": False,
+                            "coach_label": None,
+                            "best_crop_b64": crop,
+                            "surfaced_to_ui": False,
+                            "bbox": bbox,
+                            "avg_confidence": conf,
+                        }
+                        new_count += 1
                 else:
                     meta = self._meta[tid]
                     meta["bbox"] = bbox
@@ -491,29 +573,16 @@ class Tracker:
                     n = meta["detection_count"] + 1
                     meta["detection_count"] = n
                     meta["avg_confidence"] = (
-                        meta["avg_confidence"] * (n-1) + conf
+                        meta["avg_confidence"] * (n - 1) + conf
                     ) / n
 
-                    # FootyVision embedding EMA update
-                    # BoT-SORT rows: [x1,y1,x2,y2,id,conf,cls,idx,...]
-                    # Columns 8+ may contain embedding data
-                    if len(row) > 8:
-                        try:
-                            new_emb = np.array(
-                                row[8:], dtype=np.float32
-                            )
-                            if new_emb.size > 0:
-                                if meta["embedding"] is None:
-                                    meta["embedding"] = new_emb
-                                else:
-                                    meta["embedding"] = (
-                                        EMBEDDING_ALPHA
-                                        * meta["embedding"]
-                                        + (1 - EMBEDDING_ALPHA)
-                                        * new_emb
-                                    )
-                        except Exception:
-                            pass  # embeddings not available
+                    if meta["state"] == "lost":
+                        meta["state"] = (
+                            "confirmed"
+                            if meta["detection_count"]
+                            >= TENTATIVE_THRESHOLD
+                            else "tentative"
+                        )
 
                     if meta["team_id"] is None:
                         t = self._detect_team(frame, bbox)
@@ -523,22 +592,25 @@ class Tracker:
                             and not meta["best_crop_b64"]):
                         meta["best_crop_b64"] = \
                             self._extract_crop(frame, bbox)
+                    matched_count += 1
 
-            # 4+5. State transitions and lost marking
+            # 6+7. State transitions and lost/removed marking
             newly_confirmed = []
+            lost_count = 0
+            confirmed_count = 0
+
             for tid, meta in self._meta.items():
                 if tid not in active_ids:
                     meta["frames_since_seen"] += 1
-                    if meta["frames_since_seen"] > 0:
-                        if meta["state"] not in (
-                            "removed",
-                        ):
-                            meta["state"] = "lost"
+                    if (meta["frames_since_seen"] > 0
+                            and meta["state"] != "removed"):
+                        meta["state"] = "lost"
+                        lost_count += 1
                     if meta["frames_since_seen"] > MAX_LOST_FRAMES:
                         meta["state"] = "removed"
                     continue
 
-                if (meta["state"] == "tentative"
+                if (meta["state"] in ("tentative", "lost")
                         and meta["detection_count"]
                             >= TENTATIVE_THRESHOLD):
                     meta["state"] = "confirmed"
@@ -546,7 +618,16 @@ class Tracker:
                         meta["surfaced_to_ui"] = True
                         newly_confirmed.append(meta)
 
-            # 6. Apply coach confirmed labels
+                if meta["state"] == "confirmed":
+                    confirmed_count += 1
+
+            # Count lost (for logging)
+            lost_count = sum(
+                1 for m in self._meta.values()
+                if m["state"] == "lost"
+            )
+
+            # 8. Apply coach confirmed labels
             for tid, label in confirmed_ids.items():
                 if tid in self._meta:
                     self._meta[tid]["coach_confirmed"] = True
@@ -554,7 +635,18 @@ class Tracker:
                     self._meta[tid]["state"] = "confirmed"
                     self._meta[tid]["surfaced_to_ui"] = True
 
-            # 7. Build response — confirmed + lost only
+            # 9. Per-frame instrumentation logging
+            logger.debug(
+                "Frame %d: detections=%d active_tracks=%d "
+                "matched=%d new=%d lost=%d confirmed=%d",
+                frame_idx, len(dets),
+                len([m for m in self._meta.values()
+                     if m["state"] != "removed"]),
+                matched_count, new_count,
+                lost_count, confirmed_count
+            )
+
+            # 10. Build response — confirmed + lost only
             track_states = [
                 {
                     "track_id": m["track_id"],
@@ -660,8 +752,8 @@ class Tracker:
                 continue
             last_pos = meta["positions"][-1]
             dist = (
-                (last_pos[0] - first_pos[0])**2 +
-                (last_pos[1] - first_pos[1])**2
+                (last_pos[0] - first_pos[0]) ** 2 +
+                (last_pos[1] - first_pos[1]) ** 2
             ) ** 0.5
             if dist < 50:
                 to_merge.append(tid)

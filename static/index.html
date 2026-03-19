@@ -1346,7 +1346,10 @@ async function startLiveAnalysis() {
     hide('uploadSection', 'resultsSection', 'errorSection', 'loadingSection');
     show('liveSection');
 
-    const video = $('liveVideo');
+    // Hidden video purely for metadata (duration, dimensions)
+    const video = document.createElement('video');
+    video.muted = true;
+    video.preload = 'metadata';
     const url = URL.createObjectURL(selectedFile);
     video.src = url;
 
@@ -1366,7 +1369,6 @@ async function startLiveAnalysis() {
     const duration = video.duration;
     if (!duration || !vw || !vh) { fallbackToQuick('Invalid video'); return; }
 
-    // Use 2.5fps for frame-by-frame processing — 0.4s intervals
     const fps = 2.5;
     const interval = 1 / fps;
     const totalFrames = Math.floor(duration * fps);
@@ -1391,22 +1393,13 @@ async function startLiveAnalysis() {
         return;
     }
 
-    // Setup overlay canvas
-    const canvas = $('liveCanvas');
-    const videoEl = $('liveVideo');
-    const syncCanvas = () => {
-        canvas.width = videoEl.clientWidth;
-        canvas.height = videoEl.clientHeight;
-    };
-    syncCanvas();
-    new ResizeObserver(syncCanvas).observe(videoEl);
-
-    // Play the video so user can actually watch it
-    video.currentTime = 0;
-    video.play().catch(() => {});
-
-    // Continuously redraw overlay at 15fps while live section is visible
-    liveOverlayIv = setInterval(drawLiveOverlay, 67);
+    // Rotating status messages
+    let statusIdx = 0;
+    $('liveStatusMsg').textContent = LIVE_STATUS_MSGS[0];
+    liveStatusMsgIv = setInterval(() => {
+        statusIdx = (statusIdx + 1) % LIVE_STATUS_MSGS.length;
+        $('liveStatusMsg').textContent = LIVE_STATUS_MSGS[statusIdx];
+    }, 8000);
 
     // Extraction canvas (offscreen, half-res for speed)
     const extractW = Math.min(vw, 640);
@@ -1425,8 +1418,7 @@ async function startLiveAnalysis() {
     liveSeenTrackIds = new Set();
     uncertainQueue = [];
 
-    // Extract frames — seek offscreen, don't interrupt playback visually
-    // We use a second hidden video for extraction so the visible one plays smoothly
+    // Hidden video for frame extraction
     const extractVideo = document.createElement('video');
     extractVideo.src = url;
     extractVideo.muted = true;
@@ -1443,7 +1435,6 @@ async function startLiveAnalysis() {
     let batchTimestamps = [];
 
     while (frameIdx < totalFrames) {
-        // Wait if paused
         while (livePaused) await sleep(200);
 
         const t = frameIdx * interval;
@@ -1458,7 +1449,7 @@ async function startLiveAnalysis() {
         batchTimestamps.push(parseFloat(t.toFixed(3)));
         frameIdx++;
 
-        // Update progress
+        // Update progress bar and frame counter
         const pct = (frameIdx / totalFrames * 100).toFixed(1);
         $('liveProgressFill').style.width = pct + '%';
         $('liveFrameInfo').textContent = `Frame ${frameIdx}/${totalFrames}`;
@@ -1476,12 +1467,10 @@ async function startLiveAnalysis() {
                 if (!res.ok) throw new Error(`HTTP ${res.status}`);
                 const result = await res.json();
 
-                // Update tracks from track_states
                 if (result.track_states) {
                     result.track_states.forEach(tk => { liveTracks[tk.track_id] = tk; });
                 }
 
-                // Handle newly confirmed tracks (just hit detection threshold)
                 if (result.newly_confirmed && result.newly_confirmed.length > 0) {
                     const fresh = result.newly_confirmed.filter(u =>
                         !liveSkippedIds.has(u.track_id) && !liveSeenTrackIds.has(u.track_id)
@@ -1496,11 +1485,8 @@ async function startLiveAnalysis() {
                         }
                     }
                 }
-
-                updateLivePlayerInfo();
             } catch (e) {
                 console.error('Frame batch error:', e);
-                // Don't fallback on single batch failure — skip and continue
             }
             batch = [];
             batchIndices = [];
@@ -1515,14 +1501,14 @@ async function startLiveAnalysis() {
         while (livePaused) await sleep(200);
     }
 
-    // Finalise — first get stream summary, then submit to full pipeline
+    // Finalise
     clearInterval(liveTimerIv);
-    clearInterval(liveOverlayIv);
-    video.pause();
-    $('liveFrameInfo').textContent = 'Finalising stream...';
+    clearInterval(liveStatusMsgIv);
+    $('liveFrameInfo').textContent = 'GENERATING FULL REPORT...';
+    $('liveStatusMsg').textContent = '';
+    $('liveProgressFill').style.width = '100%';
 
     try {
-        // Finalise triggers real pipeline on server-side saved video
         const finRes = await fetch(`${API_BASE}/api/v1/stream/${liveSessionId}/finalise`, {
             method: 'POST',
         });
@@ -1545,7 +1531,7 @@ async function startLiveAnalysis() {
 function fallbackToQuick(reason) {
     console.warn('Live fallback:', reason);
     clearInterval(liveTimerIv);
-    clearInterval(liveOverlayIv);
+    clearInterval(liveStatusMsgIv);
     hide('liveSection');
     liveSessionId = null;
     analysisMode = 'quick';
@@ -1563,72 +1549,6 @@ function updateLiveTimer() {
     $('liveElapsed').textContent = `${mm}:${ss}`;
 }
 
-function updateLivePlayerInfo() {
-    $('livePlayerInfo').textContent = `${liveConfirmedCount} confirmed \u00b7 ${liveUncertainCount} uncertain`;
-}
-
-function drawLiveOverlay() {
-    const canvas = $('liveCanvas');
-    const video = $('liveVideo');
-    if (!canvas || !video || !video.videoWidth) return;
-    const ctx = canvas.getContext('2d');
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
-
-    const scaleX = canvas.width / video.videoWidth;
-    const scaleY = canvas.height / video.videoHeight;
-
-    Object.values(liveTracks).forEach(tk => {
-        if (!tk.bbox) return;
-        const [x1, y1, x2, y2] = tk.bbox;
-        const sx = x1 * scaleX, sy = y1 * scaleY;
-        const sw = (x2 - x1) * scaleX, sh = (y2 - y1) * scaleY;
-        const cx = sx + sw / 2, cy = sy;
-
-        let color;
-        if (tk.coach_confirmed || tk.coach_label) {
-            color = '#00d4aa';
-        } else if (liveSkippedIds.has(tk.track_id)) {
-            color = '#6b7280';
-        } else if (tk.state === 'lost') {
-            color = '#f59e0b';
-        } else {
-            color = '#38bdf8';
-        }
-
-        // Glow effect
-        ctx.shadowColor = color;
-        ctx.shadowBlur = 8;
-
-        // Thicker box
-        ctx.strokeStyle = color;
-        ctx.lineWidth = 2.5;
-        ctx.strokeRect(sx, sy, sw, sh);
-
-        // Dot above head
-        ctx.beginPath();
-        ctx.arc(cx, cy - 6, 6, 0, Math.PI * 2);
-        ctx.fillStyle = color;
-        ctx.fill();
-
-        ctx.shadowBlur = 0;
-
-        // Label
-        const label = tk.coach_label || '';
-        if (label) {
-            ctx.font = '700 13px Rajdhani, sans-serif';
-            ctx.fillStyle = '#fff';
-            ctx.textAlign = 'center';
-            // Background pill
-            const tw = ctx.measureText(label).width + 8;
-            ctx.fillStyle = color;
-            ctx.beginPath();
-            ctx.roundRect(cx - tw/2, sy - 24, tw, 16, 4);
-            ctx.fill();
-            ctx.fillStyle = '#000';
-            ctx.fillText(label, cx, sy - 12);
-        }
-    });
-}
 
 function showUncertainCards() {
     const stack = $('uncertainStack');
@@ -1703,7 +1623,7 @@ async function confirmUncertain(trackId, btn) {
     }
     liveConfirmedCount++;
     liveUncertainCount = Math.max(0, liveUncertainCount - 1);
-    updateLivePlayerInfo();
+
     card.remove();
     checkResumeLive();
 }
@@ -1714,7 +1634,7 @@ function skipUncertain(trackId, btn) {
     clearInterval(card._timerIv);
     liveSkippedIds.add(trackId);
     liveUncertainCount = Math.max(0, liveUncertainCount - 1);
-    updateLivePlayerInfo();
+
     card.remove();
     checkResumeLive();
 }
