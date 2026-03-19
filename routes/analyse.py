@@ -1,4 +1,4 @@
-from fastapi import APIRouter, UploadFile, File
+from fastapi import APIRouter, UploadFile, File, Query
 from fastapi.responses import JSONResponse
 import shutil, uuid, os
 import numpy as np
@@ -39,7 +39,7 @@ def numpy_safe(obj):
 # Keep alias for any other code that may reference make_json_safe
 make_json_safe = numpy_safe
 
-def _run_analysis_pipeline(job_id: str, temp_path: str, skip_cleanup: bool = False):
+def _run_analysis_pipeline(job_id: str, temp_path: str, skip_cleanup: bool = False, validate: bool = False):
     """Background task — runs the full analysis pipeline."""
     try:
         # Pitch calibration
@@ -183,6 +183,16 @@ def _run_analysis_pipeline(job_id: str, temp_path: str, skip_cleanup: bool = Fal
                 "max_speed_display": spd_metric["display_value"],
             })
 
+        # Multi-pass validation (only if ?validate=true)
+        validation_result = None
+        if validate:
+            from services.multi_pass_validator import run_multi_pass_validation
+            validation_result = run_multi_pass_validation(
+                video_path=temp_path,
+                job_id=job_id,
+                players_physical=players_physical,
+            )
+
         # Total-level confidence for physical summary
         total_sprints = vel_summary.get("total_sprints", 0)
         max_speed_kmh = vel_summary.get("max_speed_kmh", 0)
@@ -264,6 +274,7 @@ def _run_analysis_pipeline(job_id: str, temp_path: str, skip_cleanup: bool = Fal
                 "history_size": trajectory_summary.get("player_history_size", {}),
             },
             "analysis": analysis_text,
+            "validation": validation_result,
         }
         result = numpy_safe(base_result)
         return result
@@ -272,7 +283,10 @@ def _run_analysis_pipeline(job_id: str, temp_path: str, skip_cleanup: bool = Fal
             os.remove(temp_path)
 
 @router.post("/analyse")
-async def analyse_video(video: UploadFile = File(...)):
+async def analyse_video(
+    video: UploadFile = File(...),
+    validate: bool = Query(False, description="Run 3-pass validation for confirmed metrics"),
+):
     """Submit video for async background analysis. Returns immediately with job_id."""
     job_id = str(uuid.uuid4())[:8]
     temp_path = f"/tmp/{job_id}_{video.filename}"
@@ -285,7 +299,7 @@ async def analyse_video(video: UploadFile = File(...)):
     create_job(job_id)
 
     # Submit async task
-    submit_job(job_id, _run_analysis_pipeline, job_id, temp_path)
+    submit_job(job_id, _run_analysis_pipeline, job_id, temp_path, validate=validate)
 
     # Return immediately with poll URL
     return JSONResponse({
