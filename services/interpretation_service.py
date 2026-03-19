@@ -17,10 +17,61 @@ def safe_float(val):
         return None
 
 
-def build_rich_context(events, tracks, vel_summary, shape_summary, velocities, job_id, team_separation=None, data_confidence=None):
-    """Build plain-English coaching context. No jargon, no raw technical values."""
+def _compute_phase_widths(events, tracks, calibration):
+    """
+    For each situation event, compute average lateral spread (width) per team
+    using trajectory entries that fall within that time window.
+
+    Returns a list of dicts:
+      { "label": "open play", "start": 0, "end": 22, "team_0_width": 36.2, "team_1_width": 21.4 }
+    """
+    ppm = 1.0
+    if calibration and calibration.get("pixels_per_metre"):
+        ppm = max(calibration["pixels_per_metre"], 0.1)
+
+    # fps assumed 25, frame_stride 2 — convert seconds to approximate frame range
+    fps = 25.0
+    stride = 2
+
+    phase_shapes = []
+    for e in events:
+        start_s = safe_float(e.get("start_time", 0)) or 0
+        end_s = safe_float(e.get("end_time", 0)) or 0
+        label = "open play" if e.get("situation") == "OPEN_PLAY" else "stoppage"
+
+        start_frame = int(start_s * fps / stride) * stride
+        end_frame = int(end_s * fps / stride) * stride
+
+        team_xs = {"team_0": [], "team_1": []}
+        for t in tracks:
+            team_id = t.get("teamId", -1)
+            if team_id not in (0, 1):
+                continue
+            key = f"team_{team_id}"
+            for entry in t.get("trajectory", []):
+                fi = entry.get("frameIndex", 0)
+                if start_frame <= fi <= end_frame:
+                    bbox = entry.get("bbox")
+                    if bbox and len(bbox) >= 4:
+                        cx = (bbox[0] + bbox[2]) / 2.0 / ppm
+                        team_xs[key].append(cx)
+
+        row = {"label": label, "start": start_s, "end": end_s,
+               "team_0_width": None, "team_1_width": None}
+        for key in ("team_0", "team_1"):
+            xs = team_xs[key]
+            if len(xs) >= 3:
+                row[f"{key}_width"] = round(max(xs) - min(xs), 1)
+        phase_shapes.append(row)
+
+    return phase_shapes
+
+
+def build_rich_context(events, tracks, vel_summary, shape_summary, velocities, job_id,
+                       team_separation=None, data_confidence=None, calibration=None,
+                       brain_summary=None):
+    """Build plain-English coaching context for the Claude prompt."""
     team_sep = team_separation or {}
-    conf = data_confidence or {}
 
     on_pitch_players = [t for t in tracks if not t.get('is_staff', False)]
     if len(on_pitch_players) > 30:
@@ -42,22 +93,17 @@ def build_rich_context(events, tracks, vel_summary, shape_summary, velocities, j
         start = safe_float(e.get('start_time', 0)) or 0
         end = safe_float(e.get('end_time', 0)) or 0
         label = "open play" if e['situation'] == 'OPEN_PLAY' else "stoppage"
-        situation_timeline.append(f"{start:.0f}s–{end:.0f}s: {label}")
+        situation_timeline.append(f"{start:.0f}s\u2013{end:.0f}s: {label}")
 
-    # Separate open play and dead ball windows
-    open_play_windows = [e for e in events if e.get('situation') == 'OPEN_PLAY']
-    dead_ball_windows = [e for e in events if e.get('situation') != 'OPEN_PLAY']
+    # Per-phase shape data
+    phase_shapes = _compute_phase_widths(events, tracks, calibration)
 
-    # Build team shape per situation phase
-    def _shape_for_phase(phase_name, width, depth):
-        if width is None:
-            return None
-        return f"roughly {width:.0f}m wide, {depth:.0f}m deep" if depth else f"roughly {width:.0f}m wide"
-
-    sh_t0 = shape_summary.get("team_0", {})
-    sh_t1 = shape_summary.get("team_1", {})
-    t0_shape_str = _shape_for_phase("open play", sh_t0.get("avg_width_metres"), sh_t0.get("avg_depth_metres"))
-    t1_shape_str = _shape_for_phase("open play", sh_t1.get("avg_width_metres"), sh_t1.get("avg_depth_metres"))
+    # Check whether brain trusts sprint data
+    sprints_trusted = True
+    if brain_summary:
+        questioned = brain_summary.get("metrics_to_question", [])
+        if "sprint_counts" in questioned:
+            sprints_trusted = False
 
     # Build per-player numbers, skip low confidence and inactive players
     # Number players within each team by distance (Player 1 = most distance)
@@ -76,7 +122,7 @@ def build_rich_context(events, tracks, vel_summary, shape_summary, velocities, j
         tc = score_track_confidence(trk)
         conf_level = tc["level"]
         if conf_level == "low":
-            continue  # skip low confidence players
+            continue
 
         team_id = track_team_map.get(track_id, -1)
         team_key = "team_0" if team_id == 0 else ("team_1" if team_id == 1 else "unassigned")
@@ -94,7 +140,7 @@ def build_rich_context(events, tracks, vel_summary, shape_summary, velocities, j
             "track_id": track_id,
             "conf_level": conf_level,
             "distance": distance,
-            "dist_range": f"{dist_lo:.0f}–{dist_hi:.0f}m",
+            "dist_range": f"{dist_lo:.0f}\u2013{dist_hi:.0f}m",
             "max_speed_kmh": max_speed_kmh,
             "sprint_count": sprint_count,
         })
@@ -107,99 +153,125 @@ def build_rich_context(events, tracks, vel_summary, shape_summary, velocities, j
             player_label = f"{team_name} Player {idx}"
             conf = p["conf_level"]
             if conf == "high":
-                player_lines.append(
-                    f"  {player_label} [HIGH confidence]: "
-                    f"distance {p['dist_range']} | "
-                    f"{p['max_speed_kmh']} km/h peak (±10%) | "
-                    f"{p['sprint_count']} sprint(s)"
-                )
+                if sprints_trusted:
+                    player_lines.append(
+                        f"  {player_label} [HIGH confidence]: "
+                        f"distance {p['dist_range']} | "
+                        f"{p['max_speed_kmh']} km/h peak (\u00b110%) | "
+                        f"{p['sprint_count']} sprint(s)"
+                    )
+                else:
+                    player_lines.append(
+                        f"  {player_label} [HIGH confidence]: "
+                        f"distance {p['dist_range']} | "
+                        f"{p['max_speed_kmh']} km/h peak (\u00b110%)"
+                    )
             else:
                 speed_lo = round(p['max_speed_kmh'] * 0.8, 1)
                 speed_hi = round(p['max_speed_kmh'] * 1.2, 1)
-                player_lines.append(
-                    f"  {player_label} [MEDIUM confidence]: "
-                    f"roughly {p['dist_range']} | "
-                    f"approximately {speed_lo}–{speed_hi} km/h peak | "
-                    f"approximately {max(0, p['sprint_count'] - 2)}–{p['sprint_count'] + 2} sprint(s)"
-                )
+                if sprints_trusted:
+                    player_lines.append(
+                        f"  {player_label} [MEDIUM confidence]: "
+                        f"roughly {p['dist_range']} | "
+                        f"approximately {speed_lo}\u2013{speed_hi} km/h peak | "
+                        f"approximately {max(0, p['sprint_count'] - 2)}\u2013{p['sprint_count'] + 2} sprint(s)"
+                    )
+                else:
+                    player_lines.append(
+                        f"  {player_label} [MEDIUM confidence]: "
+                        f"roughly {p['dist_range']} | "
+                        f"approximately {speed_lo}\u2013{speed_hi} km/h peak"
+                    )
 
     duration_str = f"{total_duration:.0f}" if isinstance(total_duration, (int, float)) else "unknown"
 
     lines = [
-        "You are a football analyst writing a post-match report for a grassroots or semi-professional coach.",
+        "You are writing a post-match report for a grassroots or semi-professional football coach.",
         "",
-        "The coach reads this on their phone. They played or coached today and want to know what the data actually showed.",
+        "The coach reads this on their phone after training or a match.",
+        "They are not academics. They want to know what happened, what the numbers show, and what to fix.",
         "",
-        "STRICT RULES — break these and the report is useless:",
+        "BANNED WORDS — never use these:",
+        "entropy, Voronoi, Shannon, homography, spectral, biomechanical,",
+        "calibration, pixel, heuristic, algorithm, interpolated,",
+        "belief state, neuro-symbolic, anomaly, parametric.",
+        "Replace every one with plain English.",
         "",
-        "1. NEVER use these words:",
-        "   entropy, Voronoi, Shannon, homography, spectral, belief state, heuristic, algorithm,",
-        "   pixel, calibration, neuro-symbolic, anomaly, interpolated, biomechanical.",
-        "   Replace them with plain English always.",
+        "BANNED TACTICS — never write these unless the data proves it:",
+        "'high press', 'low block', 'gegenpressing', 'progressive carries',",
+        "'half-space', 'pressing triggers', 'counterpressing'.",
+        "If you cannot point to a specific number that proves it, do not write it.",
         "",
-        "2. NEVER invent tactical labels.",
-        "   Do not write 'high press', 'gegenpressing', 'low block', 'progressive carries'",
-        "   unless the data explicitly shows it. If you cannot prove it from the numbers, do not say it.",
+        "RULES:",
         "",
-        "3. ONLY make claims about metrics the brain trusts.",
-        "   The brain analysis section tells you what to trust and what to question.",
-        "   If a metric is in 'metrics_to_question' do not mention it in the report at all.",
-        "   If confidence is low on a metric, skip it entirely.",
+        "Rule 1 \u2014 Every tactical claim needs a number.",
+        "BAD: 'The team pressed well.'",
+        "GOOD: 'During open play Blue spread to roughly 36m wide.'",
         "",
-        "4. Every tactical claim needs a number behind it.",
-        "   BAD: 'The team pressed well in the first half.'",
-        "   GOOD: 'During open play your team spread to roughly 36m wide.'",
-        "   BAD: 'Player 7 showed good work rate.'",
-        "   GOOD: 'Blue Player 1 covered the most ground — roughly 140–180m.'",
+        "Rule 2 \u2014 Shape must be described per phase, not as an average.",
+        "BAD: 'Blue averaged 36m width.'",
+        "GOOD: 'During open play (0\u201322s) Blue spread to roughly 36m wide.",
+        "When play stopped (22\u201333s) the shape dropped to around 20m.'",
         "",
-        "5. When you describe shape, describe it at a specific moment.",
-        "   BAD: 'The team averaged 36m width.'",
-        "   GOOD: 'During open play your team spread to roughly 36m wide.'",
+        "Rule 3 \u2014 Never label a formation.",
+        "Do not write 4-4-2, 4-3-3, or any formation number.",
+        "Describe what you see: 'Blue had more players in defence than attack'",
+        "not 'Blue played a 4-5-1.'",
         "",
-        "6. Approximate estimates must say they are approximate.",
-        "   Use: 'roughly', 'around', 'approximately', 'suggests' for any MEDIUM confidence metric.",
+        "Rule 4 \u2014 Mark approximations clearly.",
+        "For any MEDIUM confidence metric use: 'roughly', 'around', 'approximately', 'suggests'.",
+        "For any metric the brain questions \u2014 skip it entirely. Do not mention it at all.",
         "",
-        "7. Short sentences. Maximum 20 words per sentence.",
-        "   Write like you are texting a coach, not writing a thesis.",
+        "Rule 5 \u2014 Short sentences. Maximum 20 words each.",
+        "Write like you are texting a coach, not writing a thesis.",
         "",
-        "8. No praise for the sake of it.",
-        "   Do not write 'great work rate' or 'good intensity.' Only write what the data shows.",
+        "Rule 6 \u2014 No generic praise.",
+        "Do not write 'good work rate', 'great intensity', 'solid defensive shape'",
+        "unless a specific number supports it.",
         "",
-        "REPORT STRUCTURE — use exactly these sections:",
+        "REPORT STRUCTURE \u2014 use exactly these sections:",
         "",
         "## WHAT HAPPENED",
-        "3-4 sentences maximum.",
-        "Describe the match flow using only the situation timeline. Reference actual timestamps.",
-        "Do not invent what caused stoppages.",
+        "3\u20134 sentences maximum.",
+        "Describe match flow using only the situation timeline.",
+        "Reference actual timestamps. Do not invent what caused stoppages.",
         "",
         "## TEAM SHAPE",
-        "2-3 sentences. Use actual width and depth numbers.",
-        "Do not label formations (4-4-2 etc) — you cannot confirm these from the data.",
-        "If one team was significantly wider or narrower, say so and give the number.",
+        "2\u20133 sentences.",
+        "Describe shape during open play AND during dead ball separately \u2014 use the per-phase data provided.",
+        "Give actual width numbers. Do not label formations.",
+        "If one team was significantly wider or narrower say so and give the number.",
         "",
         "## WHO COVERED THE MOST GROUND",
-        "List the top 3-4 players by distance covered. Use the distance range, not a single number.",
-        "One sentence per player maximum. Only include HIGH or MEDIUM confidence players.",
-        "Skip LOW confidence players entirely.",
+        "List top 3\u20134 players by distance only.",
+        "Use player numbers (Blue Player 1, Red Player 1 etc).",
+        "Use distance range not a single number.",
+        "One sentence per player maximum.",
+        "Only include HIGH or MEDIUM confidence players. Skip LOW confidence entirely.",
         "",
         "## SPRINT EFFORTS",
-        "ONLY include this section if 'sprint_counts' is in the trusted metrics list above.",
-        "If 'sprint_counts' is in the questioned metrics list, skip this section entirely and do not mention sprints anywhere.",
-        "If included: list players who sprinted, give count, note peak speed with margin.",
+        "ONLY include this section if sprints are listed as trusted above.",
+        "If sprints are questioned \u2014 delete this section entirely. Do not mention sprints anywhere.",
+        "If included: which players sprinted, how many times, peak speed with margin.",
         "",
-        "## SPACE CONTROL",
+        "## PITCH CONTROL",
         "Only include if space control data is provided below.",
         "Do not use the word Voronoi.",
-        "Say it plainly: 'Blue had the ball in more areas of the pitch for most of this clip — controlling roughly X% of the available space.'",
-        "One or two sentences only.",
+        "Plain English only. One or two sentences only.",
         "",
         "## ONE THING TO WORK ON",
-        "This is the most important section.",
-        "Pick ONE specific, actionable thing the data suggests needs improvement.",
-        "It must be based directly on the data — not generic advice.",
+        "Most important section. Coaches remember this one.",
+        "Pick ONE specific thing the data suggests needs work.",
+        "Must be based directly on a number in the data.",
+        "Must be actionable \u2014 something to do in training.",
         "BAD: 'Work on pressing higher up the pitch.'",
-        "GOOD: 'During stoppages your team's shape tightened to around 20m wide. Work on maintaining width when play stops.'",
+        "GOOD: 'When play stopped (22\u201333 seconds), Blue's shape dropped to roughly 20m wide.",
+        "Players were very bunched together.",
+        "Work on maintaining width during dead balls so you are harder to press at restarts.'",
         "Maximum 4 sentences.",
+        "Never write generic football advice.",
+        "If the data does not clearly suggest something specific, write:",
+        "'The clip is too short to identify a clear priority \u2014 analyse a longer sequence.'",
         "",
     ]
 
@@ -213,23 +285,27 @@ def build_rich_context(events, tracks, vel_summary, shape_summary, velocities, j
 
     if has_teams:
         lines.append("TEAM IDENTIFICATION:")
-        lines.append(f"  Team A name: {t0_name} ({team_sep.get('team_0_players', 0)} players detected)")
-        lines.append(f"  Team B name: {t1_name} ({team_sep.get('team_1_players', 0)} players detected)")
+        lines.append(f"  {t0_name} ({team_sep.get('team_0_players', 0)} players detected)")
+        lines.append(f"  {t1_name} ({team_sep.get('team_1_players', 0)} players detected)")
         lines.append("")
 
-    lines.append("TEAM SHAPE (use these numbers directly):")
-    if t0_shape_str:
-        lines.append(f"  {t0_name}: {t0_shape_str} (averaged across open play phases)")
+    lines.append("TEAM SHAPE PER PHASE (use these numbers directly, describe each phase separately):")
+    if phase_shapes:
+        for ps in phase_shapes:
+            t0w = f"{ps['team_0_width']:.0f}m wide" if ps["team_0_width"] is not None else "no data"
+            t1w = f"{ps['team_1_width']:.0f}m wide" if ps["team_1_width"] is not None else "no data"
+            lines.append(
+                f"  {ps['label'].capitalize()} ({ps['start']:.0f}s\u2013{ps['end']:.0f}s): "
+                f"{t0_name} {t0w}, {t1_name} {t1w}"
+            )
     else:
-        lines.append(f"  {t0_name}: shape data unavailable")
-    if t1_shape_str:
-        lines.append(f"  {t1_name}: {t1_shape_str} (averaged across open play phases)")
-    else:
-        lines.append(f"  {t1_name}: shape data unavailable")
+        lines.append("  (Shape data unavailable)")
     lines.append("")
 
     lines.append("PLAYER DISTANCES (use these for 'who covered the most ground'):")
-    lines.append("Players are numbered 1, 2, 3... within each team, by distance covered (Player 1 = most distance).")
+    lines.append("Players numbered 1, 2, 3\u2026 within each team by distance covered (Player 1 = most distance).")
+    if not sprints_trusted:
+        lines.append("NOTE: Sprint data is unreliable for this clip. Do NOT mention sprints in the report.")
     if player_lines:
         for pl in player_lines:
             lines.append(pl)
@@ -240,7 +316,9 @@ def build_rich_context(events, tracks, vel_summary, shape_summary, velocities, j
     return "\n".join(lines)
 
 
-def interpret_events(events, tracks, job_id, velocity_summary=None, shape_summary=None, velocities=None, memory=None, team_separation=None, data_confidence=None, brain_summary=None, voronoi=None, entropy=None):
+def interpret_events(events, tracks, job_id, velocity_summary=None, shape_summary=None,
+                     velocities=None, memory=None, team_separation=None, data_confidence=None,
+                     brain_summary=None, voronoi=None, entropy=None, calibration=None):
     if not events:
         return [{"job_id": job_id, "analysis": "No events to analyse.", "events": []}]
 
@@ -252,9 +330,11 @@ def interpret_events(events, tracks, job_id, velocity_summary=None, shape_summar
         job_id,
         team_separation=team_separation,
         data_confidence=data_confidence,
+        calibration=calibration,
+        brain_summary=brain_summary,
     )
 
-    # Prefix with Observer Brain analysis when available
+    # Prefix with Observer Brain data quality summary
     if brain_summary:
         health = brain_summary.get("tracking_health", {})
         brain_prefix = "\n".join([
@@ -282,10 +362,9 @@ def interpret_events(events, tracks, job_id, velocity_summary=None, shape_summar
         prompt += "\n".join([
             "",
             "SPACE CONTROL DATA:",
-            f"  {t0_name} controlled {voronoi.get('team_0_control_pct', 0):.1f}% of available pitch space",
-            f"  {t1_name} controlled {voronoi.get('team_1_control_pct', 0):.1f}% of available pitch space",
-            f"  {dom_team} had the advantage by {voronoi.get('control_margin', 0):.1f}%",
-            f"  (Based on {voronoi.get('frames_analysed', 0)} frames)",
+            f"  {t0_name} controlled roughly {voronoi.get('team_0_control_pct', 0):.0f}% of available pitch space",
+            f"  {t1_name} controlled roughly {voronoi.get('team_1_control_pct', 0):.0f}% of available pitch space",
+            f"  {dom_team} had the advantage",
             "",
         ])
 

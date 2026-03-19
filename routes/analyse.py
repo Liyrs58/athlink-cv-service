@@ -111,6 +111,7 @@ def _run_analysis_pipeline(job_id: str, temp_path: str, skip_cleanup: bool = Fal
             brain_summary=brain_summary,
             voronoi=voronoi,
             entropy=entropy,
+            calibration=calibration,
         )
         analysis_text = analysis[0]["analysis"] if analysis else ""
 
@@ -212,7 +213,10 @@ def _run_analysis_pipeline(job_id: str, temp_path: str, skip_cleanup: bool = Fal
                 "max_speed_confidence": phys_conf,
                 "max_speed_margin": score_physical_metric(max_speed_kmh, phys_conf, "speed")["margin_of_error"],
                 "total_distance_metres": vel_summary.get("total_distance_metres", 0),
-                "players_analysed": vel_summary.get("players_analysed", 0),
+                "players_analysed": sum(
+                    1 for p in players_physical
+                    if p["distance_metres"] > 5 and p["confidence"] in ("high", "medium")
+                ),
                 "top_sprinter_id": vel_summary.get("top_sprinter_id"),
                 "top_runner_id": vel_summary.get("top_runner_id"),
                 "top_runner_distance": vel_summary.get("top_runner_distance"),
