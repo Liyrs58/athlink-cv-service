@@ -271,6 +271,11 @@ def compute_player_velocity(track, calibration: Optional[Dict[str, Any]] = None,
         dist_px = math.sqrt(dx*dx + dy*dy)
         dist_m = dist_px / ppm
 
+        # Low homography confidence: apply a conservative distance discount
+        is_approx = valid_entries[i].get("metric_quality") == "approximate"
+        if is_approx:
+            dist_m *= 0.85  # treat as approximate — discount by 15%
+
         # Only count displacement above noise floor
         if dist_m >= MIN_DISPLACEMENT_M:
             total_distance_m += dist_m

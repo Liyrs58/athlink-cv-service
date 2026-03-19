@@ -7,7 +7,7 @@ and provides accurate pixel-to-metre conversion.
 import cv2
 import numpy as np
 import logging
-from typing import Optional, Tuple, Dict, Any
+from typing import Optional, Tuple, Dict, Any, List
 
 logger = logging.getLogger(__name__)
 
@@ -240,6 +240,136 @@ def estimate_homography(frame: np.ndarray) -> Dict[str, Any]:
     }
 
 
+def compute_frame_homography_confidence(
+    video_path: str,
+    interval_frames: int = 25,
+) -> List[Dict[str, Any]]:
+    """
+    Sample every `interval_frames` frames and compute a 0-1 confidence score based on:
+      - Number of pitch line features detected (more = better)
+      - Whether keypoint homography succeeded (reprojection quality)
+      - Camera motion magnitude from optical flow vs previous sample
+
+    Returns a list of dicts:
+      [{"frame_index": int, "confidence": float, "reliable": bool}, ...]
+
+    Also stored as "frame_confidence_scores" list in the returned structure for
+    easy consumption by physics_corrector.
+    """
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        return []
+
+    raw_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    raw_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    needs_rotation = raw_h > raw_w
+
+    scores = []
+    prev_gray = None
+    frame_idx = 0
+
+    while frame_idx < total_frames:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+        ret, frame = cap.read()
+        if not ret:
+            frame_idx += interval_frames
+            continue
+
+        if needs_rotation:
+            frame = cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
+
+        score = 0.0
+
+        # Component 1: pitch line feature count (0-0.4)
+        lines = detect_pitch_lines(frame)
+        n_lines = len(lines)
+        if n_lines >= 10:
+            line_score = 0.4
+        elif n_lines >= 5:
+            line_score = 0.2 + (n_lines - 5) * 0.04
+        elif n_lines >= 2:
+            line_score = 0.1
+        else:
+            line_score = 0.0
+        score += line_score
+
+        # Component 2: keypoint homography quality (0-0.4)
+        cal = estimate_homography(frame)
+        if cal["method"] == "keypoints":
+            # Reprojection check: transform a known pitch boundary point back to image
+            H = cal.get("homography")
+            if H is not None:
+                try:
+                    H_arr = np.array(H, dtype=np.float32)
+                    H_inv = np.linalg.inv(H_arr)
+                    # Check corner [0,0] reprojection — should be near a frame corner
+                    pt = np.array([[[0.0, 0.0]]], dtype=np.float32)
+                    reproj = cv2.perspectiveTransform(pt, H_inv)
+                    rx, ry = float(to_scalar(reproj[0][0][0])), float(to_scalar(reproj[0][0][1]))
+                    h_frame, w_frame = frame.shape[:2]
+                    # If reprojected point is within the frame area → good
+                    if -w_frame * 0.3 <= rx <= w_frame * 1.3 and -h_frame * 0.3 <= ry <= h_frame * 1.3:
+                        score += 0.4
+                    else:
+                        score += 0.1
+                except Exception:
+                    score += 0.1
+            else:
+                score += 0.2
+        else:
+            # green_fraction fallback — lower quality
+            score += 0.1
+
+        # Component 3: camera motion (0-0.2, inverse — high motion = low confidence)
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        if prev_gray is not None:
+            # Sparse flow on a grid of points
+            h_f, w_f = gray.shape
+            step = max(w_f // 8, 20)
+            pts = np.array(
+                [[[float(x), float(y)]]
+                 for y in range(step, h_f - step, step)
+                 for x in range(step, w_f - step, step)],
+                dtype=np.float32,
+            )
+            if len(pts) > 0:
+                next_pts, status, _ = cv2.calcOpticalFlowPyrLK(
+                    prev_gray, gray, pts, None,
+                    winSize=(15, 15), maxLevel=2,
+                    criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 10, 0.03),
+                )
+                if status is not None:
+                    good = status.ravel() == 1
+                    if good.sum() > 0:
+                        motion = np.linalg.norm(next_pts[good] - pts[good], axis=2).mean()
+                        # Normalise: 0 motion → 0.2 bonus, >30px motion → 0.0
+                        motion_score = max(0.0, 0.2 * (1.0 - min(motion / 30.0, 1.0)))
+                        score += motion_score
+                    else:
+                        score += 0.1
+                else:
+                    score += 0.1
+            else:
+                score += 0.1
+        else:
+            score += 0.1  # no previous frame — neutral
+
+        prev_gray = gray
+
+        score = round(min(max(score, 0.0), 1.0), 3)
+        scores.append({
+            "frame_index": frame_idx,
+            "confidence": score,
+            "reliable": score >= 0.4,
+        })
+
+        frame_idx += interval_frames
+
+    cap.release()
+    return scores
+
+
 def get_frame_calibration(video_path: str, sample_frames: int = 5) -> Dict[str, Any]:
     """
     Sample frames from the video, estimate calibration on each,
@@ -321,12 +451,16 @@ def get_frame_calibration(video_path: str, sample_frames: int = 5) -> Dict[str, 
         f"frames_sampled={len(fractions)}"
     )
 
+    # Compute per-frame confidence scores every 25 frames
+    frame_confidence_scores = compute_frame_homography_confidence(video_path, interval_frames=25)
+
     return {
         'method': method,
         'visible_fraction': round(median_frac, 3),
         'pixels_per_metre': round(median_ppm, 2),
         'homography': best_homography,
         'frames_sampled': len(fractions),
+        'frame_confidence_scores': frame_confidence_scores,
     }
 
 

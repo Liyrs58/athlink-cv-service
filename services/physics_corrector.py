@@ -119,6 +119,9 @@ class PhysicsCorrector:
         # Constraint 7: self-calibrating pitch model
         ppm = self._apply_self_calibration(tracks, ppm, vis_frac, calibration)
 
+        # Constraint 8: per-frame homography confidence — mark low-confidence frames
+        self._apply_homography_confidence(tracks, calibration)
+
         self.stats["final_pixels_per_metre"] = round(ppm, 2)
         calibration["pixels_per_metre"] = ppm
 
@@ -492,6 +495,46 @@ class PhysicsCorrector:
                         else:
                             ei["world_x"] = round(ei.get("world_x", 0) + COLLISION_DIST_M * 0.5, 2)
                         self.stats["collision_resolutions"] += 1
+
+    # ── Constraint 8: Per-frame homography confidence ─────────────
+
+    def _apply_homography_confidence(self, tracks, calibration):
+        """
+        Use frame_confidence_scores from calibration to mark trajectory entries
+        that fall within low-confidence frames as approximate.
+
+        Entries in low-confidence windows (score < 0.4) get:
+          entry["metric_quality"] = "approximate"
+
+        This is used downstream by velocity_service to know which speed/distance
+        values should be treated as estimates rather than precise measurements.
+        """
+        frame_scores = calibration.get("frame_confidence_scores", [])
+        if not frame_scores:
+            return
+
+        # Build a lookup: frame_index → confidence
+        # Each score entry covers a window of 25 frames
+        INTERVAL = 25
+        low_conf_frames: set = set()
+        for entry in frame_scores:
+            if not entry.get("reliable", True):
+                fi = entry.get("frame_index", 0)
+                for offset in range(INTERVAL):
+                    low_conf_frames.add(fi + offset)
+
+        if not low_conf_frames:
+            return
+
+        low_conf_marked = 0
+        for track in tracks:
+            for traj_entry in track.get("trajectory", []):
+                fi = traj_entry.get("frameIndex", 0)
+                if fi in low_conf_frames:
+                    traj_entry["metric_quality"] = "approximate"
+                    low_conf_marked += 1
+
+        self.stats.setdefault("low_conf_frames_marked", low_conf_marked)
 
     # ── Constraint 7: Self-calibrating pitch model ────────────────
 
