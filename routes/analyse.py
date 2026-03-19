@@ -165,7 +165,11 @@ def _run_analysis_pipeline(job_id: str, temp_path: str, skip_cleanup: bool = Fal
             dist_hi = round(dist * (1 + pct), 0)
 
             team_id = track_team_map.get(v["track_id"], -1)
-            team_name = t0_name if team_id == 0 else (t1_name if team_id == 1 else "unknown")
+            team_name = t0_name if team_id == 0 else (t1_name if team_id == 1 else "unassigned")
+
+            # Skip stationary/ghost tracks — no real movement detected
+            if dist == 0 and sprints == 0 and max_spd_kmh < 5.0:
+                continue
 
             players_physical.append({
                 "track_id": v["track_id"],
