@@ -1307,10 +1307,10 @@ async function startLiveAnalysis() {
     try {
         const startFd = new FormData();
         startFd.append('video', selectedFile);
-        startFd.append('frame_width', vw);
-        startFd.append('frame_height', vh);
+        startFd.append('frame_width', String(vw));
+        startFd.append('frame_height', String(vh));
         startFd.append('clip_type', 'match');
-        startFd.append('fps', fps);
+        startFd.append('fps', String(fps));
         const res = await fetch(`${API_BASE}/api/v1/stream/start`, {
             method: 'POST', body: startFd
         });
