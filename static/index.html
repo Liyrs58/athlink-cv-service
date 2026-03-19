@@ -495,6 +495,40 @@
             font-weight: 700; letter-spacing: 1px; color: var(--muted);
         }
 
+        /* ── TACTICAL MAP ── */
+        .pitch-svg { width: 100%; max-width: 600px; height: auto; }
+        .player-dot { cursor: pointer; transition: all 0.2s; }
+        .player-dot:hover { r: 10; filter: brightness(1.3); }
+        .player-label { font-family: 'Rajdhani', sans-serif; font-size: 9px; font-weight: 600; text-anchor: middle; fill: white; pointer-events: none; }
+        .team-hull { fill-opacity: 0.15; stroke-width: 2; stroke-dasharray: 5,3; }
+        .team-stats-col { text-align: center; }
+        .team-stats-name { font-family: 'Rajdhani', sans-serif; font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 1px; color: var(--muted); margin-bottom: 4px; }
+        .team-stats-value { font-family: 'Rajdhani', sans-serif; font-size: 24px; font-weight: 700; color: var(--text); margin-bottom: 2px; }
+        .team-stats-label { font-size: 11px; color: var(--muted); }
+
+        /* ── MATCH FEED ── */
+        .feed-item {
+            background: var(--card); border: 1px solid var(--border);
+            border-radius: 8px; padding: 12px 16px; margin-bottom: 8px;
+            display: flex; align-items: center; gap: 12px;
+            border-left: 4px solid transparent;
+            transition: all 0.2s;
+        }
+        .feed-item:hover { border-color: var(--border); }
+        .feed-open { border-left-color: var(--teal); }
+        .feed-dead { border-left-color: var(--muted); }
+        .feed-sprint { border-left-color: var(--warning); }
+        .feed-time {
+            background: var(--bg); border: 1px solid var(--border);
+            border-radius: 4px; padding: 2px 8px; font-size: 10px;
+            font-family: 'Rajdhani', sans-serif; font-weight: 700; color: var(--teal);
+            min-width: 40px; text-align: center;
+        }
+        .feed-icon { font-size: 16px; }
+        .feed-content { flex: 1; }
+        .feed-title { font-family: 'Rajdhani', sans-serif; font-size: 12px; font-weight: 700; color: var(--text); margin-bottom: 2px; }
+        .feed-detail { font-size: 11px; color: var(--muted); }
+
         /* ── RESPONSIVE ── */
         @media (max-width: 640px) {
             .container { padding: 20px 16px; }
@@ -858,7 +892,14 @@ function render(d) {
         </div>
     </div>`;
 
-    // B. Match Confidence
+    // B. Tactical Map
+    ov += `<div class="card" id="tacticalMap" style="display:none;">
+        <div class="card-title">Tactical Map</div>
+        <div id="pitchContainer"></div>
+        <div id="teamStats" style="display:grid;grid-template-columns:1fr 1fr;gap:20px;margin-top:20px;"></div>
+    </div>`;
+
+    // C. Match Confidence
     const grade = (dc.overall_grade || 'B').toUpperCase();
     const gc = { A: 'g-a', B: 'g-b', C: 'g-c', D: 'g-d' }[grade] || 'g-b';
     ov += `<div class="conf-row" id="conf">
@@ -964,7 +1005,26 @@ function render(d) {
         </div>
     </div>`;
 
+    // G. Match Feed
+    ov += `<div class="card" id="matchFeed" style="display:none;">
+        <div class="card-title">Match Feed</div>
+        <div id="feedContainer"></div>
+    </div>`;
+
     $('pane-overview').innerHTML = ov;
+
+    // Render tactical map and match feed after DOM is ready
+    setTimeout(() => {
+        renderTacticalMap();
+        renderMatchFeed();
+        // Trigger card animations
+        document.querySelectorAll('.card, .card-anim').forEach((el, i) => {
+            setTimeout(() => {
+                el.style.opacity = '1';
+                el.style.transform = 'translateY(0)';
+            }, i * 100);
+        });
+    }, 100);
 
     // ──────────────────────────────────────────────────────
     //  TAB 2: PLAYERS
@@ -1267,11 +1327,20 @@ let livePaused = false;
 let liveStartTime = null;
 let liveTimerIv = null;
 let liveSkippedIds = new Set();
-let liveSeenTrackIds = new Set();   // tracks already shown as cards
+let liveSeenTrackIds = new Set();
 let uncertainQueue = [];
-let liveOverlayIv = null;           // animation loop for overlay
+let liveStatusMsgIv = null;
 const MAX_VISIBLE_CARDS = 3;
-const UNCERTAIN_BATCH_THRESHOLD = 5; // only pause after this many new uncertain in one batch
+const UNCERTAIN_BATCH_THRESHOLD = 5;
+
+const LIVE_STATUS_MSGS = [
+    'EXTRACTING FRAMES...',
+    'DETECTING PLAYERS...',
+    'TRACKING MOVEMENT...',
+    'MEASURING POSITIONS...',
+    'ANALYSING FOOTAGE...',
+    'PROCESSING BATCH...',
+];
 
 async function startLiveAnalysis() {
     hide('uploadSection', 'resultsSection', 'errorSection', 'loadingSection');
@@ -1659,6 +1728,254 @@ function checkResumeLive() {
             livePaused = false;
         }
     }
+}
+
+// ── TACTICAL MAP & MATCH FEED FUNCTIONS ──
+function getTeamColor(colourName) {
+    const name = (colourName || '').toLowerCase();
+    if (name.includes('blue')) return '#3b82f6';
+    if (name.includes('red')) return '#ef4444';
+    if (name.includes('white')) return '#f9fafb';
+    if (name.includes('dark') || name.includes('black')) return '#374151';
+    if (name.includes('yellow')) return '#f59e0b';
+    if (name.includes('green')) return '#10b981';
+    // Default fallback
+    return name.includes('team 0') ? '#3b82f6' : '#ef4444';
+}
+
+function inferPlayerPosition(player, teamId) {
+    // Simple position inference based on distance covered
+    const distance = player.distance_metres || 0;
+    const maxDistance = Math.max(...(ph.players || []).map(p => p.distance_metres || 0));
+    
+    if (maxDistance === 0) return 'back';
+    
+    const normalized = distance / maxDistance;
+    if (normalized < 0.3) return 'back';      // GK/defender - low distance
+    if (normalized > 0.7) return 'front';     // Forward - high distance  
+    return 'middle';                          // Midfielder
+}
+
+function estimatePlayerPosition(player, teamId) {
+    const position = inferPlayerPosition(player, teamId);
+    const isTeam0 = teamId === 0;
+    
+    // Team 0 on left side (0-60% of pitch), Team 1 on right side (40-100%)
+    const xRange = isTeam0 ? [0.1, 0.6] : [0.4, 0.9];
+    const yRange = [0.2, 0.8]; // Vertical spread
+    
+    let x, y;
+    if (position === 'back') {
+        x = isTeam0 ? 0.15 : 0.85;
+        y = 0.3 + Math.random() * 0.4; // Defenders spread vertically
+    } else if (position === 'front') {
+        x = isTeam0 ? 0.45 : 0.55;
+        y = 0.35 + Math.random() * 0.3; // Forwards more central
+    } else {
+        x = isTeam0 ? 0.25 : 0.75;
+        y = 0.25 + Math.random() * 0.5; // Midfielders spread across
+    }
+    
+    // Add some randomness within ranges
+    x = xRange[0] + (x - xRange[0]) * (xRange[1] - xRange[0]);
+    y = yRange[0] + Math.random() * (yRange[1] - yRange[0]);
+    
+    return { x: Math.max(0.05, Math.min(0.95, x)), y: Math.max(0.05, Math.min(0.95, y)) };
+}
+
+function buildConvexHull(points) {
+    if (points.length < 3) return points;
+    
+    // Simple convex hull approximation using sorted angles from centroid
+    const centroid = points.reduce((acc, p) => ({ x: acc.x + p.x, y: acc.y + p.y }), { x: 0, y: 0 });
+    centroid.x /= points.length;
+    centroid.y /= points.length;
+    
+    // Sort points by angle from centroid
+    const sorted = points.slice().sort((a, b) => {
+        const angleA = Math.atan2(a.y - centroid.y, a.x - centroid.x);
+        const angleB = Math.atan2(b.y - centroid.y, b.x - centroid.x);
+        return angleA - angleB;
+    });
+    
+    return sorted;
+}
+
+function renderTacticalMap() {
+    if (!ph.players || ph.players.length === 0) {
+        $('pitchContainer').innerHTML = '<div style="text-align:center;color:var(--muted);padding:40px;">No player data available</div>';
+        $('tacticalMap').style.display = 'block';
+        return;
+    }
+    
+    const pitchWidth = 105;
+    const pitchHeight = 68;
+    const svgWidth = 600;
+    const svgHeight = (svgWidth / pitchWidth) * pitchHeight;
+    
+    const t0Name = (ts.team_0_colour_name || 'Team A').toUpperCase();
+    const t1Name = (ts.team_1_colour_name || 'Team B').toUpperCase();
+    const t0Color = getTeamColor(ts.team_0_colour_name);
+    const t1Color = getTeamColor(ts.team_1_colour_name);
+    
+    // Group players by team and estimate positions
+    const team0Players = ph.players.filter(p => 
+        (p.team || '').toLowerCase().includes((ts.team_0_colour_name || '').toLowerCase()) || 
+        p.team_id === 0
+    );
+    const team1Players = ph.players.filter(p => 
+        (p.team || '').toLowerCase().includes((ts.team_1_colour_name || '').toLowerCase()) || 
+        p.team_id === 1
+    );
+    
+    // Estimate positions for each player
+    const team0Positions = team0Players.map(p => ({ ...estimatePlayerPosition(p, 0), player: p }));
+    const team1Positions = team1Players.map(p => ({ ...estimatePlayerPosition(p, 1), player: p }));
+    
+    // Build SVG
+    let svg = `<svg class="pitch-svg" viewBox="0 0 ${svgWidth} ${svgHeight}" xmlns="http://www.w3.org/2000/svg">
+        <!-- Pitch background -->
+        <rect width="${svgWidth}" height="${svgHeight}" fill="#2d6a2d"/>
+        
+        <!-- Pitch lines -->
+        <g stroke="white" stroke-width="1.5" fill="none">
+            <!-- Outer lines -->
+            <rect x="10" y="10" width="${svgWidth - 20}" height="${svgHeight - 20}"/>
+            <!-- Halfway line -->
+            <line x1="${svgWidth/2}" y1="10" x2="${svgWidth/2}" y2="${svgHeight - 10}"/>
+            <!-- Centre circle -->
+            <circle cx="${svgWidth/2}" cy="${svgHeight/2}" r="40"/>
+            <circle cx="${svgWidth/2}" cy="${svgHeight/2}" r="3" fill="white"/>
+            <!-- Penalty areas -->
+            <rect x="10" y="${(svgHeight/2) - 66}" width="88" height="132"/>
+            <rect x="${svgWidth - 98}" y="${(svgHeight/2) - 66}" width="88" height="132"/>
+            <!-- Goal areas -->
+            <rect x="10" y="${(svgHeight/2) - 28}" width="32" height="56"/>
+            <rect x="${svgWidth - 42}" y="${(svgHeight/2) - 28}" width="32" height="56"/>
+            <!-- Goals -->
+            <rect x="2" y="${(svgHeight/2) - 20}" width="8" height="40" fill="white"/>
+            <rect x="${svgWidth - 10}" y="${(svgHeight/2) - 20}" width="8" height="40" fill="white"/>
+        </g>`;
+    
+    // Team 0 hull
+    if (team0Positions.length >= 3) {
+        const hull = buildConvexHull(team0Positions);
+        const hullPoints = hull.map(p => `${p.x * svgWidth},${p.y * svgHeight}`).join(' ');
+        svg += `<polygon class="team-hull" points="${hullPoints}" fill="${t0Color}" stroke="${t0Color}"/>`;
+    }
+    
+    // Team 1 hull
+    if (team1Positions.length >= 3) {
+        const hull = buildConvexHull(team1Positions);
+        const hullPoints = hull.map(p => `${p.x * svgWidth},${p.y * svgHeight}`).join(' ');
+        svg += `<polygon class="team-hull" points="${hullPoints}" fill="${t1Color}" stroke="${t1Color}"/>`;
+    }
+    
+    // Player dots
+    team0Positions.forEach(pos => {
+        const x = pos.x * svgWidth;
+        const y = pos.y * svgHeight;
+        const label = pos.player.display_label || `#${pos.player.track_id}`;
+        svg += `<circle class="player-dot" cx="${x}" cy="${y}" r="8" fill="${t0Color}" stroke="white" stroke-width="1.5"/>
+            <text class="player-label" x="${x}" y="${y - 12}">${esc(label)}</text>`;
+    });
+    
+    team1Positions.forEach(pos => {
+        const x = pos.x * svgWidth;
+        const y = pos.y * svgHeight;
+        const label = pos.player.display_label || `#${pos.player.track_id}`;
+        svg += `<circle class="player-dot" cx="${x}" cy="${y}" r="8" fill="${t1Color}" stroke="white" stroke-width="1.5"/>
+            <text class="player-label" x="${x}" y="${y - 12}">${esc(label)}</text>`;
+    });
+    
+    svg += '</svg>';
+    
+    $('pitchContainer').innerHTML = svg;
+    
+    // Team stats
+    const t0Width = (sh.team_0 || {}).avg_width_metres || 0;
+    const t1Width = (sh.team_1 || {}).avg_width_metres || 0;
+    const t0Count = ts.team_0_players || team0Players.length;
+    const t1Count = ts.team_1_players || team1Players.length;
+    
+    $('teamStats').innerHTML = `
+        <div class="team-stats-col">
+            <div class="team-stats-name">${esc(t0Name)} TEAM</div>
+            <div class="team-stats-value">${t0Width.toFixed(1)}m</div>
+            <div class="team-stats-label">Width</div>
+            <div class="team-stats-value">${t0Count}</div>
+            <div class="team-stats-label">Players tracked</div>
+        </div>
+        <div class="team-stats-col">
+            <div class="team-stats-name">${esc(t1Name)} TEAM</div>
+            <div class="team-stats-value">${t1Width.toFixed(1)}m</div>
+            <div class="team-stats-label">Width</div>
+            <div class="team-stats-value">${t1Count}</div>
+            <div class="team-stats-label">Players tracked</div>
+        </div>
+    `;
+    
+    $('tacticalMap').style.display = 'block';
+}
+
+function renderMatchFeed() {
+    const events = (d.situations || {}).events || [];
+    const feedItems = [];
+    
+    // Add situation events
+    events.forEach(event => {
+        const start = event.start_time || 0;
+        const minutes = Math.floor(start / 60);
+        const seconds = Math.floor(start % 60);
+        const timeStr = `${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`;
+        
+        const isOpen = event.situation === 'OPEN_PLAY';
+        feedItems.push({
+            time: timeStr,
+            icon: isOpen ? '▶' : '⏸',
+            title: isOpen ? 'Open play' : 'Play stopped',
+            detail: `${((event.end_time || 0) - start).toFixed(1)}s phase`,
+            type: isOpen ? 'open' : 'dead'
+        });
+    });
+    
+    // Add sprint events
+    ph.players.forEach(player => {
+        if (player.sprints > 0) {
+            feedItems.push({
+                time: 'est.',
+                icon: '⚡',
+                title: `${player.display_label || `Player ${player.track_id}`} sprint`,
+                detail: `${player.max_speed_kmh || 0} km/h`,
+                type: 'sprint'
+            });
+        }
+    });
+    
+    // Sort by time (put estimated times at end)
+    const withTime = feedItems.filter(f => f.time !== 'est.');
+    const estimated = feedItems.filter(f => f.time === 'est.');
+    withTime.sort((a, b) => {
+        const aSecs = parseInt(a.time.split(':')[0]) * 60 + parseInt(a.time.split(':')[1]);
+        const bSecs = parseInt(b.time.split(':')[0]) * 60 + parseInt(b.time.split(':')[1]);
+        return aSecs - bSecs;
+    });
+    
+    const sortedFeed = [...withTime, ...estimated];
+    
+    const feedHtml = sortedFeed.map(item => `
+        <div class="feed-item feed-${item.type}">
+            <div class="feed-time">${item.time}</div>
+            <div class="feed-icon">${item.icon}</div>
+            <div class="feed-content">
+                <div class="feed-title">${esc(item.title)}</div>
+                <div class="feed-detail">${esc(item.detail)}</div>
+            </div>
+        </div>
+    `).join('');
+    
+    $('feedContainer').innerHTML = feedHtml || '<div style="text-align:center;color:var(--muted);padding:20px;">No events to display</div>';
+    $('matchFeed').style.display = 'block';
 }
 </script>
 </body>
