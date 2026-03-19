@@ -414,13 +414,13 @@
 
         /* ── LIVE PLAYER ── */
         #liveSection { display: none; }
-        .live-wrap { max-width: 720px; margin: 0 auto; }
+        .live-wrap { max-width: 900px; margin: 0 auto; }
         .live-video-wrap {
             position: relative; width: 100%; background: #000;
             border-radius: 12px; overflow: hidden; margin-bottom: 16px;
         }
         .live-video-wrap video {
-            display: block; width: 100%; max-height: 400px; object-fit: contain;
+            display: block; width: 100%; max-height: 520px; object-fit: contain;
         }
         .live-video-wrap canvas {
             position: absolute; top: 0; left: 0; width: 100%; height: 100%;
@@ -445,7 +445,7 @@
         .live-stats span { color: var(--text); font-weight: 600; }
 
         /* ── UNCERTAIN CARDS ── */
-        .uncertain-stack { max-width: 720px; margin: 0 auto; }
+        .uncertain-stack { max-width: 900px; margin: 0 auto; }
         .uncertain-card {
             background: var(--card); border: 1px solid var(--warning);
             border-radius: 10px; padding: 16px 20px; margin-bottom: 10px;
@@ -1260,15 +1260,18 @@ function togglePlayerExpand(card) {
 // ═══════════════════════════════════════════════════════
 
 let liveSessionId = null;
-let liveTracks = {};       // track_id -> {bbox, team_colour, status, label, crop}
+let liveTracks = {};
 let liveConfirmedCount = 0;
 let liveUncertainCount = 0;
 let livePaused = false;
 let liveStartTime = null;
 let liveTimerIv = null;
 let liveSkippedIds = new Set();
-let uncertainQueue = [];   // queued uncertain tracks
+let liveSeenTrackIds = new Set();   // tracks already shown as cards
+let uncertainQueue = [];
+let liveOverlayIv = null;           // animation loop for overlay
 const MAX_VISIBLE_CARDS = 3;
+const UNCERTAIN_BATCH_THRESHOLD = 5; // only pause after this many new uncertain in one batch
 
 async function startLiveAnalysis() {
     hide('uploadSection', 'resultsSection', 'errorSection', 'loadingSection');
@@ -1285,8 +1288,7 @@ async function startLiveAnalysis() {
             video.onerror = (e) => { clearTimeout(timeout); reject(e); };
         });
     } catch (e) {
-        console.error('Video load error:', e);
-        fallbackToQuick('Video load failed: ' + (e.message || 'unknown error'));
+        fallbackToQuick('Video load failed: ' + (e.message || 'unknown'));
         return;
     }
 
@@ -1295,30 +1297,28 @@ async function startLiveAnalysis() {
     const duration = video.duration;
     if (!duration || !vw || !vh) { fallbackToQuick('Invalid video'); return; }
 
-    const fps = 10;
+    // Use 5fps for speed — still enough for tracking
+    const fps = 5;
     const interval = 1 / fps;
     const totalFrames = Math.floor(duration * fps);
     const batchSize = 25;
 
     // Start session
     try {
-        console.log('Starting stream session...');
         const res = await fetch(`${API_BASE}/api/v1/stream/start`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ frame_width: vw, frame_height: vh, clip_type: 'match', fps: fps })
+            body: JSON.stringify({ frame_width: vw, frame_height: vh, clip_type: 'match', fps })
         });
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const data = await res.json();
         liveSessionId = data.session_id;
-        console.log('Session started:', liveSessionId);
     } catch (e) {
-        console.error('Session start failed:', e);
-        fallbackToQuick('Session start failed: ' + (e.message || 'unknown error'));
+        fallbackToQuick('Session start failed: ' + (e.message || 'unknown'));
         return;
     }
 
-    // Setup canvas
+    // Setup overlay canvas
     const canvas = $('liveCanvas');
     const videoEl = $('liveVideo');
     const syncCanvas = () => {
@@ -1326,13 +1326,21 @@ async function startLiveAnalysis() {
         canvas.height = videoEl.clientHeight;
     };
     syncCanvas();
-    const ro = new ResizeObserver(syncCanvas);
-    ro.observe(videoEl);
+    new ResizeObserver(syncCanvas).observe(videoEl);
 
-    // Extraction canvas (offscreen)
+    // Play the video so user can actually watch it
+    video.currentTime = 0;
+    video.play().catch(() => {});
+
+    // Continuously redraw overlay at 15fps while live section is visible
+    liveOverlayIv = setInterval(drawLiveOverlay, 67);
+
+    // Extraction canvas (offscreen, half-res for speed)
+    const extractW = Math.min(vw, 640);
+    const extractH = Math.round(vh * (extractW / vw));
     const extractCanvas = document.createElement('canvas');
-    extractCanvas.width = vw;
-    extractCanvas.height = vh;
+    extractCanvas.width = extractW;
+    extractCanvas.height = extractH;
     const ectx = extractCanvas.getContext('2d');
 
     liveStartTime = Date.now();
@@ -1341,26 +1349,36 @@ async function startLiveAnalysis() {
     liveUncertainCount = 0;
     liveTracks = {};
     liveSkippedIds = new Set();
+    liveSeenTrackIds = new Set();
     uncertainQueue = [];
 
-    // Extract frames in batches
+    // Extract frames — seek offscreen, don't interrupt playback visually
+    // We use a second hidden video for extraction so the visible one plays smoothly
+    const extractVideo = document.createElement('video');
+    extractVideo.src = url;
+    extractVideo.muted = true;
+    extractVideo.preload = 'auto';
+    await new Promise((resolve, reject) => {
+        const t = setTimeout(() => reject(new Error('Extract video timeout')), 10000);
+        extractVideo.onloadedmetadata = () => { clearTimeout(t); resolve(); };
+        extractVideo.onerror = (e) => { clearTimeout(t); reject(e); };
+    });
+
     let frameIdx = 0;
     let batch = [];
     let batchIndices = [];
     let batchTimestamps = [];
 
     while (frameIdx < totalFrames) {
-        // Wait if paused for uncertain players
-        while (livePaused) {
-            await sleep(200);
-        }
+        // Wait if paused
+        while (livePaused) await sleep(200);
 
         const t = frameIdx * interval;
-        video.currentTime = t;
-        await new Promise(r => { video.onseeked = r; });
+        extractVideo.currentTime = t;
+        await new Promise(r => { extractVideo.onseeked = r; });
 
-        ectx.drawImage(video, 0, 0, vw, vh);
-        const blob = await new Promise(r => extractCanvas.toBlob(r, 'image/jpeg', 0.7));
+        ectx.drawImage(extractVideo, 0, 0, extractW, extractH);
+        const blob = await new Promise(r => extractCanvas.toBlob(r, 'image/jpeg', 0.6));
 
         batch.push(blob);
         batchIndices.push(frameIdx);
@@ -1373,7 +1391,6 @@ async function startLiveAnalysis() {
         $('liveFrameInfo').textContent = `Frame ${frameIdx}/${totalFrames}`;
 
         if (batch.length >= batchSize || frameIdx >= totalFrames) {
-            // Send batch
             try {
                 const fd = new FormData();
                 batch.forEach(b => fd.append('frames', b, 'frame.jpg'));
@@ -1388,31 +1405,30 @@ async function startLiveAnalysis() {
 
                 // Update tracks
                 if (result.tracks) {
-                    result.tracks.forEach(tk => {
-                        liveTracks[tk.track_id] = tk;
-                    });
+                    result.tracks.forEach(tk => { liveTracks[tk.track_id] = tk; });
                 }
 
-                // Draw overlay
-                drawLiveOverlay();
-
-                // Handle uncertain
+                // Handle uncertain — only pause if >= threshold new ones
                 if (result.new_uncertain && result.new_uncertain.length > 0) {
-                    const newUncertain = result.new_uncertain.filter(u => !liveSkippedIds.has(u.track_id));
-                    if (newUncertain.length > 0) {
-                        uncertainQueue.push(...newUncertain);
-                        liveUncertainCount = uncertainQueue.length;
-                        updateLivePlayerInfo();
-                        livePaused = true;
-                        showUncertainCards();
+                    const fresh = result.new_uncertain.filter(u =>
+                        !liveSkippedIds.has(u.track_id) && !liveSeenTrackIds.has(u.track_id)
+                    );
+                    fresh.forEach(u => liveSeenTrackIds.add(u.track_id));
+                    if (fresh.length > 0) {
+                        uncertainQueue.push(...fresh);
+                        liveUncertainCount += fresh.length;
+                        // Only pause if we have enough to warrant user attention
+                        if (fresh.length >= UNCERTAIN_BATCH_THRESHOLD || uncertainQueue.length >= UNCERTAIN_BATCH_THRESHOLD) {
+                            livePaused = true;
+                            showUncertainCards();
+                        }
                     }
                 }
 
                 updateLivePlayerInfo();
             } catch (e) {
                 console.error('Frame batch error:', e);
-                fallbackToQuick('Frame processing failed: ' + (e.message || 'unknown error'));
-                return;
+                // Don't fallback on single batch failure — skip and continue
             }
             batch = [];
             batchIndices = [];
@@ -1420,12 +1436,20 @@ async function startLiveAnalysis() {
         }
     }
 
+    // Show any remaining uncertain cards before finalising
+    if (uncertainQueue.length > 0) {
+        livePaused = true;
+        showUncertainCards();
+        while (livePaused) await sleep(200);
+    }
+
     // Finalise
     clearInterval(liveTimerIv);
+    clearInterval(liveOverlayIv);
+    video.pause();
     $('liveFrameInfo').textContent = 'Generating report...';
 
     try {
-        console.log('Finalising session:', liveSessionId);
         const res = await fetch(`${API_BASE}/api/v1/stream/${liveSessionId}/finalise`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -1433,9 +1457,7 @@ async function startLiveAnalysis() {
         });
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const data = await res.json();
-        console.log('Session finalised, job_id:', data.job_id);
 
-        // Switch to existing poll/results flow
         hide('liveSection');
         show('loadingSection');
         startTime = Date.now();
@@ -1444,18 +1466,17 @@ async function startLiveAnalysis() {
         timerIv = setInterval(updateTimer, 1000);
         poll(data.job_id);
     } catch (e) {
-        console.error('Finalise failed:', e);
-        fallbackToQuick('Finalise failed: ' + (e.message || 'unknown error'));
+        fallbackToQuick('Finalise failed: ' + (e.message || 'unknown'));
     }
 }
 
 function fallbackToQuick(reason) {
-    console.warn('Live analysis fallback:', reason);
+    console.warn('Live fallback:', reason);
     clearInterval(liveTimerIv);
+    clearInterval(liveOverlayIv);
     hide('liveSection');
     liveSessionId = null;
     analysisMode = 'quick';
-    // Show error briefly then fall back
     alert('Live analysis unavailable — switching to quick analysis.\n\n' + reason);
     startAnalysis();
 }
@@ -1477,6 +1498,7 @@ function updateLivePlayerInfo() {
 function drawLiveOverlay() {
     const canvas = $('liveCanvas');
     const video = $('liveVideo');
+    if (!canvas || !video || !video.videoWidth) return;
     const ctx = canvas.getContext('2d');
     ctx.clearRect(0, 0, canvas.width, canvas.height);
 
@@ -1491,34 +1513,47 @@ function drawLiveOverlay() {
         const cx = sx + sw / 2, cy = sy;
 
         let color;
-        if (tk.confirmed_label || tk.status === 'confirmed') {
+        if (tk.confirmed || tk.confirmed_label) {
             color = '#00d4aa';
         } else if (liveSkippedIds.has(tk.track_id)) {
             color = '#6b7280';
-        } else if (tk.status === 'uncertain') {
+        } else if (tk.uncertain) {
             color = '#f59e0b';
         } else {
-            color = '#6b7280';
+            color = '#38bdf8'; // blue for tracked but not yet categorised
         }
 
-        // Dot
+        // Glow effect
+        ctx.shadowColor = color;
+        ctx.shadowBlur = 8;
+
+        // Thicker box
+        ctx.strokeStyle = color;
+        ctx.lineWidth = 2.5;
+        ctx.strokeRect(sx, sy, sw, sh);
+
+        // Dot above head
         ctx.beginPath();
-        ctx.arc(cx, cy - 4, 5, 0, Math.PI * 2);
+        ctx.arc(cx, cy - 6, 6, 0, Math.PI * 2);
         ctx.fillStyle = color;
         ctx.fill();
 
-        // Box
-        ctx.strokeStyle = color;
-        ctx.lineWidth = 1.5;
-        ctx.strokeRect(sx, sy, sw, sh);
+        ctx.shadowBlur = 0;
 
         // Label
-        const label = tk.confirmed_label || tk.jersey_number || '';
+        const label = tk.confirmed_label || '';
         if (label) {
-            ctx.font = '700 11px Rajdhani, sans-serif';
-            ctx.fillStyle = color;
+            ctx.font = '700 13px Rajdhani, sans-serif';
+            ctx.fillStyle = '#fff';
             ctx.textAlign = 'center';
-            ctx.fillText(label, cx, sy - 8);
+            // Background pill
+            const tw = ctx.measureText(label).width + 8;
+            ctx.fillStyle = color;
+            ctx.beginPath();
+            ctx.roundRect(cx - tw/2, sy - 24, tw, 16, 4);
+            ctx.fill();
+            ctx.fillStyle = '#000';
+            ctx.fillText(label, cx, sy - 12);
         }
     });
 }
@@ -1533,7 +1568,8 @@ function showUncertainCards() {
         card.className = 'uncertain-card';
         card.dataset.trackId = u.track_id;
 
-        const cropSrc = u.crop ? `data:image/jpeg;base64,${u.crop}` : '';
+        // crop_b64 is the field name from the API
+        const cropSrc = u.crop_b64 ? `data:image/jpeg;base64,${u.crop_b64}` : '';
         const teamLabel = u.team_colour === 0 ? 'Blue' : u.team_colour === 1 ? 'Red' : 'Unknown';
 
         card.innerHTML = `
@@ -1554,19 +1590,19 @@ function showUncertainCards() {
         `;
         stack.appendChild(card);
 
-        // 30s auto-skip timer
+        // 15s auto-skip (was 30s, too long)
         const fill = card.querySelector('.uc-timer-fill');
         let elapsed = 0;
-        const timerIv = setInterval(() => {
+        const tmr = setInterval(() => {
             elapsed += 500;
-            const pct = Math.max(0, 100 - (elapsed / 30000 * 100));
+            const pct = Math.max(0, 100 - (elapsed / 15000 * 100));
             fill.style.width = pct + '%';
-            if (elapsed >= 30000) {
-                clearInterval(timerIv);
+            if (elapsed >= 15000) {
+                clearInterval(tmr);
                 skipUncertain(u.track_id, card.querySelector('.uc-skip-btn'));
             }
         }, 500);
-        card._timerIv = timerIv;
+        card._timerIv = tmr;
     });
 }
 
@@ -1576,27 +1612,26 @@ async function confirmUncertain(trackId, btn) {
     const jersey = card.querySelector('.uc-jersey').value.trim();
     const name = card.querySelector('.uc-name').value.trim();
 
+    // Send as FormData since the endpoint uses Form(...)
     try {
+        const fd = new FormData();
+        fd.append('track_id', trackId);
+        fd.append('jersey_number', jersey || '');
+        fd.append('player_name', name || '');
+        fd.append('team_colour', '');
         await fetch(`${API_BASE}/api/v1/stream/${liveSessionId}/confirm`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                track_id: trackId,
-                jersey_number: jersey || null,
-                player_name: name || null,
-                team_colour: liveTracks[trackId] ? liveTracks[trackId].team_colour : null
-            })
+            method: 'POST', body: fd
         });
     } catch (e) { /* continue anyway */ }
 
     if (liveTracks[trackId]) {
-        liveTracks[trackId].status = 'confirmed';
+        liveTracks[trackId].confirmed = true;
         liveTracks[trackId].confirmed_label = jersey ? `#${jersey}` : (name || 'Confirmed');
+        liveTracks[trackId].uncertain = false;
     }
     liveConfirmedCount++;
     liveUncertainCount = Math.max(0, liveUncertainCount - 1);
     updateLivePlayerInfo();
-    drawLiveOverlay();
     card.remove();
     checkResumeLive();
 }
@@ -1608,7 +1643,6 @@ function skipUncertain(trackId, btn) {
     liveSkippedIds.add(trackId);
     liveUncertainCount = Math.max(0, liveUncertainCount - 1);
     updateLivePlayerInfo();
-    drawLiveOverlay();
     card.remove();
     checkResumeLive();
 }
