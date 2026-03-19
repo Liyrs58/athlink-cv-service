@@ -236,17 +236,84 @@ async def stream_finalise(session_id: str):
         for tid, label in session["confirmed_ids"].items():
             pre_confirmed[tid] = label
 
-        # Create job and submit to pipeline
+        # Build per-player physical stats from stream positions
+        fps_val = session.get("fps", 5.0)
+        frame_w = session.get("frame_width", 1920)
+        frame_h = session.get("frame_height", 1080)
+        # Rough conversion: assume 105m pitch spans full width
+        px_to_m = 105.0 / max(frame_w, 1)
+
+        players_physical = []
+        for track_data in tracks_list:
+            tid = track_data["trackId"]
+            traj = track_data.get("trajectory", [])
+            if len(traj) < 2:
+                continue
+
+            # Compute distance from trajectory positions
+            positions = session["tracks"].get(tid, {}).get("positions", [])
+            total_dist_m = 0.0
+            max_speed_ms = 0.0
+            sprint_count = 0
+            for j in range(1, len(positions)):
+                dx = (positions[j][0] - positions[j-1][0]) * px_to_m
+                dy = (positions[j][1] - positions[j-1][1]) * px_to_m
+                d = (dx*dx + dy*dy) ** 0.5
+                total_dist_m += d
+                # Speed in m/s (frames are at fps_val)
+                dt = 1.0 / fps_val if fps_val > 0 else 0.2
+                speed = d / dt if dt > 0 else 0
+                if speed > max_speed_ms:
+                    max_speed_ms = speed
+                if speed > 5.5:  # ~20 km/h sprint threshold
+                    sprint_count += 1
+
+            team_id = track_data.get("teamId")
+            label = pre_confirmed.get(tid, f"Player {tid}")
+
+            players_physical.append({
+                "track_id": tid,
+                "label": label,
+                "team_id": team_id,
+                "distance_m": round(total_dist_m, 1),
+                "max_speed_kmh": round(max_speed_ms * 3.6, 1),
+                "sprint_count": sprint_count,
+                "frames_visible": track_data.get("hits", 0),
+                "confidence": "approximate",
+            })
+
+        # Build analysis text
+        total_players = len(tracks_list)
+        confirmed = sum(1 for t in tracks_list if t["trackId"] in pre_confirmed)
+        team_counts = {}
+        for t in tracks_list:
+            tid_team = t.get("teamId")
+            if tid_team is not None:
+                team_counts[tid_team] = team_counts.get(tid_team, 0) + 1
+
+        analysis_lines = [
+            f"Live stream analysis completed — {session['frames_processed']} frames processed at {fps_val} fps.",
+            f"Detected {total_players} players ({confirmed} confirmed by coach).",
+        ]
+        if team_counts:
+            for t_id, cnt in sorted(team_counts.items()):
+                analysis_lines.append(f"Team {t_id}: {cnt} players detected.")
+
+        avg_dist = sum(p["distance_m"] for p in players_physical) / max(len(players_physical), 1)
+        if avg_dist > 0:
+            analysis_lines.append(f"Average distance covered: {avg_dist:.0f}m (approximate — based on pixel displacement).")
+
+        top_sprint = sorted(players_physical, key=lambda p: p["max_speed_kmh"], reverse=True)[:3]
+        if top_sprint:
+            fastest = top_sprint[0]
+            analysis_lines.append(f"Fastest player: {fastest['label']} at {fastest['max_speed_kmh']} km/h.")
+
+        analysis_text = "\n".join(analysis_lines)
+
+        # Create job with real results
         job_id = f"stream_{session_id}"
         create_job(job_id)
 
-        # Import pipeline function
-        from routes.analyse import _run_analysis_pipeline
-
-        # We can't run full pipeline without a video file for streaming,
-        # so store session data for retrieval
-        # The pipeline needs a video path — streaming doesn't have one.
-        # Instead, store the session result directly as a completed job.
         from services.job_queue_service import _jobs
         job = _jobs[job_id]
         job["status"] = "completed"
@@ -256,14 +323,27 @@ async def stream_finalise(session_id: str):
             "session_id": session_id,
             "clip_type": session.get("clip_type", "match"),
             "tracking": {
-                "total_tracks": len(tracks_list),
-                "confirmed_tracks": sum(1 for t in tracks_list if t["trackId"] in pre_confirmed),
+                "total_tracks": total_players,
+                "confirmed_tracks": confirmed,
                 "frames_processed": session["frames_processed"],
             },
             "tracks": tracks_list,
             "confirmed_labels": pre_confirmed,
-            "physical": {"players": []},
-            "analysis": "Stream session finalised. Full analysis requires video file upload.",
+            "physical": {"players": players_physical},
+            "analysis": analysis_text,
+            "velocities": {
+                "players": [
+                    {
+                        "track_id": p["track_id"],
+                        "label": p["label"],
+                        "team_id": p["team_id"],
+                        "distance_metres": p["distance_m"],
+                        "max_speed_kmh": p["max_speed_kmh"],
+                        "sprint_count": p["sprint_count"],
+                    }
+                    for p in players_physical
+                ],
+            },
         }
 
         tracks_confirmed = sum(1 for t in session["tracks"].values() if t["confirmed"])

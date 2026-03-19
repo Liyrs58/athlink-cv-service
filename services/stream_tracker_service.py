@@ -100,6 +100,16 @@ class StreamTrackerService:
                         y1 = int(y1 * scale_back)
                         x2 = int(x2 * scale_back)
                         y2 = int(y2 * scale_back)
+                        bw = x2 - x1
+                        bh = y2 - y1
+                        # Filter: skip tiny boxes (crowd), boxes in top 12% (stands),
+                        # and aspect ratio > 4 (ad boards)
+                        if bh < 30 or bw < 10:
+                            continue
+                        if y1 < h * 0.12 and bh < 60:
+                            continue
+                        if bw / max(bh, 1) > 4:
+                            continue
                         detections.append({
                             "bbox": [x1, y1, x2, y2],
                             "confidence": conf,
@@ -239,7 +249,7 @@ class StreamTrackerService:
             return -1
 
     def extract_best_crop(self, frame: np.ndarray, bbox: list,
-                          min_height: int = 50) -> Optional[str]:
+                          min_height: int = 20) -> Optional[str]:
         """Extract torso crop as base64 JPEG if sharp enough."""
         try:
             x1, y1, x2, y2 = bbox
@@ -261,7 +271,7 @@ class StreamTrackerService:
 
             gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
             lap_var = cv2.Laplacian(gray, cv2.CV_64F).var()
-            if lap_var < 80:
+            if lap_var < 15:
                 return None
 
             _, buf = cv2.imencode(".jpg", crop, [cv2.IMWRITE_JPEG_QUALITY, 80])
