@@ -1,0 +1,120 @@
+{
+  "job_id": "7367a51e",
+  "timestamp": "2026-03-18T14:38:21.994780",
+  "tracking": {
+    "total_tracks": 48
+  },
+  "situations": {
+    "events": [
+      {
+        "situation": "OPEN_PLAY",
+        "start_frame": 0,
+        "end_frame": 226,
+        "start_time": 0.0,
+        "end_time": 9.04,
+        "duration_seconds": 9.04
+      },
+      {
+        "situation": "DEAD_BALL",
+        "start_frame": 226,
+        "end_frame": 236,
+        "start_time": 9.04,
+        "end_time": 9.44,
+        "duration_seconds": 0.4
+      },
+      {
+        "situation": "OPEN_PLAY",
+        "start_frame": 236,
+        "end_frame": 386,
+        "start_time": 9.44,
+        "end_time": 15.44,
+        "duration_seconds": 6.0
+      },
+      {
+        "situation": "DEAD_BALL",
+        "start_frame": 386,
+        "end_frame": 410,
+        "start_time": 15.44,
+        "end_time": 16.4,
+        "duration_seconds": 0.96
+      },
+      {
+        "situation": "OPEN_PLAY",
+        "start_frame": 410,
+        "end_frame": 424,
+        "start_time": 16.4,
+        "end_time": 16.96,
+        "duration_seconds": 0.56
+      },
+      {
+        "situation": "DEAD_BALL",
+        "start_frame": 424,
+        "end_frame": 446,
+        "start_time": 16.96,
+        "end_time": 17.84,
+        "duration_seconds": 0.88
+      },
+      {
+        "situation": "OPEN_PLAY",
+        "start_frame": 446,
+        "end_frame": 602,
+        "start_time": 17.84,
+        "end_time": 24.08,
+        "duration_seconds": 6.24
+      },
+      {
+        "situation": "DEAD_BALL",
+        "start_frame": 602,
+        "end_frame": 772,
+        "start_time": 24.08,
+        "end_time": 30.88,
+        "duration_seconds": 6.8
+      },
+      {
+        "situation": "OPEN_PLAY",
+        "start_frame": 772,
+        "end_frame": 998,
+        "start_time": 30.88,
+        "end_time": 39.92,
+        "duration_seconds": 9.04
+      }
+    ]
+  },
+  "physical": {
+    "total_distance_metres": 1067.3,
+    "total_sprints": 7,
+    "max_speed_ms": 9.68,
+    "max_speed_kmh": 34.8,
+    "players_analysed": 19,
+    "top_sprinter_id": 7,
+    "top_runner_id": 15,
+    "top_runner_distance": 535.4
+  },
+  "shape": {
+    "frames_analysed": 269,
+    "team_0": {
+      "avg_width_metres": 27.7,
+      "avg_depth_metres": 10.5,
+      "avg_compactness_metres": 11.2,
+      "min_width_metres": 1.1,
+      "max_width_metres": 55.1
+    },
+    "team_1": {
+      "avg_width_metres": 44.4,
+      "avg_depth_metres": 11.9,
+      "avg_compactness_metres": 17.5,
+      "min_width_metres": 13.8,
+      "max_width_metres": 53.6
+    },
+    "combined_width_metres": 36.0,
+    "min_combined_width_metres": 1.1,
+    "max_combined_width_metres": 55.1,
+    "avg_width_metres": 36.0,
+    "avg_depth_metres": 11.0,
+    "avg_compactness_metres": 13.3,
+    "min_width_metres": 1.1,
+    "max_width_metres": 55.1,
+    "data_quality": "ok"
+  },
+  "analysis": "# Coaching Report - 40 Second Match Clip\n\n## RELIABLE INSIGHTS (team-level, high confidence)\n\nThe match had a stop-start rhythm with frequent interruptions. Play was broken up by dead balls at 9 seconds, 15-16 seconds, 17-18 seconds, and 24-31 seconds, creating choppy phases of open play.\n\nTeam shape shows a clear contrast: Team A maintained a compact 27.7m width with 10.5m depth, while Team B spread much wider at 44.4m width with similar 11.9m depth. This suggests different tactical approaches - one team playing narrow, the other stretched wide.\n\nOnly 4 players made sprints during this 40-second period: Player #15 (1 sprint), Player #7 (2 sprints), and Player #18 (1 sprint) from the reliable data.\n\nComparing to previous matches, Team A's current width of 27.7m is notably narrower than the 23.7m-36.0m range seen across previous matches, suggesting a more compact setup than usual.\n\n## APPROXIMATE ESTIMATES (player-level, medium confidence)\n\nPlayer #1236 made approximately 0-2 sprints with top speed around 32.3 km/h, covering roughly 30-50m.\n\nPlayer #1604 was relatively inactive, making approximately 0-2 sprints at around 20.4 km/h, covering only 7-11m.\n\nPlayer #608 showed moderate activity with approximately 0-3 sprints, reaching around 26.5 km/h over 3-5m of movement.\n\n## DATA GAPS\n\nFive players (#1052, #1055, #3352, #2093, #2603) had insufficient tracking data for reliable conclusions about their performance.\n\nThe 40-second clip provides limited context for full match analysis. Key tactical elements like ball possession, pass accuracy, and specific dead ball situations could not be measured from this data.\n\nSeveral players (#13, #589, #2084) showed minimal or zero movement, which may indicate they were substitutes, injured players, or the tracking system lost them during this period.\n\n## THE ONE THING TO ADDRESS BEFORE SATURDAY\n\nPlayer #7 made 2 sprints and hit 31.3 km/h - the highest work rate among reliably tracked players. However, most of the team showed very low sprint counts (0-1) during open play phases. The lack of high-intensity running from the majority of players needs immediate attention for Saturday's match fitness."
+}

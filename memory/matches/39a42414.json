@@ -1,0 +1,96 @@
+{
+  "job_id": "39a42414",
+  "timestamp": "2026-03-18T13:42:06.949998",
+  "tracking": {
+    "total_tracks": 45
+  },
+  "situations": {
+    "events": [
+      {
+        "situation": "OPEN_PLAY",
+        "start_frame": 0,
+        "end_frame": 406,
+        "start_time": 0.0,
+        "end_time": 16.24,
+        "duration_seconds": 16.24
+      },
+      {
+        "situation": "DEAD_BALL",
+        "start_frame": 406,
+        "end_frame": 422,
+        "start_time": 16.24,
+        "end_time": 16.88,
+        "duration_seconds": 0.64
+      },
+      {
+        "situation": "DEAD_BALL",
+        "start_frame": 426,
+        "end_frame": 452,
+        "start_time": 17.04,
+        "end_time": 18.08,
+        "duration_seconds": 1.04
+      },
+      {
+        "situation": "OPEN_PLAY",
+        "start_frame": 452,
+        "end_frame": 550,
+        "start_time": 18.08,
+        "end_time": 22.0,
+        "duration_seconds": 3.92
+      },
+      {
+        "situation": "DEAD_BALL",
+        "start_frame": 550,
+        "end_frame": 782,
+        "start_time": 22.0,
+        "end_time": 31.28,
+        "duration_seconds": 9.28
+      },
+      {
+        "situation": "OPEN_PLAY",
+        "start_frame": 782,
+        "end_frame": 998,
+        "start_time": 31.28,
+        "end_time": 39.92,
+        "duration_seconds": 8.64
+      }
+    ]
+  },
+  "physical": {
+    "total_distance_metres": 944.6,
+    "total_sprints": 8,
+    "max_speed_ms": 9.98,
+    "max_speed_kmh": 35.9,
+    "players_analysed": 17,
+    "top_sprinter_id": 3822,
+    "top_runner_id": -1,
+    "top_runner_distance": 236.5
+  },
+  "shape": {
+    "frames_analysed": 330,
+    "team_0": {
+      "avg_width_metres": 22.9,
+      "avg_depth_metres": 12.3,
+      "avg_compactness_metres": 9.9,
+      "min_width_metres": 0.0,
+      "max_width_metres": 57.5
+    },
+    "team_1": {
+      "avg_width_metres": 9.4,
+      "avg_depth_metres": 5.1,
+      "avg_compactness_metres": 5.5,
+      "min_width_metres": 0.0,
+      "max_width_metres": 20.8
+    },
+    "combined_width_metres": 23.7,
+    "min_combined_width_metres": 0.2,
+    "max_combined_width_metres": 57.5,
+    "avg_width_metres": 23.7,
+    "avg_depth_metres": 11.3,
+    "avg_compactness_metres": 9.3,
+    "min_width_metres": 0.2,
+    "max_width_metres": 57.5,
+    "data_quality": "ok"
+  },
+  "analysis": "API error: HTTP Error 401: Unauthorized"
+}

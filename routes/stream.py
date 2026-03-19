@@ -44,6 +44,11 @@ class StreamStartRequest(BaseModel):
 async def stream_start(req: StreamStartRequest):
     """Start a new streaming session."""
     try:
+        _clean_stale_sessions()
+        # Reset tracker state for new session
+        tracker = get_stream_tracker()
+        tracker.reset_session()
+
         session_id = str(uuid.uuid4())[:8]
         SESSIONS[session_id] = {
             "session_id": session_id,

@@ -1443,28 +1443,36 @@ async function startLiveAnalysis() {
         while (livePaused) await sleep(200);
     }
 
-    // Finalise
+    // Finalise — first get stream summary, then submit to full pipeline
     clearInterval(liveTimerIv);
     clearInterval(liveOverlayIv);
     video.pause();
-    $('liveFrameInfo').textContent = 'Generating report...';
+    $('liveFrameInfo').textContent = 'Finalising stream...';
 
     try {
-        const res = await fetch(`${API_BASE}/api/v1/stream/${liveSessionId}/finalise`, {
+        // Get stream summary (for confirmed labels)
+        const finRes = await fetch(`${API_BASE}/api/v1/stream/${liveSessionId}/finalise`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({})
         });
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        const data = await res.json();
+        if (!finRes.ok) throw new Error(`HTTP ${finRes.status}`);
+        await finRes.json();
 
+        // Now submit original video to full analysis pipeline
         hide('liveSection');
         show('loadingSection');
         startTime = Date.now();
-        $('loadingStatus').textContent = 'GENERATING REPORT...';
+        $('loadingStatus').textContent = 'RUNNING FULL ANALYSIS PIPELINE...';
         updateTimer();
         timerIv = setInterval(updateTimer, 1000);
-        poll(data.job_id);
+
+        const fd = new FormData();
+        fd.append('video', selectedFile);
+        const analyseRes = await fetch(`${API_BASE}/api/v1/analyse`, { method: 'POST', body: fd });
+        if (!analyseRes.ok) throw new Error(`HTTP ${analyseRes.status}`);
+        const analyseData = await analyseRes.json();
+        poll(analyseData.job_id);
     } catch (e) {
         fallbackToQuick('Finalise failed: ' + (e.message || 'unknown'));
     }

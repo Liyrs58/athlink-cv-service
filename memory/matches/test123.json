@@ -1,0 +1,120 @@
+{
+  "job_id": "test123",
+  "timestamp": "2026-03-18T16:28:27.202712",
+  "tracking": {
+    "total_tracks": 48
+  },
+  "situations": {
+    "events": [
+      {
+        "situation": "OPEN_PLAY",
+        "start_frame": 0,
+        "end_frame": 226,
+        "start_time": 0.0,
+        "end_time": 9.04,
+        "duration_seconds": 9.04
+      },
+      {
+        "situation": "DEAD_BALL",
+        "start_frame": 226,
+        "end_frame": 236,
+        "start_time": 9.04,
+        "end_time": 9.44,
+        "duration_seconds": 0.4
+      },
+      {
+        "situation": "OPEN_PLAY",
+        "start_frame": 236,
+        "end_frame": 386,
+        "start_time": 9.44,
+        "end_time": 15.44,
+        "duration_seconds": 6.0
+      },
+      {
+        "situation": "DEAD_BALL",
+        "start_frame": 386,
+        "end_frame": 410,
+        "start_time": 15.44,
+        "end_time": 16.4,
+        "duration_seconds": 0.96
+      },
+      {
+        "situation": "OPEN_PLAY",
+        "start_frame": 410,
+        "end_frame": 424,
+        "start_time": 16.4,
+        "end_time": 16.96,
+        "duration_seconds": 0.56
+      },
+      {
+        "situation": "DEAD_BALL",
+        "start_frame": 424,
+        "end_frame": 446,
+        "start_time": 16.96,
+        "end_time": 17.84,
+        "duration_seconds": 0.88
+      },
+      {
+        "situation": "OPEN_PLAY",
+        "start_frame": 446,
+        "end_frame": 602,
+        "start_time": 17.84,
+        "end_time": 24.08,
+        "duration_seconds": 6.24
+      },
+      {
+        "situation": "DEAD_BALL",
+        "start_frame": 602,
+        "end_frame": 772,
+        "start_time": 24.08,
+        "end_time": 30.88,
+        "duration_seconds": 6.8
+      },
+      {
+        "situation": "OPEN_PLAY",
+        "start_frame": 772,
+        "end_frame": 998,
+        "start_time": 30.88,
+        "end_time": 39.92,
+        "duration_seconds": 9.04
+      }
+    ]
+  },
+  "physical": {
+    "total_distance_metres": 1067.3,
+    "total_sprints": 7,
+    "max_speed_ms": 9.68,
+    "max_speed_kmh": 34.8,
+    "players_analysed": 19,
+    "top_sprinter_id": 7,
+    "top_runner_id": 15,
+    "top_runner_distance": 535.4
+  },
+  "shape": {
+    "frames_analysed": 269,
+    "team_0": {
+      "avg_width_metres": 27.7,
+      "avg_depth_metres": 10.5,
+      "avg_compactness_metres": 11.2,
+      "min_width_metres": 1.1,
+      "max_width_metres": 55.1
+    },
+    "team_1": {
+      "avg_width_metres": 44.4,
+      "avg_depth_metres": 11.9,
+      "avg_compactness_metres": 17.5,
+      "min_width_metres": 13.8,
+      "max_width_metres": 53.6
+    },
+    "combined_width_metres": 36.0,
+    "min_combined_width_metres": 1.1,
+    "max_combined_width_metres": 55.1,
+    "avg_width_metres": 36.0,
+    "avg_depth_metres": 11.0,
+    "avg_compactness_metres": 13.3,
+    "min_width_metres": 1.1,
+    "max_width_metres": 55.1,
+    "data_quality": "ok"
+  },
+  "analysis": "# COACHING REPORT - 40 Second Match Clip\n\n## RELIABLE INSIGHTS (team-level, high confidence)\n\nThe match rhythm shows frequent interruptions with multiple dead ball situations. Play was broken up significantly - we had 5 separate open play phases with 4 dead ball interruptions in just 40 seconds.\n\nTeam shape analysis reveals a clear structural difference: Team A (blue) maintained a compact formation with 27.7m width and 10.5m depth, while Team B (also blue) spread much wider at 44.4m width with 11.9m depth. This suggests different tactical approaches during this phase.\n\nSprint activity was extremely low across both teams - only 4 confirmed sprints from all tracked players, indicating either a controlled tempo or players conserving energy.\n\n## APPROXIMATE ESTIMATES (player-level, medium confidence)\n\n**High-intensity runners:**\n- Player #7 recorded 2 sprints and hit 31.3 km/h - our most active player\n- Player #15 covered significant ground at 535.4m with 1 sprint, reaching 29.1 km/h\n- Player #18 managed 29.9 km/h in a shorter burst\n\n**Sprint data may be underestimated:** Players #1236 and #608 showed approximately 0-2 sprints each, suggesting the actual sprint count could be higher than recorded.\n\n**Distance coverage varies widely:** Player #16 approximately covered 176m while most others moved much less, indicating different positional demands during this phase.\n\n## DATA GAPS\n\n**Significant tracking limitations affected 5 players** - we cannot reliably assess the performance of Players #1052, #1055, #3352, #2093, and #2603. This represents nearly 25% of tracked players.\n\n**Missing tactical data:** Ball possession percentages, pass completion rates, and specific dead ball situations (throw-ins, free kicks, corners) could not be determined from this clip.\n\n**Individual distance estimates** should be treated cautiously due to the 81 camera cuts that interrupted tracking throughout the 40-second period.\n\n## HISTORICAL CONTEXT\n\nCompared to previous matches where teams typically recorded 5-7 sprints and maintained 34-36m width, this clip shows notably lower sprint activity (only 4 total) and more varied team shapes. The compact 27.7m width from Team A is significantly tighter than the usual 34-36m range seen across previous matches.\n\n## THE ONE THING TO ADDRESS BEFORE SATURDAY\n\n**Low sprint engagement across the team.** With only 4 confirmed sprints from 22 reliably tracked players over 40 seconds of play, we need to work on explosive movements and high-intensity runs. Player #7 shows this is possible - others need to match that intensity level when opportunities arise."
+}

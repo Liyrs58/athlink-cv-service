@@ -1,0 +1,112 @@
+{
+  "job_id": "2e975a16",
+  "timestamp": "2026-03-18T15:22:43.584895",
+  "tracking": {
+    "total_tracks": 30
+  },
+  "situations": {
+    "events": [
+      {
+        "situation": "OPEN_PLAY",
+        "start_frame": 0,
+        "end_frame": 226,
+        "start_time": 0.0,
+        "end_time": 9.04,
+        "duration_seconds": 9.04
+      },
+      {
+        "situation": "DEAD_BALL",
+        "start_frame": 226,
+        "end_frame": 236,
+        "start_time": 9.04,
+        "end_time": 9.44,
+        "duration_seconds": 0.4
+      },
+      {
+        "situation": "OPEN_PLAY",
+        "start_frame": 236,
+        "end_frame": 386,
+        "start_time": 9.44,
+        "end_time": 15.44,
+        "duration_seconds": 6.0
+      },
+      {
+        "situation": "DEAD_BALL",
+        "start_frame": 386,
+        "end_frame": 410,
+        "start_time": 15.44,
+        "end_time": 16.4,
+        "duration_seconds": 0.96
+      },
+      {
+        "situation": "OPEN_PLAY",
+        "start_frame": 410,
+        "end_frame": 424,
+        "start_time": 16.4,
+        "end_time": 16.96,
+        "duration_seconds": 0.56
+      },
+      {
+        "situation": "DEAD_BALL",
+        "start_frame": 424,
+        "end_frame": 446,
+        "start_time": 16.96,
+        "end_time": 17.84,
+        "duration_seconds": 0.88
+      },
+      {
+        "situation": "OPEN_PLAY",
+        "start_frame": 446,
+        "end_frame": 600,
+        "start_time": 17.84,
+        "end_time": 24.0,
+        "duration_seconds": 6.16
+      },
+      {
+        "situation": "DEAD_BALL",
+        "start_frame": 600,
+        "end_frame": 748,
+        "start_time": 24.0,
+        "end_time": 29.92,
+        "duration_seconds": 5.92
+      }
+    ]
+  },
+  "physical": {
+    "total_distance_metres": 968.9,
+    "total_sprints": 5,
+    "max_speed_ms": 9.7,
+    "max_speed_kmh": 34.9,
+    "players_analysed": 16,
+    "top_sprinter_id": 15,
+    "top_runner_id": 15,
+    "top_runner_distance": 536.7
+  },
+  "shape": {
+    "frames_analysed": 283,
+    "team_0": {
+      "avg_width_metres": 30.6,
+      "avg_depth_metres": 8.3,
+      "avg_compactness_metres": 15.1,
+      "min_width_metres": 7.9,
+      "max_width_metres": 55.2
+    },
+    "team_1": {
+      "avg_width_metres": 33.4,
+      "avg_depth_metres": 12.0,
+      "avg_compactness_metres": 12.6,
+      "min_width_metres": 0.1,
+      "max_width_metres": 53.7
+    },
+    "combined_width_metres": 34.3,
+    "min_combined_width_metres": 0.1,
+    "max_combined_width_metres": 55.2,
+    "avg_width_metres": 34.3,
+    "avg_depth_metres": 11.3,
+    "avg_compactness_metres": 13.1,
+    "min_width_metres": 0.1,
+    "max_width_metres": 55.2,
+    "data_quality": "ok"
+  },
+  "analysis": "API error: HTTP Error 401: Unauthorized"
+}

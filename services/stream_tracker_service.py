@@ -28,6 +28,16 @@ class StreamTrackerService:
     def __init__(self):
         self.model = None
         self._next_track_id = 1
+        self._colour_features = []
+        self._colour_labels = {}
+        self._team_centroids = None
+
+    def reset_session(self):
+        """Reset per-session state (track IDs, team colour clustering)."""
+        self._next_track_id = 1
+        self._colour_features = []
+        self._colour_labels = {}
+        self._team_centroids = None
 
     def load_model(self):
         """Load YOLO model once and cache it."""
@@ -218,7 +228,7 @@ class StreamTrackerService:
             return {"updated_tracks": existing_tracks, "new_uncertain": []}
 
     def _detect_team_colour(self, frame: np.ndarray, bbox: list) -> int:
-        """Simplified team colour detection via HSV on torso region."""
+        """Team colour detection using green-masked HSV — same approach as team_separation_service."""
         try:
             x1, y1, x2, y2 = bbox
             h_frame, w_frame = frame.shape[:2]
@@ -227,23 +237,74 @@ class StreamTrackerService:
             y1 = max(0, min(y1, h_frame - 1))
             y2 = max(y1 + 1, min(y2, h_frame))
 
-            crop = frame[y1:y2, x1:x2]
-            if crop.size == 0:
+            box_h = y2 - y1
+            box_w = x2 - x1
+            if box_h < 8 or box_w < 8:
                 return -1
 
-            # Top 40% for torso
-            ch = crop.shape[0]
-            torso = crop[0:int(ch * 0.4), :]
+            # Upper 50% for jersey, trim 20% each side for torso centre
+            trim = int(box_w * 0.20)
+            torso = frame[y1:y1 + int(box_h * 0.50), x1 + trim:x2 - trim]
             if torso.size == 0:
                 return -1
 
             hsv = cv2.cvtColor(torso, cv2.COLOR_BGR2HSV)
-            mean_hue = float(hsv[:, :, 0].mean())
 
-            if 90 <= mean_hue <= 130:
-                return 0  # blue-ish
-            elif mean_hue <= 20 or mean_hue >= 160:
-                return 1  # red-ish
+            # Mask out pitch green and dark pixels (same as team_separation_service)
+            green_mask = cv2.inRange(hsv, np.array([25, 20, 20]), np.array([95, 255, 255]))
+            dark_mask = hsv[:, :, 2] < 30
+            exclude = (green_mask > 0) | dark_mask
+            jersey_px = ~exclude
+
+            if int(np.sum(jersey_px)) < 40:
+                return -1
+
+            # Extract normalised colour features
+            hue_vals = hsv[:, :, 0][jersey_px].astype(float)
+            sat_vals = hsv[:, :, 1][jersey_px].astype(float)
+            val_vals = hsv[:, :, 2][jersey_px].astype(float)
+
+            sat_ratio = float(np.mean(sat_vals > 60))
+            brightness = float(np.mean(val_vals)) / 255.0
+
+            hi_sat = sat_vals > 60
+            if hi_sat.sum() >= 5:
+                median_hue = float(np.median(hue_vals[hi_sat]))
+            else:
+                median_hue = float(np.median(hue_vals))
+
+            # Store feature for k-means clustering later
+            feat = np.array([median_hue / 180.0, sat_ratio, brightness])
+
+            # Accumulate features for 2-team clustering
+            self._colour_features.append(feat)
+
+            # Once we have enough samples, cluster into 2 teams
+            if len(self._colour_features) >= 6 and self._team_centroids is None:
+                data = np.array(self._colour_features)
+                weights = np.array([2.0, 1.5, 0.5])
+                data_w = data * weights
+                # Simple k-means k=2
+                rng = np.random.RandomState(42)
+                c0 = data_w[0]
+                c1 = data_w[len(data_w) // 2]
+                centroids = np.array([c0, c1])
+                for _ in range(20):
+                    dists = np.linalg.norm(data_w[:, None, :] - centroids[None, :, :], axis=2)
+                    labels = np.argmin(dists, axis=1)
+                    for k in range(2):
+                        mask = labels == k
+                        if mask.any():
+                            centroids[k] = data_w[mask].mean(axis=0)
+                self._team_centroids = centroids
+
+            # Assign to nearest centroid if available
+            if self._team_centroids is not None:
+                feat_w = feat * np.array([2.0, 1.5, 0.5])
+                d0 = float(np.linalg.norm(feat_w - self._team_centroids[0]))
+                d1 = float(np.linalg.norm(feat_w - self._team_centroids[1]))
+                return 0 if d0 <= d1 else 1
+
             return -1
         except Exception:
             return -1
