@@ -122,6 +122,19 @@ class PhysicsCorrector:
         # Constraint 8: per-frame homography confidence — mark low-confidence frames
         self._apply_homography_confidence(tracks, calibration)
 
+        # Constraint 9: pitch coverage gate — if coverage < 0.15,
+        # mark ALL metrics as approximate (close-up / bench shot)
+        pitch_coverage = calibration.get("pitch_coverage_score", 1.0)
+        if pitch_coverage < 0.15:
+            for track in tracks:
+                for entry in track.get("trajectory", []):
+                    entry["metric_quality"] = "approximate"
+            self.stats["low_coverage_global_downgrade"] = True
+            logger.warning(
+                "Pitch coverage %.3f < 0.15 — all metrics "
+                "marked approximate", pitch_coverage
+            )
+
         self.stats["final_pixels_per_metre"] = round(ppm, 2)
         calibration["pixels_per_metre"] = ppm
 

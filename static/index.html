@@ -1297,11 +1297,11 @@ async function startLiveAnalysis() {
     const duration = video.duration;
     if (!duration || !vw || !vh) { fallbackToQuick('Invalid video'); return; }
 
-    // Use 5fps for speed — still enough for tracking
-    const fps = 5;
+    // Use 2.5fps for frame-by-frame processing — 0.4s intervals
+    const fps = 2.5;
     const interval = 1 / fps;
     const totalFrames = Math.floor(duration * fps);
-    const batchSize = 25;
+    const batchSize = 10;
 
     // Start session
     try {

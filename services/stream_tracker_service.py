@@ -22,6 +22,7 @@ MIN_BOX_H = 30
 MIN_BOX_W = 10
 MAX_ASPECT = 4.0
 MOTION_CAP = 80
+EMBEDDING_ALPHA = 0.7  # FootyVision EMA: keep 70% history, blend 30% new
 
 
 class Tracker:
@@ -96,6 +97,28 @@ class Tracker:
                 frame_rate=max(1, int(self.fps)),
             )
             logger.info("BoT-SORT initialised")
+
+            # FootyVision paper optimal lambda weights (ICMIP 2024)
+            # λfeat=0.3, λdist=0.3, λiou=0.3, λvel=0.1
+            _lambda_map = {
+                "lambda_feat": 0.3,
+                "lambda_iou": 0.3,
+                "lambda_dist": 0.3,
+                "lambda_vel": 0.1,
+            }
+            applied = []
+            for attr, val in _lambda_map.items():
+                if hasattr(self.botsort, attr):
+                    setattr(self.botsort, attr, val)
+                    applied.append(attr)
+            if applied:
+                logger.info("FootyVision lambdas applied: %s",
+                            applied)
+            else:
+                logger.warning(
+                    "BoT-SORT does not expose lambda weight "
+                    "attributes — using BoxMOT defaults"
+                )
         except Exception as e:
             logger.error("BoT-SORT init failed: %s", e)
 
@@ -161,6 +184,47 @@ class Tracker:
             self._prev_gray = gray
             return (0.0, 0.0)
 
+    def _filter_to_pitch(self, frame: np.ndarray,
+                          detections: np.ndarray) -> np.ndarray:
+        """
+        Remove detections outside the pitch using green colour mask.
+        FootyVision-style bystander removal via activation masks.
+        Never crashes — returns all detections on any failure.
+        """
+        if len(detections) == 0:
+            return detections
+        try:
+            h, w = frame.shape[:2]
+            hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+            green_mask = cv2.inRange(
+                hsv,
+                np.array([25, 40, 40]),
+                np.array([95, 255, 255]),
+            )
+            kernel = np.ones((60, 60), np.uint8)
+            pitch_mask = cv2.dilate(green_mask, kernel)
+
+            keep = []
+            for i, det in enumerate(detections):
+                x1, y1, x2, y2 = int(det[0]), int(det[1]), \
+                    int(det[2]), int(det[3])
+                cx = (x1 + x2) // 2
+                feet_y = y1 + int((y2 - y1) * 0.75)
+                # Clamp to frame bounds
+                cx = max(0, min(cx, w - 1))
+                feet_y = max(0, min(feet_y, h - 1))
+                if pitch_mask[feet_y, cx] > 0:
+                    keep.append(i)
+
+            if not keep:
+                # All filtered out — return original to avoid
+                # losing all detections on a tricky frame
+                return detections
+            return detections[keep]
+        except Exception as e:
+            logger.warning("Pitch filter failed: %s", e)
+            return detections
+
     def _detect(self, frame: np.ndarray) -> np.ndarray:
         """
         Run YOLO. Return numpy array shape (N, 6):
@@ -222,7 +286,10 @@ class Tracker:
 
             if not dets:
                 return np.empty((0, 6))
-            return np.array(dets, dtype=np.float32)
+            arr = np.array(dets, dtype=np.float32)
+            # FootyVision: pitch boundary bystander removal
+            arr = self._filter_to_pitch(frame, arr)
+            return arr
         except Exception as e:
             logger.error("Detection failed: %s", e)
             return np.empty((0, 6))
@@ -411,6 +478,7 @@ class Tracker:
                         "surfaced_to_ui": False,
                         "bbox": bbox,
                         "avg_confidence": conf,
+                        "embedding": None,
                     }
                 else:
                     meta = self._meta[tid]
@@ -425,6 +493,28 @@ class Tracker:
                     meta["avg_confidence"] = (
                         meta["avg_confidence"] * (n-1) + conf
                     ) / n
+
+                    # FootyVision embedding EMA update
+                    # BoT-SORT rows: [x1,y1,x2,y2,id,conf,cls,idx,...]
+                    # Columns 8+ may contain embedding data
+                    if len(row) > 8:
+                        try:
+                            new_emb = np.array(
+                                row[8:], dtype=np.float32
+                            )
+                            if new_emb.size > 0:
+                                if meta["embedding"] is None:
+                                    meta["embedding"] = new_emb
+                                else:
+                                    meta["embedding"] = (
+                                        EMBEDDING_ALPHA
+                                        * meta["embedding"]
+                                        + (1 - EMBEDDING_ALPHA)
+                                        * new_emb
+                                    )
+                        except Exception:
+                            pass  # embeddings not available
+
                     if meta["team_id"] is None:
                         t = self._detect_team(frame, bbox)
                         if t >= 0:

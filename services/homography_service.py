@@ -23,6 +23,28 @@ PITCH_LENGTH = 105.0  # metres
 PITCH_WIDTH = 68.0    # metres
 
 
+def _compute_pitch_coverage(frame: np.ndarray) -> float:
+    """
+    Compute what fraction of the frame is pitch green.
+    Used to score homography reliability.
+
+    High coverage (>0.4) = wide angle, good for homography
+    Low coverage (<0.15) = close-up or bench shot
+
+    Returns float 0-1.
+    """
+    try:
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        green = cv2.inRange(
+            hsv,
+            np.array([25, 40, 40]),
+            np.array([95, 255, 255]),
+        )
+        return float(np.sum(green > 0)) / (frame.shape[0] * frame.shape[1])
+    except Exception:
+        return 0.0
+
+
 def detect_pitch_lines(frame: np.ndarray) -> list:
     """
     Detect white pitch line markings using HSV thresholding + Hough transform.
@@ -386,6 +408,7 @@ def get_frame_calibration(video_path: str, sample_frames: int = 5) -> Dict[str, 
             'pixels_per_metre': 15.5,
             'homography': None,
             'frames_sampled': 0,
+            'pitch_coverage_score': 0.0,
         }
 
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -401,6 +424,7 @@ def get_frame_calibration(video_path: str, sample_frames: int = 5) -> Dict[str, 
             'pixels_per_metre': 15.5,
             'homography': None,
             'frames_sampled': 0,
+            'pitch_coverage_score': 0.0,
         }
 
     # Sample evenly spaced frames (skip first and last 10%)
@@ -413,6 +437,7 @@ def get_frame_calibration(video_path: str, sample_frames: int = 5) -> Dict[str, 
 
     fractions = []
     ppms = []
+    coverages = []
     best_homography = None
 
     for idx in sample_indices:
@@ -426,6 +451,7 @@ def get_frame_calibration(video_path: str, sample_frames: int = 5) -> Dict[str, 
         cal = estimate_homography(frame)
         fractions.append(cal['visible_fraction'])
         ppms.append(cal['pixels_per_metre'])
+        coverages.append(_compute_pitch_coverage(frame))
         if cal['method'] == 'keypoints' and cal['homography'] is not None:
             best_homography = cal['homography']
 
@@ -438,16 +464,19 @@ def get_frame_calibration(video_path: str, sample_frames: int = 5) -> Dict[str, 
             'pixels_per_metre': 15.5,
             'homography': None,
             'frames_sampled': 0,
+            'pitch_coverage_score': 0.0,
         }
 
     median_frac = float(to_scalar(np.median(fractions)))
     median_ppm = float(to_scalar(np.median(ppms)))
+    median_coverage = float(to_scalar(np.median(coverages))) if coverages else 0.0
 
     method = 'keypoints' if best_homography is not None else 'green_fraction'
 
     logger.info(
         f"Calibration: visible_fraction={median_frac:.3f}, "
         f"pixels_per_metre={median_ppm:.2f}, method={method}, "
+        f"pitch_coverage={median_coverage:.3f}, "
         f"frames_sampled={len(fractions)}"
     )
 
@@ -460,6 +489,7 @@ def get_frame_calibration(video_path: str, sample_frames: int = 5) -> Dict[str, 
         'pixels_per_metre': round(median_ppm, 2),
         'homography': best_homography,
         'frames_sampled': len(fractions),
+        'pitch_coverage_score': round(median_coverage, 3),
         'frame_confidence_scores': frame_confidence_scores,
     }
 

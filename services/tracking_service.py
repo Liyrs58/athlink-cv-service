@@ -145,6 +145,47 @@ def estimate_camera_motion(prev_gray, curr_gray, pitch_mask=None):
     return M, "farneback"
 
 
+def _filter_to_pitch(frame_bgr, bboxes_confs):
+    """
+    Remove detections outside the pitch using green colour mask.
+    FootyVision-style bystander removal via activation masks.
+
+    bboxes_confs: list of (bbox, conf) tuples
+    Returns filtered list of (bbox, conf).
+    Never crashes — returns all detections on any failure.
+    """
+    if not bboxes_confs:
+        return bboxes_confs
+    try:
+        h, w = frame_bgr.shape[:2]
+        hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
+        green_mask = cv2.inRange(
+            hsv,
+            np.array([25, 40, 40]),
+            np.array([95, 255, 255]),
+        )
+        kernel = np.ones((60, 60), np.uint8)
+        pitch_mask = cv2.dilate(green_mask, kernel)
+
+        keep = []
+        for bbox, conf in bboxes_confs:
+            x1, y1, x2, y2 = int(bbox[0]), int(bbox[1]), \
+                int(bbox[2]), int(bbox[3])
+            cx = (x1 + x2) // 2
+            feet_y = y1 + int((y2 - y1) * 0.75)
+            cx = max(0, min(cx, w - 1))
+            feet_y = max(0, min(feet_y, h - 1))
+            if pitch_mask[feet_y, cx] > 0:
+                keep.append((bbox, conf))
+
+        if not keep:
+            return bboxes_confs
+        return keep
+    except Exception as e:
+        logger.warning("Pitch filter failed: %s", e)
+        return bboxes_confs
+
+
 def is_pitch_shot(frame, threshold=0.12):
     """Check if frame shows the pitch (enough green) vs closeup/crowd/bench."""
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
@@ -600,12 +641,27 @@ def run_tracking(
             bboxes = bt_results[0].boxes.xyxy.cpu().tolist()
             confs = bt_results[0].boxes.conf.cpu().tolist()
 
+            # FootyVision: pitch boundary bystander removal
+            # Scale bboxes back to original coords for pitch filter
+            orig_bboxes = [[v / scale for v in b] if scale != 1.0 else b for b in bboxes]
+            pitch_filtered = _filter_to_pitch(frame, list(zip(orig_bboxes, confs)))
+            pitch_ok_set = set()
+            for fb, fc in pitch_filtered:
+                pitch_ok_set.add((round(fb[0], 1), round(fb[1], 1),
+                                  round(fb[2], 1), round(fb[3], 1)))
+
             for bt_id_f, bbox, conf in zip(bt_ids, bboxes, confs):
                 track_id = int(bt_id_f)
 
                 # Scale bbox back to original frame coordinates
                 if scale != 1.0:
                     bbox = [v / scale for v in bbox]
+
+                # FootyVision pitch filter: skip detections outside pitch
+                bbox_key = (round(bbox[0], 1), round(bbox[1], 1),
+                            round(bbox[2], 1), round(bbox[3], 1))
+                if bbox_key not in pitch_ok_set:
+                    continue
 
                 # Drop non-player detections
                 box_w = bbox[2] - bbox[0]
