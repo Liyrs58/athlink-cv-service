@@ -397,6 +397,104 @@
         /* ── FOOTER ── */
         footer { text-align: center; padding: 40px 0 20px; font-size: 12px; color: #374151; font-family: 'Inter', sans-serif; }
 
+        /* ── MODE BUTTONS ── */
+        .mode-bar {
+            display: flex; gap: 12px; justify-content: center;
+            margin: 0 auto 16px; max-width: 620px;
+        }
+        .mode-btn {
+            flex: 1; padding: 14px 0; border: 2px solid var(--border);
+            border-radius: 10px; background: var(--card); color: var(--muted);
+            font-family: 'Rajdhani', sans-serif; font-size: 15px; font-weight: 700;
+            letter-spacing: 1.5px; text-transform: uppercase; cursor: pointer;
+            transition: all 0.25s;
+        }
+        .mode-btn.active { border-color: var(--teal); color: var(--text); box-shadow: 0 0 12px rgba(0,212,170,0.15); }
+        .mode-btn:hover:not(.active) { border-color: #374151; color: var(--text); }
+
+        /* ── LIVE PLAYER ── */
+        #liveSection { display: none; }
+        .live-wrap { max-width: 720px; margin: 0 auto; }
+        .live-video-wrap {
+            position: relative; width: 100%; background: #000;
+            border-radius: 12px; overflow: hidden; margin-bottom: 16px;
+        }
+        .live-video-wrap video {
+            display: block; width: 100%; max-height: 400px; object-fit: contain;
+        }
+        .live-video-wrap canvas {
+            position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+            pointer-events: none;
+        }
+        .live-progress {
+            background: var(--card); border: 1px solid var(--border);
+            border-radius: 10px; padding: 16px 20px; margin-bottom: 16px;
+        }
+        .live-progress-bar-bg {
+            height: 8px; background: var(--border); border-radius: 4px;
+            overflow: hidden; margin-bottom: 10px;
+        }
+        .live-progress-bar-fill {
+            height: 100%; background: var(--teal); border-radius: 4px;
+            transition: width 0.3s;
+        }
+        .live-stats {
+            display: flex; justify-content: space-between; align-items: center;
+            font-family: 'Inter', sans-serif; font-size: 13px; color: var(--muted);
+        }
+        .live-stats span { color: var(--text); font-weight: 600; }
+
+        /* ── UNCERTAIN CARDS ── */
+        .uncertain-stack { max-width: 720px; margin: 0 auto; }
+        .uncertain-card {
+            background: var(--card); border: 1px solid var(--warning);
+            border-radius: 10px; padding: 16px 20px; margin-bottom: 10px;
+            display: flex; align-items: center; gap: 16px;
+            animation: uc-fade-in 0.3s;
+        }
+        @keyframes uc-fade-in { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
+        .uc-crop {
+            width: 56px; height: 72px; border-radius: 6px;
+            background: var(--border); object-fit: cover; flex-shrink: 0;
+        }
+        .uc-info { flex: 1; }
+        .uc-title { font-family: 'Rajdhani', sans-serif; font-size: 14px; font-weight: 700; letter-spacing: 1px; text-transform: uppercase; color: var(--warning); margin-bottom: 6px; }
+        .uc-team { font-size: 12px; color: var(--muted); margin-bottom: 8px; }
+        .uc-fields { display: flex; gap: 8px; margin-bottom: 8px; }
+        .uc-fields input {
+            background: var(--bg); border: 1px solid var(--border); color: var(--text);
+            padding: 6px 10px; border-radius: 6px; font-size: 13px; font-family: 'Inter', sans-serif;
+            width: 80px;
+        }
+        .uc-fields input:last-child { width: 140px; }
+        .uc-fields input::placeholder { color: #4b5563; }
+        .uc-actions { display: flex; gap: 8px; }
+        .uc-confirm-btn {
+            background: var(--teal); color: #000; border: none;
+            padding: 7px 16px; border-radius: 6px; font-size: 12px; font-weight: 700;
+            font-family: 'Rajdhani', sans-serif; letter-spacing: 1px;
+            text-transform: uppercase; cursor: pointer;
+        }
+        .uc-skip-btn {
+            background: none; color: var(--muted); border: 1px solid var(--border);
+            padding: 7px 16px; border-radius: 6px; font-size: 12px; font-weight: 600;
+            font-family: 'Rajdhani', sans-serif; letter-spacing: 1px;
+            text-transform: uppercase; cursor: pointer;
+        }
+        .uc-timer-bar {
+            height: 3px; background: var(--border); border-radius: 2px;
+            margin-top: 8px; overflow: hidden;
+        }
+        .uc-timer-fill {
+            height: 100%; background: var(--warning); border-radius: 2px;
+            transition: width 0.5s linear;
+        }
+        .live-finalising {
+            text-align: center; padding: 40px 20px;
+            font-family: 'Rajdhani', sans-serif; font-size: 20px;
+            font-weight: 700; letter-spacing: 1px; color: var(--muted);
+        }
+
         /* ── RESPONSIVE ── */
         @media (max-width: 640px) {
             .container { padding: 20px 16px; }
@@ -406,6 +504,9 @@
             .ctrl-nums, .fatigue-teams { grid-template-columns: 1fr; }
             .conf-row { flex-direction: column; text-align: center; }
             .traj-grid { grid-template-columns: 1fr; }
+            .uncertain-card { flex-direction: column; align-items: flex-start; }
+            .uc-fields { flex-direction: column; }
+            .uc-fields input { width: 100% !important; }
         }
     </style>
 </head>
@@ -436,6 +537,10 @@
             </div>
             <input type="file" id="fileInput" accept="video/*">
             <div class="file-info" id="fileInfo"><span id="fileName"></span></div>
+            <div class="mode-bar" id="modeBar" style="display:none">
+                <button class="mode-btn active" id="modeLive" onclick="setMode('live')">&#9654; Live Analysis</button>
+                <button class="mode-btn" id="modeQuick" onclick="setMode('quick')">&#9889; Quick Analysis</button>
+            </div>
             <button class="analyse-btn" id="analyseBtn">Analyse Match</button>
         </section>
 
@@ -448,6 +553,25 @@
                 <div class="loading-sub">Processing your footage</div>
                 <button class="cancel-btn" id="cancelBtn">Cancel</button>
             </div>
+        </section>
+
+        <!-- LIVE PLAYER -->
+        <section id="liveSection">
+            <div class="live-wrap">
+                <div class="live-video-wrap">
+                    <video id="liveVideo" muted playsinline></video>
+                    <canvas id="liveCanvas"></canvas>
+                </div>
+                <div class="live-progress">
+                    <div class="live-progress-bar-bg"><div class="live-progress-bar-fill" id="liveProgressFill" style="width:0%"></div></div>
+                    <div class="live-stats">
+                        <span id="liveFrameInfo">Frame 0/0</span>
+                        <span id="livePlayerInfo">0 confirmed &middot; 0 uncertain</span>
+                        <span id="liveElapsed">00:00</span>
+                    </div>
+                </div>
+            </div>
+            <div class="uncertain-stack" id="uncertainStack"></div>
         </section>
 
         <!-- RESULTS -->
@@ -487,6 +611,7 @@ const LOADING_MSGS = [
 
 let msgIdx = 0, startTime, timerIv, msgIv, pollIv;
 let selectedFile = null;
+let analysisMode = 'live'; // 'live' or 'quick'
 
 // ── Upload events ──
 const zone = $('uploadZone'), fInput = $('fileInput');
@@ -506,7 +631,14 @@ function pickFile(f) {
     $('fileInfo').style.display = 'block';
     $('fileNameDisplay').textContent = f.name;
     $('fileNameDisplay').style.display = 'block';
+    $('modeBar').style.display = 'flex';
     $('analyseBtn').style.display = 'block';
+}
+
+function setMode(mode) {
+    analysisMode = mode;
+    $('modeLive').classList.toggle('active', mode === 'live');
+    $('modeQuick').classList.toggle('active', mode === 'quick');
 }
 
 $('analyseBtn').addEventListener('click', startAnalysis);
@@ -518,6 +650,7 @@ $('cancelBtn').addEventListener('click', () => {
 
 function startAnalysis() {
     if (!selectedFile) return;
+    if (analysisMode === 'live') { startLiveAnalysis(); return; }
     show('loadingSection'); hide('uploadSection', 'resultsSection', 'errorSection');
 
     msgIdx = 0; startTime = Date.now();
@@ -1120,6 +1253,364 @@ function togglePlayerExpand(card) {
     if (!exp) return;
     exp.classList.toggle('open');
     card.classList.toggle('expanded');
+}
+
+// ═══════════════════════════════════════════════════════
+//  LIVE ANALYSIS
+// ═══════════════════════════════════════════════════════
+
+let liveSessionId = null;
+let liveTracks = {};       // track_id -> {bbox, team_colour, status, label, crop}
+let liveConfirmedCount = 0;
+let liveUncertainCount = 0;
+let livePaused = false;
+let liveStartTime = null;
+let liveTimerIv = null;
+let liveSkippedIds = new Set();
+let uncertainQueue = [];   // queued uncertain tracks
+const MAX_VISIBLE_CARDS = 3;
+
+async function startLiveAnalysis() {
+    hide('uploadSection', 'resultsSection', 'errorSection', 'loadingSection');
+    show('liveSection');
+
+    const video = $('liveVideo');
+    const url = URL.createObjectURL(selectedFile);
+    video.src = url;
+
+    try {
+        await new Promise((resolve, reject) => {
+            video.onloadedmetadata = resolve;
+            video.onerror = reject;
+        });
+    } catch (e) {
+        fallbackToQuick('Video load failed');
+        return;
+    }
+
+    const vw = video.videoWidth;
+    const vh = video.videoHeight;
+    const duration = video.duration;
+    if (!duration || !vw || !vh) { fallbackToQuick('Invalid video'); return; }
+
+    const fps = 10;
+    const interval = 1 / fps;
+    const totalFrames = Math.floor(duration * fps);
+    const batchSize = 25;
+
+    // Start session
+    try {
+        const res = await fetch(`${API_BASE}/api/v1/stream/start`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ frame_width: vw, frame_height: vh, clip_type: 'match', fps: fps })
+        });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        liveSessionId = data.session_id;
+    } catch (e) {
+        fallbackToQuick('Session start failed');
+        return;
+    }
+
+    // Setup canvas
+    const canvas = $('liveCanvas');
+    const videoEl = $('liveVideo');
+    const syncCanvas = () => {
+        canvas.width = videoEl.clientWidth;
+        canvas.height = videoEl.clientHeight;
+    };
+    syncCanvas();
+    const ro = new ResizeObserver(syncCanvas);
+    ro.observe(videoEl);
+
+    // Extraction canvas (offscreen)
+    const extractCanvas = document.createElement('canvas');
+    extractCanvas.width = vw;
+    extractCanvas.height = vh;
+    const ectx = extractCanvas.getContext('2d');
+
+    liveStartTime = Date.now();
+    liveTimerIv = setInterval(updateLiveTimer, 1000);
+    liveConfirmedCount = 0;
+    liveUncertainCount = 0;
+    liveTracks = {};
+    liveSkippedIds = new Set();
+    uncertainQueue = [];
+
+    // Extract frames in batches
+    let frameIdx = 0;
+    let batch = [];
+    let batchIndices = [];
+    let batchTimestamps = [];
+
+    while (frameIdx < totalFrames) {
+        // Wait if paused for uncertain players
+        while (livePaused) {
+            await sleep(200);
+        }
+
+        const t = frameIdx * interval;
+        video.currentTime = t;
+        await new Promise(r => { video.onseeked = r; });
+
+        ectx.drawImage(video, 0, 0, vw, vh);
+        const blob = await new Promise(r => extractCanvas.toBlob(r, 'image/jpeg', 0.7));
+
+        batch.push(blob);
+        batchIndices.push(frameIdx);
+        batchTimestamps.push(parseFloat(t.toFixed(3)));
+        frameIdx++;
+
+        // Update progress
+        const pct = (frameIdx / totalFrames * 100).toFixed(1);
+        $('liveProgressFill').style.width = pct + '%';
+        $('liveFrameInfo').textContent = `Frame ${frameIdx}/${totalFrames}`;
+
+        if (batch.length >= batchSize || frameIdx >= totalFrames) {
+            // Send batch
+            try {
+                const fd = new FormData();
+                batch.forEach(b => fd.append('frames', b, 'frame.jpg'));
+                fd.append('frame_indices', JSON.stringify(batchIndices));
+                fd.append('timestamps', JSON.stringify(batchTimestamps));
+
+                const res = await fetch(`${API_BASE}/api/v1/stream/${liveSessionId}/frames`, {
+                    method: 'POST', body: fd
+                });
+                if (!res.ok) throw new Error(`HTTP ${res.status}`);
+                const result = await res.json();
+
+                // Update tracks
+                if (result.tracks) {
+                    result.tracks.forEach(tk => {
+                        liveTracks[tk.track_id] = tk;
+                    });
+                }
+
+                // Draw overlay
+                drawLiveOverlay();
+
+                // Handle uncertain
+                if (result.new_uncertain && result.new_uncertain.length > 0) {
+                    const newUncertain = result.new_uncertain.filter(u => !liveSkippedIds.has(u.track_id));
+                    if (newUncertain.length > 0) {
+                        uncertainQueue.push(...newUncertain);
+                        liveUncertainCount = uncertainQueue.length;
+                        updateLivePlayerInfo();
+                        livePaused = true;
+                        showUncertainCards();
+                    }
+                }
+
+                updateLivePlayerInfo();
+            } catch (e) {
+                fallbackToQuick('Frame processing failed');
+                return;
+            }
+            batch = [];
+            batchIndices = [];
+            batchTimestamps = [];
+        }
+    }
+
+    // Finalise
+    clearInterval(liveTimerIv);
+    $('liveFrameInfo').textContent = 'Generating report...';
+
+    try {
+        const res = await fetch(`${API_BASE}/api/v1/stream/${liveSessionId}/finalise`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({})
+        });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+
+        // Switch to existing poll/results flow
+        hide('liveSection');
+        show('loadingSection');
+        startTime = Date.now();
+        $('loadingStatus').textContent = 'GENERATING REPORT...';
+        updateTimer();
+        timerIv = setInterval(updateTimer, 1000);
+        poll(data.job_id);
+    } catch (e) {
+        fallbackToQuick('Finalise failed');
+    }
+}
+
+function fallbackToQuick(reason) {
+    console.warn('Live analysis fallback:', reason);
+    clearInterval(liveTimerIv);
+    hide('liveSection');
+    liveSessionId = null;
+    analysisMode = 'quick';
+    startAnalysis();
+}
+
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+function updateLiveTimer() {
+    if (!liveStartTime) return;
+    const s = Math.floor((Date.now() - liveStartTime) / 1000);
+    const mm = String(Math.floor(s / 60)).padStart(2, '0');
+    const ss = String(s % 60).padStart(2, '0');
+    $('liveElapsed').textContent = `${mm}:${ss}`;
+}
+
+function updateLivePlayerInfo() {
+    $('livePlayerInfo').textContent = `${liveConfirmedCount} confirmed \u00b7 ${liveUncertainCount} uncertain`;
+}
+
+function drawLiveOverlay() {
+    const canvas = $('liveCanvas');
+    const video = $('liveVideo');
+    const ctx = canvas.getContext('2d');
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+    const scaleX = canvas.width / video.videoWidth;
+    const scaleY = canvas.height / video.videoHeight;
+
+    Object.values(liveTracks).forEach(tk => {
+        if (!tk.bbox) return;
+        const [x1, y1, x2, y2] = tk.bbox;
+        const sx = x1 * scaleX, sy = y1 * scaleY;
+        const sw = (x2 - x1) * scaleX, sh = (y2 - y1) * scaleY;
+        const cx = sx + sw / 2, cy = sy;
+
+        let color;
+        if (tk.confirmed_label || tk.status === 'confirmed') {
+            color = '#00d4aa';
+        } else if (liveSkippedIds.has(tk.track_id)) {
+            color = '#6b7280';
+        } else if (tk.status === 'uncertain') {
+            color = '#f59e0b';
+        } else {
+            color = '#6b7280';
+        }
+
+        // Dot
+        ctx.beginPath();
+        ctx.arc(cx, cy - 4, 5, 0, Math.PI * 2);
+        ctx.fillStyle = color;
+        ctx.fill();
+
+        // Box
+        ctx.strokeStyle = color;
+        ctx.lineWidth = 1.5;
+        ctx.strokeRect(sx, sy, sw, sh);
+
+        // Label
+        const label = tk.confirmed_label || tk.jersey_number || '';
+        if (label) {
+            ctx.font = '700 11px Rajdhani, sans-serif';
+            ctx.fillStyle = color;
+            ctx.textAlign = 'center';
+            ctx.fillText(label, cx, sy - 8);
+        }
+    });
+}
+
+function showUncertainCards() {
+    const stack = $('uncertainStack');
+    stack.innerHTML = '';
+    const visible = uncertainQueue.splice(0, MAX_VISIBLE_CARDS);
+
+    visible.forEach(u => {
+        const card = document.createElement('div');
+        card.className = 'uncertain-card';
+        card.dataset.trackId = u.track_id;
+
+        const cropSrc = u.crop ? `data:image/jpeg;base64,${u.crop}` : '';
+        const teamLabel = u.team_colour === 0 ? 'Blue' : u.team_colour === 1 ? 'Red' : 'Unknown';
+
+        card.innerHTML = `
+            ${cropSrc ? `<img class="uc-crop" src="${cropSrc}" alt="player crop">` : '<div class="uc-crop"></div>'}
+            <div class="uc-info">
+                <div class="uc-title">New player detected</div>
+                <div class="uc-team">Team: ${esc(teamLabel)}</div>
+                <div class="uc-fields">
+                    <input type="text" placeholder="Jersey #" class="uc-jersey" maxlength="3">
+                    <input type="text" placeholder="Player name" class="uc-name">
+                </div>
+                <div class="uc-actions">
+                    <button class="uc-confirm-btn" onclick="confirmUncertain(${u.track_id}, this)">Confirm</button>
+                    <button class="uc-skip-btn" onclick="skipUncertain(${u.track_id}, this)">Skip</button>
+                </div>
+                <div class="uc-timer-bar"><div class="uc-timer-fill" style="width:100%"></div></div>
+            </div>
+        `;
+        stack.appendChild(card);
+
+        // 30s auto-skip timer
+        const fill = card.querySelector('.uc-timer-fill');
+        let elapsed = 0;
+        const timerIv = setInterval(() => {
+            elapsed += 500;
+            const pct = Math.max(0, 100 - (elapsed / 30000 * 100));
+            fill.style.width = pct + '%';
+            if (elapsed >= 30000) {
+                clearInterval(timerIv);
+                skipUncertain(u.track_id, card.querySelector('.uc-skip-btn'));
+            }
+        }, 500);
+        card._timerIv = timerIv;
+    });
+}
+
+async function confirmUncertain(trackId, btn) {
+    const card = btn.closest('.uncertain-card');
+    clearInterval(card._timerIv);
+    const jersey = card.querySelector('.uc-jersey').value.trim();
+    const name = card.querySelector('.uc-name').value.trim();
+
+    try {
+        await fetch(`${API_BASE}/api/v1/stream/${liveSessionId}/confirm`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                track_id: trackId,
+                jersey_number: jersey || null,
+                player_name: name || null,
+                team_colour: liveTracks[trackId] ? liveTracks[trackId].team_colour : null
+            })
+        });
+    } catch (e) { /* continue anyway */ }
+
+    if (liveTracks[trackId]) {
+        liveTracks[trackId].status = 'confirmed';
+        liveTracks[trackId].confirmed_label = jersey ? `#${jersey}` : (name || 'Confirmed');
+    }
+    liveConfirmedCount++;
+    liveUncertainCount = Math.max(0, liveUncertainCount - 1);
+    updateLivePlayerInfo();
+    drawLiveOverlay();
+    card.remove();
+    checkResumeLive();
+}
+
+function skipUncertain(trackId, btn) {
+    const card = btn.closest('.uncertain-card');
+    if (!card) return;
+    clearInterval(card._timerIv);
+    liveSkippedIds.add(trackId);
+    liveUncertainCount = Math.max(0, liveUncertainCount - 1);
+    updateLivePlayerInfo();
+    drawLiveOverlay();
+    card.remove();
+    checkResumeLive();
+}
+
+function checkResumeLive() {
+    const stack = $('uncertainStack');
+    if (stack.children.length === 0) {
+        if (uncertainQueue.length > 0) {
+            showUncertainCards();
+        } else {
+            livePaused = false;
+        }
+    }
 }
 </script>
 </body>
