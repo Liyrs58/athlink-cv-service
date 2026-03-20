@@ -46,7 +46,8 @@
         .tagline { font-size: 13px; color: #6b7280; font-family: 'Inter', sans-serif; }
 
         /* ── UPLOAD ── */
-        #uploadSection { text-align: center; }
+        #uploadSection { text-align: center; display: block; }
+        #uploadSection.hidden { display: none; }
         .upload-zone {
             border: 2px dashed var(--teal);
             border-radius: 16px;
@@ -633,6 +634,40 @@
 <script>
 const $ = id => document.getElementById(id);
 const API_BASE = 'https://web-production-6b7ca.up.railway.app';
+
+// ── Reset UI to initial state on page load ──
+function resetToInitialState() {
+    const uploadSection = $('uploadSection');
+    const loadingSection = $('loadingSection');
+    const liveSection = $('liveSection');
+    const resultsSection = $('resultsSection');
+    const errorSection = $('errorSection');
+    const fileInfo = $('fileInfo');
+    const modeBar = $('modeBar');
+    const analyseBtn = $('analyseBtn');
+    const fileNameDisplay = $('fileNameDisplay');
+
+    // Show only upload section
+    if (uploadSection) uploadSection.style.display = 'block';
+    if (loadingSection) loadingSection.style.display = 'none';
+    if (liveSection) liveSection.style.display = 'none';
+    if (resultsSection) resultsSection.style.display = 'none';
+    if (errorSection) errorSection.style.display = 'none';
+
+    // Hide file info and mode bar until file is selected
+    if (fileInfo) fileInfo.style.display = 'none';
+    if (modeBar) modeBar.style.display = 'none';
+    if (analyseBtn) analyseBtn.style.display = 'none';
+    if (fileNameDisplay) fileNameDisplay.style.display = 'none';
+
+    // Clear file input
+    const fileInput = $('fileInput');
+    if (fileInput) fileInput.value = '';
+}
+
+// Reset on page load
+document.addEventListener('DOMContentLoaded', resetToInitialState);
+window.addEventListener('load', resetToInitialState);
 
 const LOADING_MSGS = [
     'TRACKING PLAYERS...',
