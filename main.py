@@ -133,6 +133,18 @@ async def root():
         "docs": "/docs"
     }
 
+@app.get("/")
+async def serve_index():
+    """Serve index.html with no-cache headers to prevent stale UI."""
+    from fastapi.responses import HTMLResponse
+    import pathlib
+    html = pathlib.Path("static/index.html").read_text()
+    return HTMLResponse(html, headers={
+        "Cache-Control": "no-cache, no-store, must-revalidate",
+        "Pragma": "no-cache",
+        "Expires": "0",
+    })
+
 app.mount("/", StaticFiles(directory="static", html=True), name="static")
 
 if __name__ == "__main__":
