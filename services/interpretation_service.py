@@ -69,7 +69,8 @@ def _compute_phase_widths(events, tracks, calibration):
 
 def build_rich_context(events, tracks, vel_summary, shape_summary, velocities, job_id,
                        team_separation=None, data_confidence=None, calibration=None,
-                       brain_summary=None):
+                       brain_summary=None, ball_data=None, possession_data=None,
+                       pass_data=None):
     """Build plain-English coaching context for the Claude prompt."""
     team_sep = team_separation or {}
 
@@ -338,12 +339,38 @@ def build_rich_context(events, tracks, vel_summary, shape_summary, velocities, j
         lines.append("  (No players with sufficient tracking data)")
     lines.append("")
 
+    # Ball tracking, possession, passes
+    if ball_data and not ball_data.get("error"):
+        tracking_rate = ball_data.get("tracking_rate", 0)
+        lines.append("BALL TRACKING:")
+        lines.append(f"  Ball tracked in {tracking_rate:.0f}% of frames")
+
+        if possession_data:
+            t0_poss = possession_data.get("team_0_pct", 0)
+            t1_poss = possession_data.get("team_1_pct", 0)
+            lines.append(f"  Possession: {t0_name} {t0_poss:.0f}% | {t1_name} {t1_poss:.0f}%")
+
+        if pass_data and pass_data.get("total", 0) > 0:
+            total_passes = pass_data["total"]
+            lines.append(f"  Total passes detected: {total_passes}")
+            per_player = pass_data.get("per_player", {})
+            if per_player:
+                pass_strs = []
+                for pid, count in sorted(per_player.items(), key=lambda x: x[1], reverse=True)[:5]:
+                    pos = track_position_map.get(int(pid) if isinstance(pid, str) else pid, "Unknown")
+                    tid = track_team_map.get(int(pid) if isinstance(pid, str) else pid, -1)
+                    tname = t0_name if tid == 0 else (t1_name if tid == 1 else "Unknown")
+                    pass_strs.append(f"{tname} {pos}: {count}")
+                lines.append(f"  Passes per player: {', '.join(pass_strs)}")
+        lines.append("")
+
     return "\n".join(lines)
 
 
 def interpret_events(events, tracks, job_id, velocity_summary=None, shape_summary=None,
                      velocities=None, memory=None, team_separation=None, data_confidence=None,
-                     brain_summary=None, voronoi=None, entropy=None, calibration=None):
+                     brain_summary=None, voronoi=None, entropy=None, calibration=None,
+                     ball_data=None, possession_data=None, pass_data=None):
     if not events:
         return [{"job_id": job_id, "analysis": "No events to analyse.", "events": []}]
 
@@ -357,6 +384,9 @@ def interpret_events(events, tracks, job_id, velocity_summary=None, shape_summar
         data_confidence=data_confidence,
         calibration=calibration,
         brain_summary=brain_summary,
+        ball_data=ball_data,
+        possession_data=possession_data,
+        pass_data=pass_data,
     )
 
     # Prefix with Observer Brain data quality summary

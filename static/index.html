@@ -892,6 +892,38 @@ function render(d) {
         </div>
     </div>`;
 
+    // A2. Annotated Video Download + Possession Bar
+    if (d.annotated_video_path) {
+        ov += `<div class="card" id="annotatedVideo">
+            <div class="card-title">Match Video</div>
+            <a href="/api/v1/jobs/${esc(d.job_id)}/video" download
+               style="display:inline-block;padding:12px 28px;background:var(--teal);color:#0a0e1a;
+                      font-weight:600;border-radius:8px;text-decoration:none;font-size:14px;
+                      transition:opacity 0.2s;margin-bottom:16px"
+               onmouseover="this.style.opacity='0.85'" onmouseout="this.style.opacity='1'">
+                Download Annotated Match Video
+            </a>`;
+
+        // Possession bar from video annotation
+        const ap = d.annotation_possession;
+        if (ap) {
+            const t0pct = ap['0'] || 0;
+            const t1pct = ap['1'] || 0;
+            ov += `<div style="margin-top:12px">
+                <div style="display:flex;justify-content:space-between;font-size:13px;margin-bottom:4px">
+                    <span style="color:var(--teal)">${esc(t0n)} ${t0pct.toFixed(1)}%</span>
+                    <span style="color:var(--danger)">${esc(t1n)} ${t1pct.toFixed(1)}%</span>
+                </div>
+                <div style="display:flex;height:8px;border-radius:4px;overflow:hidden;background:#1f2937">
+                    <div style="width:${t0pct}%;background:var(--teal)"></div>
+                    <div style="width:${t1pct}%;background:var(--danger)"></div>
+                </div>
+                <div style="font-size:11px;color:var(--muted);margin-top:4px;text-align:center">Ball Possession (from video annotation)</div>
+            </div>`;
+        }
+        ov += `</div>`;
+    }
+
     // B. Tactical Map
     ov += `<div class="card" id="tacticalMap" style="display:none;">
         <div class="card-title">Tactical Map</div>

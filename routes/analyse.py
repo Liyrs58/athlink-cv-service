@@ -1,6 +1,7 @@
 from fastapi import APIRouter, UploadFile, File, Query
 from fastapi.responses import JSONResponse
-import shutil, uuid, os
+import shutil, uuid, os, logging
+import cv2
 import numpy as np
 from services.tracking_service import run_tracking
 from services.team_separation_service import cluster_teams
@@ -23,8 +24,13 @@ from services.observer_brain import ObserverBrain
 from services.fatigue_clock_service import FatigueClock
 from services.voronoi_service import compute_voronoi_control
 from services.entropy_service import compute_team_entropy
+from services.ball_tracking_service import BallTracker, PossessionDetector, PassDetector
+from services.video_annotator import VideoAnnotator
+from services.camera_compensator import CameraCompensator
+from services.speed_estimator import SpeedEstimator
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 def numpy_safe(obj):
     """Convert numpy types to native Python types for JSON serialization."""
@@ -38,6 +44,51 @@ def numpy_safe(obj):
 
 # Keep alias for any other code that may reference make_json_safe
 make_json_safe = numpy_safe
+
+def _convert_tracks_to_at_format(tracks, ball_data, total_frames):
+    """
+    Convert Athlink track format to Abdullah Tarek's format.
+
+    Athlink format: list of track dicts with trajectory entries.
+    Abdullah format: {
+        "players": [{track_id: {"bbox": [...], "team": int}}, ...per frame],
+        "ball": [{1: {"bbox": [...]}}, ...per frame]
+    }
+    """
+    at_tracks = {
+        "players": [{} for _ in range(total_frames)],
+        "ball": [{} for _ in range(total_frames)],
+    }
+
+    # Map players
+    for t in tracks:
+        tid = t.get("trackId", 0)
+        team_id = t.get("teamId", -1)
+        for entry in t.get("trajectory", []):
+            fi = entry.get("frameIndex", 0)
+            bbox = entry.get("bbox", [])
+            if fi < total_frames and len(bbox) >= 4:
+                at_tracks["players"][fi][tid] = {
+                    "bbox": bbox,
+                    "team": team_id,
+                    "team_color": {0: (0, 0, 255), 1: (0, 255, 0), -1: (128, 128, 128)}.get(team_id, (128, 128, 128)),
+                }
+
+    # Map ball positions
+    if ball_data and not ball_data.get("error"):
+        positions = ball_data.get("positions", {})
+        for fi_str, pos in positions.items():
+            fi = int(fi_str)
+            if fi < total_frames:
+                # Convert center point to bbox (ball is small, ~10px)
+                cx, cy = pos["x"], pos["y"]
+                r = 8
+                at_tracks["ball"][fi][1] = {
+                    "bbox": [cx - r, cy - r, cx + r, cy + r],
+                }
+
+    return at_tracks
+
 
 def infer_position(positions: list, frame_h: int, team_id: int) -> str:
     """
@@ -119,6 +170,127 @@ def _run_analysis_pipeline(job_id: str, temp_path: str, skip_cleanup: bool = Fal
         calibration = correction_report["calibration"]
         corrections_applied = correction_report["corrections_applied"]
 
+        # ── Ball tracking ─────────────────────────────────────────
+        ball_data = {"error": "Ball tracking unavailable"}
+        possession_data = {}
+        pass_data = {}
+        pass_detector = None
+        try:
+            ball_tracker = BallTracker()
+            ball_tracker.load_model()
+            if ball_tracker.model is not None:
+                cap = cv2.VideoCapture(temp_path)
+                fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+                total_frames = 0
+                while True:
+                    ret, frame = cap.read()
+                    if not ret:
+                        break
+                    ball_tracker.detect(frame, total_frames)
+                    total_frames += 1
+                cap.release()
+
+                ball_positions = ball_tracker.get_positions()
+                rate = ball_tracker.tracking_rate(total_frames)
+                ball_data = {
+                    "positions": {str(k): v for k, v in ball_positions.items()},
+                    "tracked_frames": len(ball_positions),
+                    "total_frames": total_frames,
+                    "tracking_rate": round(rate, 1),
+                }
+                logger.info("Ball tracked in %d/%d frames (%.1f%%)", len(ball_positions), total_frames, rate)
+
+                # Possession + pass detection
+                ppm = 1.0
+                if calibration and calibration.get("pixels_per_metre"):
+                    ppm = max(calibration["pixels_per_metre"], 0.1)
+
+                possession_det = PossessionDetector()
+                pass_detector = PassDetector()
+
+                for fi in range(total_frames):
+                    bp = ball_tracker.get_position_at(fi)
+                    # Build player list for this frame
+                    frame_players = []
+                    for t in tracks:
+                        if t.get("firstSeen", 0) <= fi <= t.get("lastSeen", 0):
+                            traj = t.get("trajectory", [])
+                            closest = min(traj, key=lambda e: abs(e["frameIndex"] - fi), default=None) if traj else None
+                            if closest and abs(closest["frameIndex"] - fi) <= 4:
+                                bbox = closest.get("bbox", [])
+                                if len(bbox) >= 4:
+                                    frame_players.append({
+                                        "track_id": t.get("trackId"),
+                                        "cx": (bbox[0] + bbox[2]) / 2.0,
+                                        "cy": (bbox[1] + bbox[3]) / 2.0,
+                                        "team_id": t.get("teamId", -1),
+                                    })
+
+                    poss = possession_det.update(bp, frame_players, fi, ppm)
+                    pass_detector.update(poss, bp, fi, fps, ppm)
+
+                poss_pct = possession_det.get_team_possession_pct()
+                possession_data = {
+                    "team_0_pct": poss_pct.get(0, 0.0),
+                    "team_1_pct": poss_pct.get(1, 0.0),
+                    "events": possession_det.get_possession_events(),
+                }
+                pass_data = {
+                    "total": len(pass_detector.get_passes()),
+                    "per_player": pass_detector.get_passes_per_player(),
+                    "events": pass_detector.get_passes(),
+                }
+        except Exception as e:
+            logger.warning("Ball tracking failed: %s", e)
+            ball_data = {"error": f"Ball tracking failed: {e}"}
+
+        # ── Video annotation ────────────────────────────────────
+        annotated_video_path = None
+        annotation_possession = None
+        try:
+            cap2 = cv2.VideoCapture(temp_path)
+            ann_fps = cap2.get(cv2.CAP_PROP_FPS) or 25.0
+            ann_frames = []
+            while True:
+                ret2, f2 = cap2.read()
+                if not ret2:
+                    break
+                ann_frames.append(f2)
+            cap2.release()
+
+            if ann_frames and len(ann_frames) > 5:
+                ann_total = len(ann_frames)
+                at_tracks = _convert_tracks_to_at_format(tracks, ball_data, ann_total)
+
+                # Camera compensation
+                compensator = CameraCompensator(ann_frames[0])
+                camera_movement = compensator.get_camera_movement(ann_frames)
+                at_tracks = compensator.adjust_positions(at_tracks, camera_movement)
+
+                # Speed estimation with camera correction
+                speed_est = SpeedEstimator()
+                at_tracks = speed_est.calculate(at_tracks, ann_fps)
+
+                # Ball possession
+                annotator = VideoAnnotator()
+                at_tracks, team_ball_control = annotator.assign_ball_possession(at_tracks)
+                annotation_possession = annotator.get_team_ball_control_pct(team_ball_control)
+
+                # Generate annotated video
+                annotated_video_path = f'/tmp/{job_id}_annotated.mp4'
+                annotator.annotate_video(
+                    temp_path,
+                    at_tracks,
+                    annotated_video_path,
+                    camera_movement,
+                    team_ball_control,
+                )
+
+                logger.info("Video annotation complete: %s", annotated_video_path)
+        except Exception as e:
+            logger.error("Video annotation failed: %s", e)
+            annotated_video_path = None
+
         # Apply coach-confirmed labels from stream session
         if pre_confirmed_labels:
             for track in tracks:
@@ -174,6 +346,9 @@ def _run_analysis_pipeline(job_id: str, temp_path: str, skip_cleanup: bool = Fal
             voronoi=voronoi,
             entropy=entropy,
             calibration=calibration,
+            ball_data=ball_data,
+            possession_data=possession_data,
+            pass_data=pass_data,
         )
         analysis_text = analysis[0]["analysis"] if analysis else ""
 
@@ -265,6 +440,7 @@ def _run_analysis_pipeline(job_id: str, temp_path: str, skip_cleanup: bool = Fal
                 "max_speed_kmh": max_spd_kmh,
                 "max_speed_display": spd_metric["display_value"],
                 "unreliable_speed_frames": v.get("unreliable_speed_frames", 0),
+                "passes": pass_detector.get_passes_per_player().get(v["track_id"], 0) if pass_detector else 0,
             })
 
         # Build match_feed from situation events and sprint data
@@ -321,12 +497,13 @@ def _run_analysis_pipeline(job_id: str, temp_path: str, skip_cleanup: bool = Fal
                 "distance_range": player["distance_range"],
                 "top_speed": f"{player['max_speed_kmh']} km/h ±10%",
                 "sprints": player.get("sprints", 0),
+                "passes": player.get("passes", 0),
                 "confidence": player["confidence"]
             })
         stats_rows.sort(key=lambda x: x["distance_range"].split("-")[0], reverse=True)
 
         stats_table = {
-            "headers": ["Player", "Position", "Team", "Distance", "Top Speed", "Sprints", "Confidence"],
+            "headers": ["Player", "Position", "Team", "Distance", "Top Speed", "Sprints", "Passes", "Confidence"],
             "rows": stats_rows
         }
 
@@ -420,8 +597,13 @@ def _run_analysis_pipeline(job_id: str, temp_path: str, skip_cleanup: bool = Fal
                 "trajectories": trajectory_summary.get("trajectories", {}),
                 "history_size": trajectory_summary.get("player_history_size", {}),
             },
+            "ball": ball_data,
+            "possession": possession_data,
+            "passes": pass_data,
             "match_feed": match_feed,
             "stats_table": stats_table,
+            "annotated_video_path": annotated_video_path,
+            "annotation_possession": annotation_possession,
             "analysis": analysis_text,
             "validation": validation_result,
         }
@@ -456,3 +638,20 @@ async def analyse_video(
         "status": "processing",
         "poll_url": f"/api/v1/jobs/status/{job_id}"
     })
+
+
+@router.get("/jobs/{job_id}/video")
+async def get_annotated_video(job_id: str):
+    """Return the annotated video file for download."""
+    video_path = f'/tmp/{job_id}_annotated.mp4'
+    if os.path.exists(video_path):
+        from fastapi.responses import FileResponse
+        return FileResponse(
+            video_path,
+            media_type='video/mp4',
+            filename=f'athlink_analysis_{job_id}.mp4',
+        )
+    return JSONResponse(
+        {"error": "Annotated video not found"},
+        status_code=404,
+    )
