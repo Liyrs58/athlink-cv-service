@@ -590,24 +590,8 @@
             </div>
         </section>
 
-        <!-- LIVE PLAYER -->
-        <section id="liveSection" style="display:none">
-            <div class="live-wrap">
-                <div class="live-video-wrap">
-                    <video id="liveVideo" muted playsinline></video>
-                    <canvas id="liveCanvas"></canvas>
-                </div>
-                <div class="live-progress">
-                    <div class="live-progress-bar-bg"><div class="live-progress-bar-fill" id="liveProgressFill" style="width:0%"></div></div>
-                    <div class="live-stats">
-                        <span id="liveFrameInfo">Frame 0/0</span>
-                        <span id="livePlayerInfo">0 confirmed &middot; 0 uncertain</span>
-                        <span id="liveElapsed">00:00</span>
-                    </div>
-                </div>
-            </div>
-            <div class="uncertain-stack" id="uncertainStack"></div>
-        </section>
+        <!-- LIVE PLAYER (injected by JS on demand) -->
+        <section id="liveSection" style="display:none !important"></section>
 
         <!-- RESULTS -->
         <section id="resultsSection" style="display:none">
@@ -1410,7 +1394,28 @@ const LIVE_STATUS_MSGS = [
 ];
 
 async function startLiveAnalysis() {
+    // Inject live player HTML on demand (never in static HTML to prevent flash)
+    const ls = $('liveSection');
+    if (!ls.dataset.injected) {
+        ls.innerHTML = `<div class="live-wrap">
+            <div class="live-video-wrap">
+                <video id="liveVideo" muted playsinline></video>
+                <canvas id="liveCanvas"></canvas>
+            </div>
+            <div class="live-progress">
+                <div class="live-progress-bar-bg"><div class="live-progress-bar-fill" id="liveProgressFill" style="width:0%"></div></div>
+                <div class="live-stats">
+                    <span id="liveFrameInfo">Frame 0/0</span>
+                    <span id="livePlayerInfo">0 confirmed &middot; 0 uncertain</span>
+                    <span id="liveElapsed">00:00</span>
+                </div>
+            </div>
+        </div>
+        <div class="uncertain-stack" id="uncertainStack"></div>`;
+        ls.dataset.injected = '1';
+    }
     hide('uploadSection', 'resultsSection', 'errorSection', 'loadingSection');
+    ls.style.cssText = 'display:block';
     show('liveSection');
 
     // Hidden video purely for metadata (duration, dimensions)
