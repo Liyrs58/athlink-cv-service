@@ -617,7 +617,10 @@
 
 <script>
 const $ = id => document.getElementById(id);
-const API_BASE = 'https://web-production-6b7ca.up.railway.app';
+// Auto-detect API base: if running on localhost, use localhost; otherwise use the production Railway URL
+const API_BASE = window.location.hostname.includes('localhost') || window.location.hostname === '127.0.0.1'
+    ? `http://${window.location.hostname}:${window.location.port || 8001}`
+    : 'https://web-production-6b7ca.up.railway.app';
 
 // ── Reset UI to initial state on page load ──
 function resetToInitialState() {
@@ -1560,6 +1563,10 @@ async function startLiveAnalysis() {
                 }
             } catch (e) {
                 console.error('Frame batch error:', e);
+                console.error('Failed to post frames:', e.message);
+                console.error('Session ID:', liveSessionId);
+                console.error('API_BASE:', API_BASE);
+                console.error('Batch size:', batch.length);
             }
             batch = [];
             batchIndices = [];
