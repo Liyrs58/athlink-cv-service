@@ -1429,6 +1429,11 @@ async function startLiveAnalysis() {
     const url = URL.createObjectURL(selectedFile);
     video.src = url;
 
+    // Feed visible video element with the same source
+    const liveVid = $('liveVideo');
+    liveVid.src = url;
+    liveVid.play().catch(() => {});
+
     try {
         await new Promise((resolve, reject) => {
             const timeout = setTimeout(() => reject(new Error('Video load timeout')), 10000);
@@ -1518,6 +1523,14 @@ async function startLiveAnalysis() {
         await new Promise(r => { extractVideo.onseeked = r; });
 
         ectx.drawImage(extractVideo, 0, 0, extractW, extractH);
+
+        // Draw current frame to visible canvas for preview
+        const liveCanvas = $('liveCanvas');
+        liveCanvas.width = extractW;
+        liveCanvas.height = extractH;
+        const lctx = liveCanvas.getContext('2d');
+        lctx.drawImage(extractVideo, 0, 0, extractW, extractH);
+
         const blob = await new Promise(r => extractCanvas.toBlob(r, 'image/jpeg', 0.6));
 
         batch.push(blob);
