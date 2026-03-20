@@ -144,13 +144,13 @@ def infer_position(positions: list, frame_h: int, team_id: int) -> str:
     except Exception:
         return "Unknown"
 
-def _run_analysis_pipeline(job_id: str, temp_path: str, skip_cleanup: bool = False, validate: bool = False, pre_confirmed_labels: dict = None):
+def _run_analysis_pipeline(job_id: str, temp_path: str, skip_cleanup: bool = False, validate: bool = False, pre_confirmed_labels: dict = None, progress_path: str = None):
     """Background task — runs the full analysis pipeline."""
     try:
         # Pitch calibration
         calibration = get_frame_calibration(temp_path)
 
-        r = run_tracking(job_id=job_id, video_path=temp_path, frame_stride=2)
+        r = run_tracking(job_id=job_id, video_path=temp_path, frame_stride=2, progress_path=progress_path)
         tracks = r.get("tracks", [])
         frame_metadata = r.get("frame_metadata", [])
 

@@ -495,6 +495,12 @@
             font-family: 'Rajdhani', sans-serif; font-size: 20px;
             font-weight: 700; letter-spacing: 1px; color: var(--muted);
         }
+        .live-status-msg {
+            text-align: center; padding: 8px;
+            font-family: 'Rajdhani', sans-serif; font-size: 14px;
+            font-weight: 700; letter-spacing: 2px; color: var(--teal);
+            text-transform: uppercase;
+        }
 
         /* ── TACTICAL MAP ── */
         .pitch-svg { width: 100%; max-width: 600px; height: auto; }
@@ -1409,7 +1415,7 @@ async function startLiveAnalysis() {
                 <div class="live-progress-bar-bg"><div class="live-progress-bar-fill" id="liveProgressFill" style="width:0%"></div></div>
                 <div class="live-stats">
                     <span id="liveFrameInfo">Frame 0/0</span>
-                    <span id="livePlayerInfo">0 confirmed &middot; 0 uncertain</span>
+                    <span id="livePlayerInfo">0 players tracked</span>
                     <span id="liveElapsed">00:00</span>
                 </div>
             </div>
@@ -1422,53 +1428,46 @@ async function startLiveAnalysis() {
     ls.style.cssText = 'display:block';
     show('liveSection');
 
-    // Hidden video purely for metadata (duration, dimensions)
-    const video = document.createElement('video');
-    video.muted = true;
-    video.preload = 'metadata';
+    // Load video metadata
     const url = URL.createObjectURL(selectedFile);
-    video.src = url;
-
-    // Feed visible video element with the same source
     const liveVid = $('liveVideo');
     liveVid.src = url;
-    liveVid.play().catch(() => {});
 
     try {
         await new Promise((resolve, reject) => {
-            const timeout = setTimeout(() => reject(new Error('Video load timeout')), 10000);
-            video.onloadedmetadata = () => { clearTimeout(timeout); resolve(); };
-            video.onerror = (e) => { clearTimeout(timeout); reject(e); };
+            const timeout = setTimeout(() => reject(new Error('Video load timeout')), 15000);
+            liveVid.onloadedmetadata = () => { clearTimeout(timeout); resolve(); };
+            liveVid.onerror = (e) => { clearTimeout(timeout); reject(e); };
         });
     } catch (e) {
         fallbackToQuick('Video load failed: ' + (e.message || 'unknown'));
         return;
     }
 
-    const vw = video.videoWidth;
-    const vh = video.videoHeight;
-    const duration = video.duration;
-    if (!duration || !vw || !vh) { fallbackToQuick('Invalid video'); return; }
+    const vw = liveVid.videoWidth;
+    const vh = liveVid.videoHeight;
+    if (!vw || !vh) { fallbackToQuick('Invalid video'); return; }
 
-    const fps = 2.5;
-    const interval = 1 / fps;
-    const totalFrames = Math.floor(duration * fps);
-    const batchSize = 10;
+    // Start playing video in browser
+    liveVid.play().catch(() => {});
 
-    // Start session
+    // Upload video to server and start background BoT-SORT pipeline
+    let liveJobId = null;
     try {
         const startFd = new FormData();
         startFd.append('video', selectedFile);
         startFd.append('frame_width', String(vw));
         startFd.append('frame_height', String(vh));
         startFd.append('clip_type', 'match');
-        startFd.append('fps', String(fps));
+        startFd.append('fps', '25');
+        $('liveStatusMsg').textContent = 'UPLOADING VIDEO...';
         const res = await fetch(`${API_BASE}/api/v1/stream/start`, {
             method: 'POST', body: startFd
         });
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const data = await res.json();
         liveSessionId = data.session_id;
+        liveJobId = data.job_id;
     } catch (e) {
         fallbackToQuick('Session start failed: ' + (e.message || 'unknown'));
         return;
@@ -1482,14 +1481,6 @@ async function startLiveAnalysis() {
         $('liveStatusMsg').textContent = LIVE_STATUS_MSGS[statusIdx];
     }, 8000);
 
-    // Extraction canvas (offscreen, half-res for speed)
-    const extractW = Math.min(vw, 640);
-    const extractH = Math.round(vh * (extractW / vw));
-    const extractCanvas = document.createElement('canvas');
-    extractCanvas.width = extractW;
-    extractCanvas.height = extractH;
-    const ectx = extractCanvas.getContext('2d');
-
     liveStartTime = Date.now();
     liveTimerIv = setInterval(updateLiveTimer, 1000);
     liveConfirmedCount = 0;
@@ -1499,126 +1490,140 @@ async function startLiveAnalysis() {
     liveSeenTrackIds = new Set();
     uncertainQueue = [];
 
-    // Hidden video for frame extraction
-    const extractVideo = document.createElement('video');
-    extractVideo.src = url;
-    extractVideo.muted = true;
-    extractVideo.preload = 'auto';
-    await new Promise((resolve, reject) => {
-        const t = setTimeout(() => reject(new Error('Extract video timeout')), 10000);
-        extractVideo.onloadedmetadata = () => { clearTimeout(t); resolve(); };
-        extractVideo.onerror = (e) => { clearTimeout(t); reject(e); };
-    });
+    // Set up canvas for drawing overlays
+    const liveCanvas = $('liveCanvas');
+    const lctx = liveCanvas.getContext('2d');
 
-    let frameIdx = 0;
-    let batch = [];
-    let batchIndices = [];
-    let batchTimestamps = [];
+    // Ball visibility counter
+    let ballMissingPolls = 0;
 
-    while (frameIdx < totalFrames) {
-        while (livePaused) await sleep(200);
+    // Poll for progress every 2 seconds
+    const progressIv = setInterval(async () => {
+        try {
+            const res = await fetch(`${API_BASE}/api/v1/stream/${liveSessionId}/progress`);
+            if (!res.ok) return;
+            const prog = await res.json();
 
-        const t = frameIdx * interval;
-        extractVideo.currentTime = t;
-        await new Promise(r => { extractVideo.onseeked = r; });
+            // Update progress bar
+            const total = prog.total_frames || 1;
+            const done = prog.frames_processed || 0;
+            const pct = Math.min(100, (done / total * 100)).toFixed(1);
+            $('liveProgressFill').style.width = pct + '%';
+            $('liveFrameInfo').textContent = `Frame ${done}/${total}`;
 
-        ectx.drawImage(extractVideo, 0, 0, extractW, extractH);
+            // Track count
+            const tracks = prog.tracks || [];
+            const confirmed = tracks.filter(t => t.confirmed).length;
+            $('livePlayerInfo').textContent = `${tracks.length} tracked · ${confirmed} confirmed`;
 
-        // Draw current frame to visible canvas for preview
-        const liveCanvas = $('liveCanvas');
-        liveCanvas.width = extractW;
-        liveCanvas.height = extractH;
-        const lctx = liveCanvas.getContext('2d');
-        lctx.drawImage(extractVideo, 0, 0, extractW, extractH);
+            // Draw tracking overlay on canvas
+            liveCanvas.width = liveVid.clientWidth;
+            liveCanvas.height = liveVid.clientHeight;
+            lctx.clearRect(0, 0, liveCanvas.width, liveCanvas.height);
 
-        const blob = await new Promise(r => extractCanvas.toBlob(r, 'image/jpeg', 0.6));
+            // Scale factor: server coordinates → displayed video size
+            const scaleX = liveCanvas.width / vw;
+            const scaleY = liveCanvas.height / vh;
 
-        batch.push(blob);
-        batchIndices.push(frameIdx);
-        batchTimestamps.push(parseFloat(t.toFixed(3)));
-        frameIdx++;
+            tracks.forEach(tk => {
+                if (!tk.bbox || tk.bbox.length < 4) return;
+                const x1 = tk.bbox[0] * scaleX;
+                const y1 = tk.bbox[1] * scaleY;
+                const x2 = tk.bbox[2] * scaleX;
+                const y2 = tk.bbox[3] * scaleY;
+                const w = x2 - x1;
+                const h = y2 - y1;
 
-        // Update progress bar and frame counter
-        const pct = (frameIdx / totalFrames * 100).toFixed(1);
-        $('liveProgressFill').style.width = pct + '%';
-        $('liveFrameInfo').textContent = `Frame ${frameIdx}/${totalFrames}`;
+                // Team colours
+                let color = '#9ca3af'; // grey unknown
+                if (tk.team_id === 0) color = '#3b82f6'; // blue
+                else if (tk.team_id === 1) color = '#ef4444'; // red
 
-        if (batch.length >= batchSize || frameIdx >= totalFrames) {
-            try {
-                const fd = new FormData();
-                batch.forEach(b => fd.append('frames', b, 'frame.jpg'));
-                fd.append('frame_indices', JSON.stringify(batchIndices));
-                fd.append('timestamps', JSON.stringify(batchTimestamps));
-
-                const res = await fetch(`${API_BASE}/api/v1/stream/${liveSessionId}/frames`, {
-                    method: 'POST', body: fd
-                });
-                if (!res.ok) throw new Error(`HTTP ${res.status}`);
-                const result = await res.json();
-
-                if (result.track_states) {
-                    result.track_states.forEach(tk => { liveTracks[tk.track_id] = tk; });
+                lctx.strokeStyle = color;
+                lctx.lineWidth = 2;
+                if (tk.confirmed) {
+                    lctx.setLineDash([]);
+                } else {
+                    lctx.setLineDash([4, 4]);
                 }
+                lctx.strokeRect(x1, y1, w, h);
 
-                if (result.newly_confirmed && result.newly_confirmed.length > 0) {
-                    const fresh = result.newly_confirmed.filter(u =>
-                        !liveSkippedIds.has(u.track_id) && !liveSeenTrackIds.has(u.track_id)
-                    );
-                    fresh.forEach(u => liveSeenTrackIds.add(u.track_id));
-                    if (fresh.length > 0) {
-                        uncertainQueue.push(...fresh);
-                        liveUncertainCount += fresh.length;
-                        if (fresh.length >= UNCERTAIN_BATCH_THRESHOLD || uncertainQueue.length >= UNCERTAIN_BATCH_THRESHOLD) {
-                            livePaused = true;
-                            showUncertainCards();
-                        }
-                    }
+                // Label
+                const label = `#${tk.track_id}`;
+                lctx.setLineDash([]);
+                lctx.fillStyle = color;
+                lctx.fillRect(x1, y1 - 16, lctx.measureText(label).width + 8, 16);
+                lctx.fillStyle = '#fff';
+                lctx.font = 'bold 11px Inter, sans-serif';
+                lctx.fillText(label, x1 + 4, y1 - 4);
+            });
+
+            // Draw ball
+            if (prog.ball_bbox && prog.ball_bbox.length >= 4) {
+                ballMissingPolls = 0;
+                const bx1 = prog.ball_bbox[0] * scaleX;
+                const by1 = prog.ball_bbox[1] * scaleY;
+                const bx2 = prog.ball_bbox[2] * scaleX;
+                const by2 = prog.ball_bbox[3] * scaleY;
+                const bcx = (bx1 + bx2) / 2;
+                const bcy = (by1 + by2) / 2;
+                const br = Math.max((bx2 - bx1), (by2 - by1)) / 2 + 4;
+
+                // Pulsing yellow circle
+                const pulse = 1 + 0.2 * Math.sin(Date.now() / 200);
+                lctx.beginPath();
+                lctx.arc(bcx, bcy, br * pulse, 0, Math.PI * 2);
+                lctx.strokeStyle = '#f59e0b';
+                lctx.lineWidth = 2.5;
+                lctx.setLineDash([]);
+                lctx.stroke();
+                // BALL label
+                lctx.fillStyle = '#f59e0b';
+                lctx.font = 'bold 10px Inter, sans-serif';
+                lctx.fillText('BALL', bcx - 14, bcy + br * pulse + 14);
+            } else {
+                ballMissingPolls++;
+                if (ballMissingPolls >= 5) {
+                    lctx.fillStyle = 'rgba(245, 158, 11, 0.7)';
+                    lctx.font = '12px Inter, sans-serif';
+                    lctx.fillText('Ball: not visible', 10, liveCanvas.height - 10);
                 }
-            } catch (e) {
-                console.error('Frame batch error:', e);
-                console.error('Failed to post frames:', e.message);
-                console.error('Session ID:', liveSessionId);
-                console.error('API_BASE:', API_BASE);
-                console.error('Batch size:', batch.length);
             }
-            batch = [];
-            batchIndices = [];
-            batchTimestamps = [];
+
+            // Check if tracking is done
+            if (prog.status === 'completed') {
+                clearInterval(progressIv);
+                clearInterval(liveTimerIv);
+                clearInterval(liveStatusMsgIv);
+                $('liveFrameInfo').textContent = 'GENERATING FULL REPORT...';
+                $('liveStatusMsg').textContent = '';
+                $('liveProgressFill').style.width = '100%';
+                liveVid.pause();
+
+                // Finalise — get job_id and transition to report polling
+                try {
+                    const finRes = await fetch(`${API_BASE}/api/v1/stream/${liveSessionId}/finalise`, {
+                        method: 'POST',
+                    });
+                    if (!finRes.ok) throw new Error(`HTTP ${finRes.status}`);
+                    const finData = await finRes.json();
+
+                    hide('liveSection');
+                    show('loadingSection');
+                    startTime = Date.now();
+                    $('loadingStatus').textContent = 'RUNNING FULL ANALYSIS PIPELINE...';
+                    updateTimer();
+                    timerIv = setInterval(updateTimer, 1000);
+
+                    poll(finData.job_id);
+                } catch (e) {
+                    fallbackToQuick('Finalise failed: ' + (e.message || 'unknown'));
+                }
+            }
+        } catch (e) {
+            console.error('Progress poll error:', e);
         }
-    }
-
-    // Show any remaining uncertain cards before finalising
-    if (uncertainQueue.length > 0) {
-        livePaused = true;
-        showUncertainCards();
-        while (livePaused) await sleep(200);
-    }
-
-    // Finalise
-    clearInterval(liveTimerIv);
-    clearInterval(liveStatusMsgIv);
-    $('liveFrameInfo').textContent = 'GENERATING FULL REPORT...';
-    $('liveStatusMsg').textContent = '';
-    $('liveProgressFill').style.width = '100%';
-
-    try {
-        const finRes = await fetch(`${API_BASE}/api/v1/stream/${liveSessionId}/finalise`, {
-            method: 'POST',
-        });
-        if (!finRes.ok) throw new Error(`HTTP ${finRes.status}`);
-        const finData = await finRes.json();
-
-        hide('liveSection');
-        show('loadingSection');
-        startTime = Date.now();
-        $('loadingStatus').textContent = 'RUNNING FULL ANALYSIS PIPELINE...';
-        updateTimer();
-        timerIv = setInterval(updateTimer, 1000);
-
-        poll(finData.job_id);
-    } catch (e) {
-        fallbackToQuick('Finalise failed: ' + (e.message || 'unknown'));
-    }
+    }, 2000);
 }
 
 function fallbackToQuick(reason) {

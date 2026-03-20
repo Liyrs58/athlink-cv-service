@@ -404,6 +404,7 @@ def run_tracking(
     max_frames: Optional[int] = None,
     max_track_age: int = 90,  # Frames of inactivity before eviction (in processed frame count)
     adaptive_stride: bool = True,  # FIX 2: process every frame during fast pans
+    progress_path: Optional[str] = None,  # Path to write progress.json for live streaming
 ) -> Dict[str, Any]:
     """Run BoT-SORT object tracking on video frames with camera motion compensation."""
     model = _get_model()
@@ -437,6 +438,9 @@ def run_tracking(
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         raise ValueError(f"Could not reopen video: {video_path}")
+
+    # Estimate total frames for progress reporting
+    _total_frames_est = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
 
     output_dir = Path(f"temp/{job_id}/tracking")
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1022,6 +1026,39 @@ def run_tracking(
             "ball_source": next((bt.get("source") for bt in ball_trajectory if bt.get("frameIndex") == current_frame_idx), None),
         })
 
+        # Write progress for live streaming (every 10 processed frames)
+        if progress_path and processed_count % 10 == 0:
+            _progress_tracks = []
+            for _tid, _trk in active_tracks.items():
+                if _trk["trajectory"]:
+                    _last = _trk["trajectory"][-1]
+                    _progress_tracks.append({
+                        "track_id": _tid,
+                        "team_id": _trk.get("teamId", -1),
+                        "bbox": _last["bbox"],
+                        "confirmed": (_trk.get("_confirmed_detections", 0) or 0) >= 3,
+                        "frame_index": _last.get("frameIndex", current_frame_idx),
+                    })
+            # Find latest ball detection
+            _ball_bbox = None
+            if ball_trajectory:
+                _last_ball = ball_trajectory[-1]
+                if _last_ball.get("source") == "yolo":
+                    _ball_bbox = _last_ball.get("bbox")
+            _progress_data = {
+                "frames_processed": raw_frame_idx,
+                "total_frames": _total_frames_est,
+                "tracks": _progress_tracks,
+                "ball_bbox": _ball_bbox,
+                "status": "processing",
+            }
+            try:
+                import json as _json
+                with open(progress_path, "w") as _pf:
+                    _json.dump(_progress_data, _pf)
+            except Exception:
+                pass
+
         # FIX 2: Handle scene cut — aggressively reset tracks
         if scene_cut_flag:
             # On scene cut, drastically reduce track lifetimes
@@ -1275,6 +1312,15 @@ def run_tracking(
     results_file = output_dir / "track_results.json"
     with open(results_file, "w") as f:
         json.dump(results_data, f, indent=2)
+
+    # Write final progress (completed)
+    if progress_path:
+        try:
+            import json as _json
+            with open(progress_path, "w") as _pf:
+                _json.dump({"frames_processed": _total_frames_est, "total_frames": _total_frames_est, "tracks": [], "ball_bbox": None, "status": "completed"}, _pf)
+        except Exception:
+            pass
 
     logger.info(f"Tracking complete: {len(filtered)} tracks saved to {results_file}")
     return results_data

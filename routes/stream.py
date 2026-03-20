@@ -1,19 +1,21 @@
 """
-Frame Shuttle API — live streaming analysis.
-Per-session Tracker instances. Real pipeline on finalise.
+Live streaming analysis — server-side BoT-SORT with progress polling.
+
+Architecture:
+  POST /stream/start        → upload video, start background BoT-SORT pipeline
+  GET  /stream/{id}/progress → poll current tracking progress (reads progress.json)
+  POST /stream/{id}/confirm  → coach confirms a player identity
+  POST /stream/{id}/finalise → wait for pipeline, return job_id for full report
 """
 
 from fastapi import APIRouter, UploadFile, File, Form
 from fastapi.responses import JSONResponse
-from typing import List
-import numpy as np
-import cv2
 import json
 import uuid
 import time
+import os
 import logging
 
-from services.stream_tracker_service import Tracker
 from services.job_queue_service import create_job, submit_job
 
 logger = logging.getLogger(__name__)
@@ -36,14 +38,14 @@ def _clean_stale_sessions():
 @router.post("/stream/start")
 async def stream_start(
     video: UploadFile = File(...),
-    frame_width: int = Form(...),
-    frame_height: int = Form(...),
+    frame_width: int = Form(0),
+    frame_height: int = Form(0),
     clip_type: str = Form(default="match"),
     fps: float = Form(default=25.0),
 ):
     """
-    Start a new streaming session.
-    Saves video to disk. Creates per-session Tracker.
+    Start a live streaming session.
+    Saves video, starts background BoT-SORT pipeline, returns session_id immediately.
     """
     try:
         _clean_stale_sessions()
@@ -55,94 +57,93 @@ async def stream_start(
         with open(video_path, "wb") as f:
             f.write(content)
 
-        # Create per-session tracker
-        tracker = Tracker(frame_width, frame_height, fps)
-        tracker.load_model()
+        # Progress file — tracking_service writes to this every 10 frames
+        progress_path = f"/tmp/{session_id}_progress.json"
+
+        # Write initial progress
+        with open(progress_path, "w") as f:
+            json.dump({
+                "frames_processed": 0,
+                "total_frames": 0,
+                "tracks": [],
+                "ball_bbox": None,
+                "status": "starting",
+            }, f)
+
+        # Create job for the full pipeline
+        job_id = str(uuid.uuid4())[:8]
+        create_job(job_id)
 
         SESSIONS[session_id] = {
             "session_id": session_id,
             "created_at": time.time(),
             "video_path": video_path,
-            "frame_width": frame_width,
-            "frame_height": frame_height,
+            "progress_path": progress_path,
+            "job_id": job_id,
             "clip_type": clip_type,
-            "fps": fps,
-            "frames_processed": 0,
             "confirmed_ids": {},
-            "tracker": tracker,
+            "status": "processing",
         }
+
+        # Start the REAL analysis pipeline in background
+        from routes.analyse import _run_analysis_pipeline
+        submit_job(
+            job_id,
+            _run_analysis_pipeline,
+            job_id,
+            video_path,
+            progress_path=progress_path,
+        )
 
         return JSONResponse({
             "session_id": session_id,
-            "status": "ready",
+            "job_id": job_id,
+            "status": "processing",
             "clip_type": clip_type,
         })
     except Exception as e:
         logger.error("stream_start failed: %s", e)
-        return JSONResponse({"error": str(e)})
+        return JSONResponse({"error": str(e)}, status_code=500)
 
 
-@router.post("/stream/{session_id}/frames")
-async def stream_frames(
-    session_id: str,
-    frames: List[UploadFile] = File(...),
-    frame_indices: str = Form(...),
-    timestamps: str = Form(...),
-):
-    """Process a batch of frames via BoT-SORT tracker."""
+@router.get("/stream/{session_id}/progress")
+async def stream_progress(session_id: str):
+    """
+    Poll current tracking progress.
+    Reads progress.json written by tracking_service every 10 frames.
+    """
     try:
-        _clean_stale_sessions()
         session = SESSIONS.get(session_id)
         if not session:
-            return JSONResponse({"error": "session not found"})
+            return JSONResponse({"error": "session not found"}, status_code=404)
 
-        t_start = time.time()
+        progress_path = session["progress_path"]
+        if not os.path.exists(progress_path):
+            return JSONResponse({
+                "frames_processed": 0,
+                "total_frames": 0,
+                "tracks": [],
+                "ball_bbox": None,
+                "status": "starting",
+            })
 
         try:
-            indices = json.loads(frame_indices)
-        except Exception:
-            indices = list(range(len(frames)))
-        try:
-            ts_list = json.loads(timestamps)
-        except Exception:
-            ts_list = [0.0] * len(frames)
+            with open(progress_path, "r") as f:
+                progress = json.load(f)
+        except (json.JSONDecodeError, IOError):
+            # File is being written to — return last known state
+            return JSONResponse({
+                "frames_processed": 0,
+                "total_frames": 0,
+                "tracks": [],
+                "ball_bbox": None,
+                "status": "processing",
+            })
 
-        # Decode frames
-        np_frames = []
-        for f in frames:
-            data = await f.read()
-            arr = np.frombuffer(data, dtype=np.uint8)
-            img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-            if img is not None:
-                np_frames.append(img)
-            else:
-                np_frames.append(
-                    np.zeros((100, 100, 3), dtype=np.uint8)
-                )
-
-        tracker = session["tracker"]
-        result = tracker.process_batch(
-            np_frames,
-            indices,
-            ts_list,
-            session["confirmed_ids"],
-        )
-        session["frames_processed"] += len(np_frames)
-
-        return JSONResponse({
-            "session_id": session_id,
-            "frames_processed": session["frames_processed"],
-            "track_states": result["track_states"],
-            "newly_confirmed": result["newly_confirmed"],
-            "tracks_total": result["tracks_total"],
-            "tracks_confirmed": result["tracks_confirmed"],
-            "processing_ms": int(
-                (time.time() - t_start) * 1000
-            ),
-        })
+        return JSONResponse(progress)
     except Exception as e:
-        logger.error("stream_frames failed: %s", e)
-        return JSONResponse({"error": str(e)})
+        logger.error("stream_progress failed: %s", e)
+        return JSONResponse({"error": str(e)}, status_code=500)
 
 
 @router.post("/stream/{session_id}/confirm")
@@ -157,7 +158,7 @@ async def stream_confirm(
     try:
         session = SESSIONS.get(session_id)
         if not session:
-            return JSONResponse({"error": "session not found"})
+            return JSONResponse({"error": "session not found"}, status_code=404)
 
         if jersey_number:
             label = f"#{jersey_number}"
@@ -169,70 +170,39 @@ async def stream_confirm(
             label = f"Player {track_id}"
 
         session["confirmed_ids"][track_id] = label
-        tracker = session["tracker"]
-        if track_id in tracker._meta:
-            tracker._meta[track_id]["coach_confirmed"] = True
-            tracker._meta[track_id]["coach_label"] = label
-            tracker._meta[track_id]["state"] = "confirmed"
-            tracker._meta[track_id]["surfaced_to_ui"] = True
-
-        merged = tracker.incremental_reid_patch(
-            track_id, label
-        )
 
         return JSONResponse({
             "track_id": track_id,
             "confirmed_label": label,
-            "tracks_merged": merged,
             "status": "confirmed",
         })
     except Exception as e:
         logger.error("stream_confirm failed: %s", e)
-        return JSONResponse({"error": str(e)})
+        return JSONResponse({"error": str(e)}, status_code=500)
 
 
 @router.post("/stream/{session_id}/finalise")
 async def stream_finalise(session_id: str):
     """
-    Trigger REAL full analysis pipeline.
-    No fake output. No pixel math. No manual job status setting.
-    Real pipeline. Real report.
+    Return the job_id for the background pipeline.
+    Frontend polls /api/v1/jobs/status/{job_id} as normal.
     """
     try:
         session = SESSIONS.get(session_id)
         if not session:
-            return JSONResponse({"error": "session not found"})
+            return JSONResponse({"error": "session not found"}, status_code=404)
 
-        video_path = session["video_path"]
-        tracker = session["tracker"]
-        confirmed_labels = tracker.get_confirmed_labels()
-        summary = tracker.get_track_summary()
-
-        job_id = str(uuid.uuid4())[:8]
-        create_job(job_id)
-
-        from routes.analyse import _run_analysis_pipeline
-        submit_job(
-            job_id,
-            _run_analysis_pipeline,
-            job_id,
-            video_path,
-            pre_confirmed_labels=confirmed_labels,
-        )
+        job_id = session["job_id"]
 
         return JSONResponse({
             "job_id": job_id,
             "session_id": session_id,
-            "tracks_confirmed": summary["confirmed"],
-            "tracks_total": summary["total"],
             "poll_url": f"/api/v1/jobs/status/{job_id}",
-            "message": (
-                "Full analysis running. Poll for results."
-            ),
+            "message": "Full analysis running. Poll for results.",
         })
     except Exception as e:
         logger.error("stream_finalise failed: %s", e)
-        return JSONResponse({"error": str(e)})
+        return JSONResponse({"error": str(e)}, status_code=500)
 
 
 @router.get("/stream/{session_id}/status")
@@ -241,16 +211,13 @@ async def stream_status(session_id: str):
     try:
         session = SESSIONS.get(session_id)
         if not session:
-            return JSONResponse({"error": "session not found"})
-        summary = session["tracker"].get_track_summary()
+            return JSONResponse({"error": "session not found"}, status_code=404)
         return JSONResponse({
             "session_id": session_id,
-            "frames_processed": session["frames_processed"],
+            "job_id": session["job_id"],
             "clip_type": session["clip_type"],
-            "uptime_seconds": int(
-                time.time() - session["created_at"]
-            ),
-            **summary,
+            "status": session["status"],
+            "uptime_seconds": int(time.time() - session["created_at"]),
         })
     except Exception as e:
-        return JSONResponse({"error": str(e)})
+        return JSONResponse({"error": str(e)}, status_code=500)
