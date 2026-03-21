@@ -11,7 +11,7 @@ from services.pitch_service import _estimate_homography, validate_homography, _t
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-MODEL_PATH = os.getenv("YOLO_MODEL_PATH", "yolov8s.pt")
+MODEL_PATH = os.getenv("YOLO_MODEL_PATH", "yolo11n.pt")
 CONFIDENCE_THRESHOLD = float(os.getenv("YOLO_CONF", "0.25"))
 IOU_THRESHOLD = float(os.getenv("YOLO_IOU", "0.45"))
 TARGET_CLASSES = [0]
