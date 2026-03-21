@@ -455,8 +455,35 @@
         }
         @keyframes uc-fade-in { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
         .uc-crop {
-            width: 56px; height: 72px; border-radius: 6px;
+            width: 120px; height: 160px; border-radius: 6px;
             background: var(--border); object-fit: cover; flex-shrink: 0;
+            transition: transform 0.2s; transform-origin: top left;
+            cursor: zoom-in;
+        }
+        .uc-crop.zoomed {
+            transform: scale(2);
+            cursor: zoom-out;
+            z-index: 10;
+            position: relative;
+        }
+        .uc-zoom-btn {
+            background: rgba(0,0,0,0.5); color: var(--muted); border: 1px solid var(--border);
+            padding: 3px 8px; border-radius: 4px; font-size: 10px; cursor: pointer;
+            font-family: 'Rajdhani', sans-serif; font-weight: 600; letter-spacing: 1px;
+            text-transform: uppercase; margin-top: 4px; display: block; width: 120px;
+            text-align: center;
+        }
+        .uc-jersey-prompt { font-size: 12px; color: var(--muted); margin-bottom: 6px; font-family: 'Inter', sans-serif; }
+        .uc-yn-btns { display: flex; gap: 6px; margin-bottom: 8px; }
+        .uc-yn-yes {
+            background: rgba(0,212,170,0.15); color: var(--teal); border: 1px solid rgba(0,212,170,0.3);
+            padding: 4px 10px; border-radius: 5px; font-size: 11px; font-weight: 600; cursor: pointer;
+            font-family: 'Rajdhani', sans-serif; letter-spacing: 1px; text-transform: uppercase;
+        }
+        .uc-yn-no {
+            background: rgba(107,114,128,0.15); color: var(--muted); border: 1px solid var(--border);
+            padding: 4px 10px; border-radius: 5px; font-size: 11px; font-weight: 600; cursor: pointer;
+            font-family: 'Rajdhani', sans-serif; letter-spacing: 1px; text-transform: uppercase;
         }
         .uc-info { flex: 1; }
         .uc-title { font-family: 'Rajdhani', sans-serif; font-size: 14px; font-weight: 700; letter-spacing: 1px; text-transform: uppercase; color: var(--warning); margin-bottom: 6px; }
@@ -1388,6 +1415,8 @@ let liveStartTime = null;
 let liveTimerIv = null;
 let liveSkippedIds = new Set();
 let liveSeenTrackIds = new Set();
+let jerseyMap = {};
+let shownTrackIds = new Set();
 let uncertainQueue = [];
 let liveStatusMsgIv = null;
 const MAX_VISIBLE_CARDS = 3;
@@ -1488,6 +1517,8 @@ async function startLiveAnalysis() {
     liveTracks = {};
     liveSkippedIds = new Set();
     liveSeenTrackIds = new Set();
+    jerseyMap = {};
+    shownTrackIds = new Set();
     uncertainQueue = [];
 
     // Set up canvas for drawing overlays
@@ -1548,14 +1579,25 @@ async function startLiveAnalysis() {
                 }
                 lctx.strokeRect(x1, y1, w, h);
 
-                // Label
-                const label = `#${tk.track_id}`;
+                // Label — use teal jersey label if coach has confirmed this track
                 lctx.setLineDash([]);
-                lctx.fillStyle = color;
-                lctx.fillRect(x1, y1 - 16, lctx.measureText(label).width + 8, 16);
-                lctx.fillStyle = '#fff';
-                lctx.font = 'bold 11px Inter, sans-serif';
-                lctx.fillText(label, x1 + 4, y1 - 4);
+                const jerseyLabel = jerseyMap[tk.track_id];
+                if (jerseyLabel) {
+                    // Teal, bold, larger font for labelled players
+                    lctx.font = 'bold 13px Inter, sans-serif';
+                    const lw = lctx.measureText(jerseyLabel).width + 10;
+                    lctx.fillStyle = '#00d4aa';
+                    lctx.fillRect(x1, y1 - 18, lw, 18);
+                    lctx.fillStyle = '#000';
+                    lctx.fillText(jerseyLabel, x1 + 5, y1 - 4);
+                } else {
+                    const label = `#${tk.track_id}`;
+                    lctx.font = 'bold 11px Inter, sans-serif';
+                    lctx.fillStyle = color;
+                    lctx.fillRect(x1, y1 - 16, lctx.measureText(label).width + 8, 16);
+                    lctx.fillStyle = '#fff';
+                    lctx.fillText(label, x1 + 4, y1 - 4);
+                }
             });
 
             // Draw ball
@@ -1588,6 +1630,21 @@ async function startLiveAnalysis() {
                     lctx.font = '12px Inter, sans-serif';
                     lctx.fillText('Ball: not visible', 10, liveCanvas.height - 10);
                 }
+            }
+
+            // Auto-trigger uncertain cards for new confirmed tracks (first 10 only)
+            tracks.forEach(tk => {
+                if (tk.confirmed && !shownTrackIds.has(tk.track_id) && shownTrackIds.size < 10) {
+                    shownTrackIds.add(tk.track_id);
+                    uncertainQueue.push({
+                        track_id: tk.track_id,
+                        team_colour: tk.team_id,
+                        crop_b64: null,
+                    });
+                }
+            });
+            if (uncertainQueue.length > 0 && $('uncertainStack').children.length === 0) {
+                showUncertainCards();
             }
 
             // Check if tracking is done
@@ -1658,16 +1715,31 @@ function showUncertainCards() {
         card.className = 'uncertain-card';
         card.dataset.trackId = u.track_id;
 
-        // crop_b64 is the field name from the API
         const cropSrc = u.crop_b64 ? `data:image/jpeg;base64,${u.crop_b64}` : '';
         const teamLabel = u.team_colour === 0 ? 'Blue' : u.team_colour === 1 ? 'Red' : 'Unknown';
 
         card.innerHTML = `
-            ${cropSrc ? `<img class="uc-crop" src="${cropSrc}" alt="player crop">` : '<div class="uc-crop"></div>'}
+            <div style="flex-shrink:0">
+                ${cropSrc
+                    ? `<img class="uc-crop" id="ucCrop_${u.track_id}" src="${cropSrc}" alt="player crop"
+                           onclick="this.classList.toggle('zoomed');document.getElementById('ucZoomBtn_${u.track_id}').textContent=this.classList.contains('zoomed')?'- 1x':'+ 2x ZOOM'">`
+                    : `<div class="uc-crop" style="display:flex;align-items:center;justify-content:center;color:var(--muted);font-size:11px">No crop</div>`
+                }
+                ${cropSrc
+                    ? `<button class="uc-zoom-btn" id="ucZoomBtn_${u.track_id}"
+                           onclick="const img=document.getElementById('ucCrop_${u.track_id}');img.classList.toggle('zoomed');this.textContent=img.classList.contains('zoomed')?'- 1x':'+ 2x ZOOM'">+ 2x ZOOM</button>`
+                    : ''
+                }
+            </div>
             <div class="uc-info">
-                <div class="uc-title">New player detected</div>
+                <div class="uc-title">Track #${u.track_id} detected</div>
                 <div class="uc-team">Team: ${esc(teamLabel)}</div>
-                <div class="uc-fields">
+                <div class="uc-jersey-prompt">Can you see a jersey number?</div>
+                <div class="uc-yn-btns">
+                    <button class="uc-yn-yes" onclick="document.getElementById('ucJerseyFields_${u.track_id}').style.display='flex'">YES — type it above</button>
+                    <button class="uc-yn-no" onclick="skipUncertain(${u.track_id}, this)">NO — skip</button>
+                </div>
+                <div class="uc-fields" id="ucJerseyFields_${u.track_id}" style="display:none">
                     <input type="text" placeholder="Jersey #" class="uc-jersey" maxlength="3">
                     <input type="text" placeholder="Player name" class="uc-name">
                 </div>
@@ -1680,7 +1752,7 @@ function showUncertainCards() {
         `;
         stack.appendChild(card);
 
-        // 15s auto-skip (was 30s, too long)
+        // 15s auto-skip
         const fill = card.querySelector('.uc-timer-fill');
         let elapsed = 0;
         const tmr = setInterval(() => {
@@ -1713,6 +1785,13 @@ async function confirmUncertain(trackId, btn) {
             method: 'POST', body: fd
         });
     } catch (e) { /* continue anyway */ }
+
+    // Store in jerseyMap for teal canvas labels
+    if (jersey) {
+        jerseyMap[trackId] = `#${jersey}`;
+    } else if (name) {
+        jerseyMap[trackId] = name;
+    }
 
     if (liveTracks[trackId]) {
         liveTracks[trackId].coach_confirmed = true;
