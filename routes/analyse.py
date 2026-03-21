@@ -20,6 +20,7 @@ from services.confidence_service import (
     build_data_confidence_summary,
 )
 from services.job_queue_service import create_job, submit_job
+from services.runpod_service import is_runpod_available, run_on_runpod
 from services.observer_brain import ObserverBrain
 from services.fatigue_clock_service import FatigueClock
 from services.voronoi_service import compute_voronoi_control
@@ -147,6 +148,16 @@ def infer_position(positions: list, frame_h: int, team_id: int) -> str:
 def _run_analysis_pipeline(job_id: str, temp_path: str, skip_cleanup: bool = False, validate: bool = False, pre_confirmed_labels: dict = None, progress_path: str = None):
     """Background task — runs the full analysis pipeline."""
     try:
+        # If RunPod GPU is available, offload processing there
+        if is_runpod_available():
+            try:
+                logger.info(f"Routing job {job_id} to RunPod GPU")
+                result = run_on_runpod(temp_path, job_id)
+                return result
+            except Exception as e:
+                logger.error(f"RunPod failed, falling back to local: {e}")
+                # Fall through to local pipeline
+
         # Pitch calibration
         calibration = get_frame_calibration(temp_path)
 
