@@ -919,27 +919,74 @@ def run_tracking(
 
         prev_active_ids = current_active_ids
 
-        # --- Ball detection with Kalman prediction ---
+        # --- Ball detection with Roboflow dedicated model ---
         ball_detected = False
-        ball_results = model(frame, verbose=False, conf=0.15, classes=[32], half=_use_half)
-        if ball_results[0].boxes is not None and len(ball_results[0].boxes) > 0:
-            ball_boxes = ball_results[0].boxes.xyxy.cpu().tolist()
-            ball_confs = ball_results[0].boxes.conf.cpu().tolist()
-            best_idx = int(np.argmax(ball_confs))
-            bx1, by1, bx2, by2 = ball_boxes[best_idx]
-            cx = (bx1 + bx2) / 2.0
-            cy = (by1 + by2) / 2.0
-            # Update Kalman filter with YOLO detection
-            cx, cy = ball_tracker.update(cx, cy)
-            ball_trajectory.append({
-                "frameIndex": current_frame_idx,
-                "x": cx,
-                "y": cy,
-                "bbox": [bx1, by1, bx2, by2],
-                "confidence": float(ball_confs[best_idx]),
-                "source": "yolo",
-            })
-            ball_detected = True
+        try:
+            import requests as _requests
+            import base64 as _base64
+            import os as _os
+
+            _rf_key = _os.environ.get("ROBOFLOW_API_KEY", "uS7ciF51wtr6QxlZrXGJ")
+            _, _buf = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+            _b64 = _base64.b64encode(_buf.tobytes()).decode('utf-8')
+
+            _resp = _requests.post(
+                'https://detect.roboflow.com/footballs-1trlz/3',
+                params={'api_key': _rf_key},
+                data=_b64,
+                headers={'Content-Type': 'application/x-www-form-urlencoded'},
+                timeout=2.0
+            )
+
+            if _resp.status_code == 200:
+                _rf_data = _resp.json()
+                _preds = _rf_data.get('predictions', [])
+                if _preds:
+                    _best = max(_preds, key=lambda p: p.get('confidence', 0))
+                    _cx = _best['x']
+                    _cy = _best['y']
+                    _w = _best['width']
+                    _h = _best['height']
+                    _bx1 = _cx - _w/2
+                    _by1 = _cy - _h/2
+                    _bx2 = _cx + _w/2
+                    _by2 = _cy + _h/2
+                    _cx, _cy = ball_tracker.update(_cx, _cy)
+                    ball_trajectory.append({
+                        "frameIndex": current_frame_idx,
+                        "x": _cx,
+                        "y": _cy,
+                        "bbox": [_bx1, _by1, _bx2, _by2],
+                        "confidence": float(_best.get('confidence', 0)),
+                        "source": "roboflow",
+                    })
+                    ball_detected = True
+        except Exception as _ball_err:
+            pass
+
+        # Fallback to YOLO if Roboflow failed
+        if not ball_detected:
+            try:
+                ball_results = model(frame, verbose=False, conf=0.15, classes=[32], half=_use_half)
+                if ball_results[0].boxes is not None and len(ball_results[0].boxes) > 0:
+                    ball_boxes = ball_results[0].boxes.xyxy.cpu().tolist()
+                    ball_confs = ball_results[0].boxes.conf.cpu().tolist()
+                    best_idx = int(np.argmax(ball_confs))
+                    bx1, by1, bx2, by2 = ball_boxes[best_idx]
+                    cx = (bx1 + bx2) / 2.0
+                    cy = (by1 + by2) / 2.0
+                    cx, cy = ball_tracker.update(cx, cy)
+                    ball_trajectory.append({
+                        "frameIndex": current_frame_idx,
+                        "x": cx,
+                        "y": cy,
+                        "bbox": [bx1, by1, bx2, by2],
+                        "confidence": float(ball_confs[best_idx]),
+                        "source": "yolo_fallback",
+                    })
+                    ball_detected = True
+            except Exception:
+                pass
 
         # If YOLO did not detect ball, use Kalman prediction + Hough circles
         if not ball_detected:
