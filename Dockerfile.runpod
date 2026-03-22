@@ -8,9 +8,25 @@ RUN apt-get update -y && \
 
 WORKDIR /app
 
-# Copy requirements and install
-COPY requirements.txt .
-RUN pip3 install --no-cache-dir -r requirements.txt
+# Record pre-installed torch version BEFORE pip install
+RUN python3 -c "import torch; print('PRE-INSTALL torch:', torch.__version__, 'CUDA:', torch.cuda.is_available())" || true
+
+# Install Python deps — use RunPod-specific requirements that exclude
+# packages which would overwrite GPU torch with CPU torch
+COPY requirements-runpod.txt .
+RUN pip3 install --no-cache-dir -r requirements-runpod.txt
+
+# Verify torch CUDA wasn't broken by pip install
+RUN python3 -c "\
+import sys; \
+print('Python:', sys.version); \
+import torch; \
+print('torch:', torch.__version__, 'CUDA:', torch.cuda.is_available()); \
+assert torch.cuda.is_available(), 'CUDA not available — pip install broke GPU torch!'; \
+import cv2; print('cv2:', cv2.__version__); \
+from ultralytics import YOLO; print('ultralytics OK'); \
+import numpy; print('numpy:', numpy.__version__); \
+print('ALL IMPORTS OK — CUDA VERIFIED')"
 
 # Copy application code
 COPY . .
