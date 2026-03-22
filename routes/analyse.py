@@ -145,8 +145,20 @@ def infer_position(positions: list, frame_h: int, team_id: int) -> str:
     except Exception:
         return "Unknown"
 
+def _get_video_duration(path: str) -> float:
+    """Return video duration in seconds, or 0 on error."""
+    try:
+        cap = cv2.VideoCapture(path)
+        fps = cap.get(cv2.CAP_PROP_FPS) or 25
+        frames = cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0
+        cap.release()
+        return frames / fps
+    except Exception:
+        return 0
+
 def _run_on_runpod_wrapper(job_id: str, temp_path: str, skip_cleanup: bool = False, validate: bool = False):
-    """Try RunPod GPU processing; fall back to local CPU on failure."""
+    """Try RunPod GPU processing. Only fall back to local for videos under 60s."""
+    duration = _get_video_duration(temp_path)
     try:
         result = run_on_runpod(temp_path, job_id)
         logger.info("RunPod completed job %s successfully", job_id)
@@ -154,7 +166,14 @@ def _run_on_runpod_wrapper(job_id: str, temp_path: str, skip_cleanup: bool = Fal
             os.remove(temp_path)
         return result
     except Exception as e:
-        logger.warning("RunPod failed for job %s: %s — falling back to local", job_id, e)
+        error_msg = str(e)
+        # Do not fall back if RunPod itself failed — that's a real error
+        if "RunPod job failed" in error_msg or "RunPod error" in error_msg:
+            raise
+        # Do not fall back for long videos — CPU fallback is unusable
+        if duration > 60:
+            raise Exception(f"RunPod unavailable for job {job_id} ({duration:.0f}s video). Not falling back to CPU. Error: {error_msg}")
+        logger.warning("RunPod network/timeout failure for short job %s (%.0fs) — falling back to local. Error: %s", job_id, duration, error_msg)
         return _run_analysis_pipeline(job_id, temp_path, skip_cleanup=skip_cleanup, validate=validate)
 
 

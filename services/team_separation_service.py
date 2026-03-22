@@ -285,6 +285,15 @@ def cluster_teams(tracks: List[dict], video_path: str) -> Dict:
             track["teamId"] = -1
             continue
 
+        # Filter out tracks that spend most of their time near frame edges (touchline staff/crowd)
+        y_positions = [pt.get("y", 0.5) for pt in traj if isinstance(pt, dict)]
+        if y_positions:
+            avg_y = sum(y_positions) / len(y_positions)
+            # Exclude tracks in top 12% or bottom 12% of frame (sideline/crowd area)
+            if avg_y < 0.12 or avg_y > 0.88:
+                track["teamId"] = -1
+                continue
+
         confirmed_indices.append(track_idx)
 
         # Sample up to SAMPLES_PER_TRACK evenly-spaced trajectory points
@@ -354,7 +363,7 @@ def cluster_teams(tracks: List[dict], video_path: str) -> Dict:
         _mark_all_unknown(tracks)
         return _failed_result()
 
-    # ── K-means (k=2) ────────────────────────────────────────────────────
+    # ── K-means clustering ────────────────────────────────────────────────────
     clustering_indices = list(feature_vectors.keys())
     data = np.array([feature_vectors[i] for i in clustering_indices])
 
@@ -362,10 +371,32 @@ def cluster_teams(tracks: List[dict], video_path: str) -> Dict:
     weights = np.array([2.0, 1.5, 0.5])
     data_w = data * weights
 
-    labels, centroids_w = _kmeans(data_w, k=2)
+    n_tracks = len(clustering_indices)
+    if n_tracks >= 6:
+        # Use 3 clusters: two teams + referee/other
+        labels3, centroids3 = _kmeans(data_w, k=3)
 
-    for i, track_idx in enumerate(clustering_indices):
-        tracks[track_idx]["teamId"] = int(labels[i])
+        # Count cluster sizes
+        from collections import Counter
+        cluster_counts = Counter(labels3)
+
+        # The smallest cluster is referees/staff — mark as -1
+        smallest_cluster = min(cluster_counts, key=cluster_counts.get)
+
+        # The two largest clusters are the teams
+        team_clusters = [c for c in cluster_counts if c != smallest_cluster]
+        team_map = {team_clusters[0]: 0, team_clusters[1]: 1, smallest_cluster: -1}
+
+        for i, track_idx in enumerate(clustering_indices):
+            tracks[track_idx]["teamId"] = team_map[int(labels3[i])]
+
+        logger.info("3-cluster separation: cluster sizes %s, referee cluster=%d",
+                    dict(cluster_counts), smallest_cluster)
+    else:
+        # Too few tracks for 3-cluster, fall back to 2
+        labels, centroids_w = _kmeans(data_w, k=2)
+        for i, track_idx in enumerate(clustering_indices):
+            tracks[track_idx]["teamId"] = int(labels[i])
 
     # Assign unclustered confirmed tracks to nearest centroid
     clustered_set = set(clustering_indices)
@@ -418,6 +449,14 @@ def cluster_teams(tracks: List[dict], video_path: str) -> Dict:
         t0_count, t0_name, *t0_hsv,
         t1_count, t1_name, *t1_hsv,
     )
+
+    # Log team counts and detect imbalance
+    other_count = sum(1 for t in tracks if t.get("teamId") == -1)
+    logger.info("Team counts: team_0=%d, team_1=%d, unassigned=%d", t0_count, t1_count, other_count)
+    if t0_count > 0 and t1_count > 0:
+        ratio = max(t0_count, t1_count) / min(t0_count, t1_count)
+        if ratio > 2.5:
+            logger.warning("Team separation imbalanced (ratio=%.1f) — referee or staff may be misclustered", ratio)
 
     return {
         "status": "ok",
