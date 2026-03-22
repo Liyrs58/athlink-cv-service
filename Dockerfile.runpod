@@ -17,7 +17,13 @@ RUN pip install --no-cache-dir $(grep -v ultralytics requirements-runpod.txt | g
 
 # Install ultralytics WITHOUT its torch dependency — keep the base image's GPU torch
 RUN pip install --no-cache-dir --no-deps ultralytics && \
-    pip install --no-cache-dir py-cpuinfo thop scipy matplotlib tqdm pyyaml seaborn psutil
+    pip install --no-cache-dir py-cpuinfo thop scipy matplotlib tqdm pyyaml seaborn psutil pandas
+
+# Pre-cache YOLOv5 repo so it never downloads at runtime (~200MB saved per job)
+RUN python3 -c "\
+import torch; \
+torch.hub.load('ultralytics/yolov5', 'yolov5s', trust_repo=True, verbose=False); \
+print('YOLOv5 cached OK')"
 
 # Final verification: all critical imports work
 RUN python3 -c "\
