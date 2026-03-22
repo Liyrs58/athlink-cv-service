@@ -23,7 +23,7 @@ def run_on_runpod(video_path: str, job_id: str) -> dict:
 
     # Send URL to RunPod (not the video itself)
     resp = requests.post(
-        f"https://api.runpod.io/v2/{RUNPOD_ENDPOINT_ID}/run",
+        f"https://api.runpod.ai/v2/{RUNPOD_ENDPOINT_ID}/run",
         headers={"Authorization": f"Bearer {RUNPOD_API_KEY}", "Content-Type": "application/json"},
         json={"input": {"video_url": video_url, "filename": os.path.basename(video_path), "job_id": job_id}},
         timeout=60,
@@ -35,7 +35,7 @@ def run_on_runpod(video_path: str, job_id: str) -> dict:
     for _ in range(200):
         time.sleep(5)
         status_resp = requests.get(
-            f"https://api.runpod.io/v2/{RUNPOD_ENDPOINT_ID}/status/{runpod_job_id}",
+            f"https://api.runpod.ai/v2/{RUNPOD_ENDPOINT_ID}/status/{runpod_job_id}",
             headers={"Authorization": f"Bearer {RUNPOD_API_KEY}"},
             timeout=30,
         )

@@ -18,9 +18,10 @@ def _get_client():
     if _client is not None:
         return _client
     url = os.environ.get("SUPABASE_URL")
-    key = os.environ.get("SUPABASE_KEY")
+    # Prefer service-role key (bypasses RLS); fall back to anon key
+    key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or os.environ.get("SUPABASE_KEY")
     if not url or not key:
-        logger.warning("SUPABASE_URL or SUPABASE_KEY not set — storage disabled")
+        logger.warning("SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY not set — storage disabled")
         return None
     from supabase import create_client
     _client = create_client(url, key)
