@@ -5,7 +5,10 @@ RUNPOD_API_KEY = os.environ.get("RUNPOD_API_KEY", "")
 RUNPOD_ENDPOINT_ID = os.environ.get("RUNPOD_ENDPOINT_ID", "1qpoq5tzl69dri")
 
 def is_runpod_available():
-    return bool(RUNPOD_API_KEY and RUNPOD_ENDPOINT_ID)
+    available = bool(RUNPOD_API_KEY and RUNPOD_ENDPOINT_ID)
+    logger.info("RunPod check: API_KEY=%s, ENDPOINT=%s, available=%s",
+                bool(RUNPOD_API_KEY), bool(RUNPOD_ENDPOINT_ID), available)
+    return available
 
 def run_on_runpod(video_path: str, job_id: str) -> dict:
     with open(video_path, "rb") as f:
