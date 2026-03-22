@@ -66,5 +66,16 @@ def handler(job):
         logger.error(f"[JOB {job_id_str}] Handler error: {error_traceback}")
         return {"error": str(e), "traceback": error_traceback}
 
+# Pre-check: verify critical imports work before starting handler
+try:
+    logger.info("Pre-checking imports...")
+    import cv2
+    logger.info("cv2 OK: %s", cv2.__version__)
+    from routes.analyse import _run_analysis_pipeline
+    logger.info("_run_analysis_pipeline imported OK")
+except Exception as e:
+    logger.error("FATAL: Import pre-check failed: %s", traceback.format_exc())
+    # Don't exit — let RunPod start so it can report errors via the handler
+
 logger.info("Starting RunPod serverless handler...")
 runpod.serverless.start({"handler": handler})

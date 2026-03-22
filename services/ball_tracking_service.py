@@ -6,7 +6,6 @@ Provides: BallTracker, PossessionDetector, PassDetector
 """
 
 import os
-import torch
 import cv2
 import numpy as np
 import logging
@@ -14,9 +13,19 @@ from typing import Optional, Dict, List
 
 logger = logging.getLogger(__name__)
 
+# Lazy-load torch to avoid crashing RunPod workers at import time
+torch = None
+
+def _get_torch():
+    global torch
+    if torch is None:
+        import torch as _torch
+        torch = _torch
+    return torch
+
 BALL_MODEL_PATH = os.environ.get(
     "BALL_MODEL_PATH",
-    "/Users/rudra/Desktop/soccer-video-analytics/ball.pt",
+    "ball.pt",
 )
 INFERENCE_SIZE = 1920       # must run at full resolution
 MIN_CONF = 0.3              # minimum confidence to accept detection
@@ -48,7 +57,7 @@ class BallTracker:
     def load_model(self):
         """Load YOLOv5 ball detector via torch.hub. Never raise."""
         try:
-            self.model = torch.hub.load(
+            self.model = _get_torch().hub.load(
                 "ultralytics/yolov5",
                 "custom",
                 path=BALL_MODEL_PATH,

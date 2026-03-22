@@ -4,13 +4,16 @@ from datetime import datetime
 from pathlib import Path
 
 MEMORY_DIR = Path("memory")
-MEMORY_DIR.mkdir(exist_ok=True)
-(MEMORY_DIR / "matches").mkdir(exist_ok=True)
-(MEMORY_DIR / "teams").mkdir(exist_ok=True)
-(MEMORY_DIR / "patterns").mkdir(exist_ok=True)
+
+def _ensure_memory_dirs():
+    MEMORY_DIR.mkdir(exist_ok=True)
+    (MEMORY_DIR / "matches").mkdir(exist_ok=True)
+    (MEMORY_DIR / "teams").mkdir(exist_ok=True)
+    (MEMORY_DIR / "patterns").mkdir(exist_ok=True)
 
 def store_match(job_id, tracking, situations, physical, shape, analysis, player_history=None):
     """Store complete match analysis to memory."""
+    _ensure_memory_dirs()
     match_data = {
         "job_id": job_id,
         "timestamp": datetime.now().isoformat(),

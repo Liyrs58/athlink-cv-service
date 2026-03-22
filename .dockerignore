@@ -1,0 +1,16 @@
+.git
+.venv
+__pycache__
+*.pyc
+temp/
+memory/
+*.mp4
+*.avi
+*.mov
+.env
+.env.*
+node_modules
+.DS_Store
+verify_*.py
+CLAUDE.md
+README.md
