@@ -1,9 +1,20 @@
+import json
 import logging
+import os
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+
 import numpy as np
 
 logger = logging.getLogger(__name__)
+
+_JOBS_DIR = os.environ.get("JOBS_DIR", "/tmp/athlink_jobs")
+os.makedirs(_JOBS_DIR, exist_ok=True)
+
+_executor = ThreadPoolExecutor(max_workers=2)
+_jobs: dict = {}  # in-memory cache
+_lock = threading.Lock()
 
 
 def _numpy_safe(obj):
@@ -16,8 +27,29 @@ def _numpy_safe(obj):
     if isinstance(obj, (list, tuple)): return [_numpy_safe(i) for i in obj]
     return obj
 
-_executor = ThreadPoolExecutor(max_workers=2)
-_jobs: dict = {}  # jobId → job state dict
+
+def _job_path(job_id: str) -> str:
+    return os.path.join(_JOBS_DIR, f"{job_id}.json")
+
+
+def _save_job(job: dict):
+    try:
+        with open(_job_path(job["jobId"]), "w") as f:
+            json.dump(_numpy_safe(job), f)
+    except Exception as e:
+        logger.warning("Failed to persist job %s: %s", job.get("jobId"), e)
+
+
+def _load_job_from_disk(job_id: str) -> dict | None:
+    path = _job_path(job_id)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except Exception as e:
+        logger.warning("Failed to load job %s from disk: %s", job_id, e)
+        return None
 
 
 def create_job(job_id: str) -> dict:
@@ -30,19 +62,31 @@ def create_job(job_id: str) -> dict:
         "error": None,
         "result": None,
     }
-    _jobs[job_id] = job
+    with _lock:
+        _jobs[job_id] = job
+    _save_job(job)
     return job
 
 
 def get_job(job_id: str):
-    return _jobs.get(job_id)
+    with _lock:
+        if job_id in _jobs:
+            return _jobs[job_id]
+    # Not in memory — check disk (survives restarts)
+    job = _load_job_from_disk(job_id)
+    if job is not None:
+        with _lock:
+            _jobs[job_id] = job
+    return job
 
 
 def submit_job(job_id: str, fn, *args, **kwargs):
     def _wrapper():
-        job = _jobs[job_id]
+        with _lock:
+            job = _jobs[job_id]
         job["status"] = "processing"
         job["startedAt"] = time.time()
+        _save_job(job)
         try:
             result = fn(*args, **kwargs)
             job["status"] = "completed"
@@ -53,9 +97,25 @@ def submit_job(job_id: str, fn, *args, **kwargs):
             job["status"] = "failed"
             job["completedAt"] = time.time()
             job["error"] = str(e)
+        finally:
+            _save_job(job)
 
     _executor.submit(_wrapper)
 
 
 def list_jobs():
-    return sorted(_jobs.values(), key=lambda j: j["createdAt"], reverse=True)
+    # Merge disk jobs into memory
+    try:
+        for fname in os.listdir(_JOBS_DIR):
+            if fname.endswith(".json"):
+                jid = fname[:-5]
+                if jid not in _jobs:
+                    job = _load_job_from_disk(jid)
+                    if job:
+                        with _lock:
+                            _jobs[jid] = job
+    except Exception:
+        pass
+    with _lock:
+        jobs = list(_jobs.values())
+    return sorted(jobs, key=lambda j: j.get("createdAt", 0), reverse=True)
