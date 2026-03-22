@@ -21,4 +21,4 @@ COPY . .
 
 RUN mkdir -p /app/temp /app/memory/matches /app/static
 
-CMD ["python", "handler.py"]
+CMD ["python", "main.py"]

@@ -1,4 +1,4 @@
-import os, requests, base64, time, logging
+import os, requests, time, logging
 logger = logging.getLogger(__name__)
 
 RUNPOD_API_KEY = os.environ.get("RUNPOD_API_KEY", "")
@@ -11,13 +11,21 @@ def is_runpod_available():
     return available
 
 def run_on_runpod(video_path: str, job_id: str) -> dict:
-    with open(video_path, "rb") as f:
-        video_b64 = base64.b64encode(f.read()).decode("utf-8")
+    """Upload video to Supabase, send URL to RunPod for GPU processing."""
+    from services.storage_service import upload_file_from_path
 
+    # Upload video to Supabase so RunPod can download it
+    remote_path = f"runpod/{job_id}/{os.path.basename(video_path)}"
+    video_url = upload_file_from_path("match-videos", remote_path, video_path)
+    if not video_url:
+        raise Exception("Failed to upload video to Supabase storage")
+    logger.info("Video uploaded to Supabase: %s", video_url)
+
+    # Send URL to RunPod (not the video itself)
     resp = requests.post(
         f"https://api.runpod.io/v2/{RUNPOD_ENDPOINT_ID}/run",
         headers={"Authorization": f"Bearer {RUNPOD_API_KEY}", "Content-Type": "application/json"},
-        json={"input": {"video_base64": video_b64, "filename": os.path.basename(video_path), "job_id": job_id}},
+        json={"input": {"video_url": video_url, "filename": os.path.basename(video_path), "job_id": job_id}},
         timeout=60,
     )
     resp.raise_for_status()
