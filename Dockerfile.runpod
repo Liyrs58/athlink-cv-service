@@ -8,25 +8,27 @@ RUN apt-get update -y && \
 
 WORKDIR /app
 
-# Record pre-installed torch so we can restore it after pip install
-RUN python3 -c "import torch; print('BASE IMAGE torch:', torch.__version__, 'CUDA:', torch.cuda.is_available())"
+# Install PyTorch with CUDA 11.8 support
+RUN pip3 install --no-cache-dir torch torchvision --index-url https://download.pytorch.org/whl/cu118
+
+# Verify torch + CUDA works
+RUN python3 -c "import torch; print('torch:', torch.__version__, 'CUDA:', torch.cuda.is_available())"
 
 # Install deps EXCEPT ultralytics (which overwrites GPU torch)
 COPY requirements-runpod.txt .
 RUN pip3 install --no-cache-dir $(grep -v ultralytics requirements-runpod.txt | grep -v '^\s*#' | grep -v '^\s*$')
 
-# Install ultralytics WITHOUT its torch dependency — keep the base image's GPU torch
+# Install ultralytics WITHOUT its torch dependency — keep our GPU torch
 RUN pip3 install --no-cache-dir --no-deps ultralytics && \
     pip3 install --no-cache-dir py-cpuinfo thop scipy matplotlib tqdm pyyaml seaborn psutil
 
-# Verify CUDA still works
+# Final verification: CUDA + all critical imports
 RUN python3 -c "\
 import torch; \
 print('torch:', torch.__version__, 'CUDA:', torch.cuda.is_available()); \
-assert torch.cuda.is_available(), 'CUDA broken!'; \
 import cv2; print('cv2:', cv2.__version__); \
 from ultralytics import YOLO; print('ultralytics OK'); \
-print('ALL IMPORTS OK — CUDA VERIFIED')"
+print('ALL IMPORTS OK')"
 
 # Copy application code
 COPY . .

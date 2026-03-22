@@ -1,5 +1,5 @@
 # RunPod GPU requirements
-# The base image (runpod/base:0.4.0-cuda11.8.0) has torch+CUDA pre-installed.
+# torch+CUDA is installed explicitly in Dockerfile.runpod (cu118 index).
 # DO NOT add packages that force-install CPU torch (yolov5, boxmot, supervision).
 
 fastapi==0.104.1
