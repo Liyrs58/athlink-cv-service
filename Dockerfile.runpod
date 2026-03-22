@@ -8,32 +8,30 @@ RUN apt-get update -y && \
 
 WORKDIR /app
 
-# Record pre-installed torch version BEFORE pip install
-RUN python3 -c "import torch; print('PRE-INSTALL torch:', torch.__version__, 'CUDA:', torch.cuda.is_available())" || true
+# Record pre-installed torch so we can restore it after pip install
+RUN python3 -c "import torch; print('BASE IMAGE torch:', torch.__version__, 'CUDA:', torch.cuda.is_available())"
 
-# Install Python deps — use RunPod-specific requirements that exclude
-# packages which would overwrite GPU torch with CPU torch
+# Install deps EXCEPT ultralytics (which overwrites GPU torch)
 COPY requirements-runpod.txt .
-RUN pip3 install --no-cache-dir -r requirements-runpod.txt
+RUN pip3 install --no-cache-dir $(grep -v ultralytics requirements-runpod.txt | grep -v '^\s*#' | grep -v '^\s*$')
 
-# Verify torch CUDA wasn't broken by pip install
+# Install ultralytics WITHOUT its torch dependency — keep the base image's GPU torch
+RUN pip3 install --no-cache-dir --no-deps ultralytics && \
+    pip3 install --no-cache-dir py-cpuinfo thop scipy matplotlib tqdm pyyaml seaborn psutil
+
+# Verify CUDA still works
 RUN python3 -c "\
-import sys; \
-print('Python:', sys.version); \
 import torch; \
 print('torch:', torch.__version__, 'CUDA:', torch.cuda.is_available()); \
-assert torch.cuda.is_available(), 'CUDA not available — pip install broke GPU torch!'; \
+assert torch.cuda.is_available(), 'CUDA broken!'; \
 import cv2; print('cv2:', cv2.__version__); \
 from ultralytics import YOLO; print('ultralytics OK'); \
-import numpy; print('numpy:', numpy.__version__); \
 print('ALL IMPORTS OK — CUDA VERIFIED')"
 
 # Copy application code
 COPY . .
 
-# Set environment variables
 ENV PYTHONPATH=/app
 ENV PYTHONUNBUFFERED=1
 
-# RunPod handler entry point
 CMD ["python3", "-u", "handler.py"]
