@@ -1,31 +1,27 @@
-FROM runpod/base:0.4.0-cuda11.8.0
+FROM runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04
 
 # Install system dependencies
 RUN apt-get update -y && \
-    apt-get install -y python3-pip ffmpeg libgl1-mesa-glx libglib2.0-0 && \
+    apt-get install -y ffmpeg libgl1-mesa-glx libglib2.0-0 && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# Install PyTorch with CUDA 11.8 support
-RUN pip3 install --no-cache-dir torch torchvision --index-url https://download.pytorch.org/whl/cu118
-
-# Verify torch + CUDA works
-RUN python3 -c "import torch; print('torch:', torch.__version__, 'CUDA:', torch.cuda.is_available())"
+# Confirm torch + CUDA are present from base image
+RUN python3 -c "import torch; print('torch:', torch.__version__, 'CUDA avail:', torch.cuda.is_available())"
 
 # Install deps EXCEPT ultralytics (which overwrites GPU torch)
 COPY requirements-runpod.txt .
-RUN pip3 install --no-cache-dir $(grep -v ultralytics requirements-runpod.txt | grep -v '^\s*#' | grep -v '^\s*$')
+RUN pip install --no-cache-dir $(grep -v ultralytics requirements-runpod.txt | grep -v '^\s*#' | grep -v '^\s*$')
 
-# Install ultralytics WITHOUT its torch dependency — keep our GPU torch
-RUN pip3 install --no-cache-dir --no-deps ultralytics && \
-    pip3 install --no-cache-dir py-cpuinfo thop scipy matplotlib tqdm pyyaml seaborn psutil
+# Install ultralytics WITHOUT its torch dependency — keep the base image's GPU torch
+RUN pip install --no-cache-dir --no-deps ultralytics && \
+    pip install --no-cache-dir py-cpuinfo thop scipy matplotlib tqdm pyyaml seaborn psutil
 
-# Final verification: CUDA + all critical imports
+# Final verification: all critical imports work
 RUN python3 -c "\
-import torch; \
-print('torch:', torch.__version__, 'CUDA:', torch.cuda.is_available()); \
+import torch; print('torch:', torch.__version__); \
 import cv2; print('cv2:', cv2.__version__); \
 from ultralytics import YOLO; print('ultralytics OK'); \
 print('ALL IMPORTS OK')"
