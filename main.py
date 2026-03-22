@@ -64,8 +64,7 @@ TAGS_METADATA = [
 
 @asynccontextmanager
 async def lifespan(app):
-    """Clean corrupted match data at startup."""
-    clean_memory()
+    """Initialize app — skip blocking clean_memory at startup."""
     yield
 
 app = FastAPI(
