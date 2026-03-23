@@ -14,3 +14,4 @@ yolov5>=7.0.0
 supervision>=0.26.0
 # numpy pinned for Railway compatibility
 runpod
+google-generativeai>=0.8.0

@@ -17,3 +17,4 @@ runpod
 shapely>=2.0.0
 lsq-ellipse>=2.2.0
 sympy>=1.12
+google-generativeai>=0.8.0

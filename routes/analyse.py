@@ -29,6 +29,7 @@ from services.ball_tracking_service import BallTracker, PossessionDetector, Pass
 from services.video_annotator import VideoAnnotator
 from services.camera_compensator import CameraCompensator
 from services.speed_estimator import SpeedEstimator
+from services.brain_service import generate_brain_report
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -641,6 +642,14 @@ def _run_analysis_pipeline(job_id: str, temp_path: str, skip_cleanup: bool = Fal
             "validation": validation_result,
         }
         result = numpy_safe(base_result)
+
+        # Three-layer AI brain report replaces generic interpretation
+        try:
+            brain_report = generate_brain_report(job_id, temp_path, result)
+            result["analysis"] = brain_report
+        except Exception as e:
+            logger.error("Brain report failed for %s: %s — keeping interpret_events output", job_id, e)
+
         return result
     finally:
         if not skip_cleanup and os.path.exists(temp_path):
