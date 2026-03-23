@@ -6,6 +6,7 @@ to correct impossible values and maximise accuracy.
 """
 
 import math
+import time
 import logging
 from typing import Dict, Any, List, Optional, Tuple
 
@@ -95,6 +96,9 @@ class PhysicsCorrector:
         calibration: Dict[str, Any],
     ) -> Dict[str, Any]:
         """Run all 7 constraints in order. Returns corrected tracks + report."""
+        self._start_time = time.time()
+        self._MAX_PHYSICS_SECONDS = 30
+
         ppm = calibration.get("pixels_per_metre", 15.5)
         vis_frac = calibration.get("visible_fraction", 0.55)
 
@@ -325,6 +329,9 @@ class PhysicsCorrector:
         merged_ids = set()
 
         for frame_idx in frame_indices:
+            if time.time() - self._start_time > self._MAX_PHYSICS_SECONDS:
+                logger.warning("Physics corrector timeout after %.1fs — returning partial results", time.time() - self._start_time)
+                break
             if len(merged_ids) > 20:
                 break  # don't over-merge
 
@@ -351,6 +358,9 @@ class PhysicsCorrector:
                 best_dist = float("inf")
                 best_pair = None
                 for i in range(len(active)):
+                    if time.time() - self._start_time > self._MAX_PHYSICS_SECONDS:
+                        logger.warning("Physics corrector timeout after %.1fs — returning partial results", time.time() - self._start_time)
+                        break
                     for j in range(i + 1, len(active)):
                         ti, ei = active[i]
                         tj, ej = active[j]
@@ -368,6 +378,9 @@ class PhysicsCorrector:
                 if best_pair is None:
                     # No same-team pair, try any pair
                     for i in range(len(active)):
+                        if time.time() - self._start_time > self._MAX_PHYSICS_SECONDS:
+                            logger.warning("Physics corrector timeout after %.1fs — returning partial results", time.time() - self._start_time)
+                            break
                         for j in range(i + 1, len(active)):
                             ei = active[i][1]
                             ej = active[j][1]
@@ -478,6 +491,9 @@ class PhysicsCorrector:
         sampled = frame_indices[::5] if len(frame_indices) > 20 else frame_indices
 
         for frame_idx in sampled:
+            if time.time() - self._start_time > self._MAX_PHYSICS_SECONDS:
+                logger.warning("Physics corrector timeout after %.1fs — returning partial results", time.time() - self._start_time)
+                break
             active = []
             for t in tracks:
                 if t.get("is_staff", False):
@@ -493,6 +509,9 @@ class PhysicsCorrector:
 
             # Check all pairs
             for i in range(len(active)):
+                if time.time() - self._start_time > self._MAX_PHYSICS_SECONDS:
+                    logger.warning("Physics corrector timeout after %.1fs — returning partial results", time.time() - self._start_time)
+                    break
                 for j in range(i + 1, len(active)):
                     ti, ei, ci = active[i]
                     tj, ej, cj = active[j]

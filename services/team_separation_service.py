@@ -289,8 +289,8 @@ def cluster_teams(tracks: List[dict], video_path: str) -> Dict:
         y_positions = [pt.get("y", 0.5) for pt in traj if isinstance(pt, dict)]
         if y_positions:
             avg_y = sum(y_positions) / len(y_positions)
-            # Exclude tracks in top 12% or bottom 12% of frame (sideline/crowd area)
-            if avg_y < 0.12 or avg_y > 0.88:
+            # Exclude tracks in top 8% or bottom 8% of frame (sideline/crowd area)
+            if avg_y < 0.08 or avg_y > 0.92:
                 track["teamId"] = -1
                 continue
 
