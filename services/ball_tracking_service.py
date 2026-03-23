@@ -48,6 +48,7 @@ class BallTracker:
 
     def __init__(self):
         self.model = None
+        self.model_type = None
         self._positions: Dict[int, dict] = {}   # frame_idx -> {x, y, conf, interpolated}
         self._last_pos: Optional[dict] = None
         self._last_det_frame: int = -1
@@ -56,13 +57,14 @@ class BallTracker:
     # ------------------------------------------------------------------
     def load_model(self):
         try:
-            import yolov5
+            from ultralytics import YOLO
             if os.path.exists(BALL_MODEL_PATH):
-                self.model = yolov5.load(BALL_MODEL_PATH)
+                self.model = YOLO(BALL_MODEL_PATH)
                 logger.info("Ball detector loaded from %s", BALL_MODEL_PATH)
             else:
-                self.model = yolov5.load('yolov5s.pt')
-                logger.info("Ball detector loaded: yolov5s fallback")
+                self.model = YOLO('yolov8s.pt')
+                logger.info("Ball detector loaded: yolov8s fallback via ultralytics")
+            self.model_type = 'ultralytics'
         except Exception as e:
             logger.error("Ball detector load failed: %s", e)
             self.model = None
@@ -79,27 +81,32 @@ class BallTracker:
             return None
 
         try:
-            results = self.model(frame, size=INFERENCE_SIZE)
-            df = results.pandas().xyxy[0]
+            results = self.model(frame, imgsz=INFERENCE_SIZE, verbose=False)
+            boxes = results[0].boxes
 
-            if len(df) == 0:
+            if boxes is None or len(boxes) == 0:
                 return self._handle_miss(frame_idx)
 
             # Filter to ball-sized detections
-            df = df.copy()
-            df["w"] = df["xmax"] - df["xmin"]
-            df["h"] = df["ymax"] - df["ymin"]
-            df = df[(df["w"] < MAX_BALL_SIZE) & (df["h"] < MAX_BALL_SIZE)]
+            best_cx = best_cy = best_conf = None
+            for box in boxes:
+                x1, y1, x2, y2 = box.xyxy[0].tolist()
+                w = x2 - x1
+                h = y2 - y1
+                if w >= MAX_BALL_SIZE or h >= MAX_BALL_SIZE:
+                    continue
+                c = float(box.conf[0])
+                if best_conf is None or c > best_conf:
+                    best_cx = (x1 + x2) / 2
+                    best_cy = (y1 + y2) / 2
+                    best_conf = c
 
-            if len(df) == 0:
+            if best_conf is None:
                 return self._handle_miss(frame_idx)
 
-            # Take highest-confidence detection only
-            best = df.sort_values("confidence", ascending=False).iloc[0]
-
-            cx = float((best["xmin"] + best["xmax"]) / 2)
-            cy = float((best["ymin"] + best["ymax"]) / 2)
-            conf = float(best["confidence"])
+            cx = float(best_cx)
+            cy = float(best_cy)
+            conf = float(best_conf)
 
             pos = {"x": cx, "y": cy, "confidence": conf, "interpolated": False}
             self._positions[frame_idx] = pos
