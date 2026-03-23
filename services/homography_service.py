@@ -205,14 +205,23 @@ def estimate_homography(frame: np.ndarray) -> Dict[str, Any]:
     Estimate pitch calibration from a single frame.
 
     Returns dict with:
-    - 'method': 'keypoints' or 'green_fraction'
-    - 'homography': 3x3 matrix (if keypoints method)
+    - 'method': 'pnlcalib', 'keypoints', or 'green_fraction'
+    - 'homography': 3x3 matrix (if pnlcalib or keypoints method)
     - 'visible_fraction': float (always present)
     - 'pixels_per_metre': float (always present)
     """
     h, w = frame.shape[:2]
 
-    # Try keypoint-based homography first
+    # Tier 1: Try PnLCalib (broadcast-grade HRNet keypoint + line detection)
+    try:
+        from services.pnlcalib_service import estimate_homography_pnlcalib
+        pnl_result = estimate_homography_pnlcalib(frame)
+        if pnl_result is not None:
+            return pnl_result
+    except Exception as e:
+        logger.debug("PnLCalib unavailable: %s", e)
+
+    # Tier 2: Try keypoint-based homography
     corners = detect_pitch_keypoints(frame)
     if corners is not None:
         # Map detected corners to pitch coordinates

@@ -14,3 +14,6 @@ supabase>=2.0.0
 pillow>=8.0.0
 reportlab>=4.0.0
 runpod
+shapely>=2.0.0
+lsq-ellipse>=2.2.0
+sympy>=1.12

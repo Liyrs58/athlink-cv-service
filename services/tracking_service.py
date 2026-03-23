@@ -532,15 +532,29 @@ def run_tracking(
 
         # Estimate homography from first valid frame (for accurate coordinate conversion)
         if not homography_found:
+            # Try PnLCalib first (broadcast-grade calibration)
             try:
-                homography_H = _estimate_homography(frame)
-                if homography_H is not None and validate_homography(homography_H, frame.shape[1], frame.shape[0]):
-                    homography_found = True
-                    logger.info(f"Homography estimated from frame {current_frame_idx}")
-                else:
-                    logger.info(f"Homography validation failed, will use proportional scaling")
+                from services.pnlcalib_service import estimate_homography_pnlcalib
+                pnl = estimate_homography_pnlcalib(frame)
+                if pnl and pnl.get('homography'):
+                    homography_H = np.array(pnl['homography'], dtype=np.float32)
+                    if validate_homography(homography_H, frame.shape[1], frame.shape[0]):
+                        homography_found = True
+                        logger.info(f"PnLCalib homography from frame {current_frame_idx}")
             except Exception as e:
-                logger.warning(f"Homography estimation failed: {e}, will use proportional scaling")
+                logger.debug(f"PnLCalib unavailable: {e}")
+
+            # Fall back to existing Hough-line approach
+            if not homography_found:
+                try:
+                    homography_H = _estimate_homography(frame)
+                    if homography_H is not None and validate_homography(homography_H, frame.shape[1], frame.shape[0]):
+                        homography_found = True
+                        logger.info(f"Homography estimated from frame {current_frame_idx}")
+                    else:
+                        logger.info(f"Homography validation failed, will use proportional scaling")
+                except Exception as e:
+                    logger.warning(f"Homography estimation failed: {e}, will use proportional scaling")
 
         timestamp = current_frame_idx / fps if fps > 0 else 0.0
         frame_h_px = frame.shape[0]
