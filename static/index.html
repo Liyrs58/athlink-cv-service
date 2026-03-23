@@ -948,10 +948,11 @@ function render(d) {
     </div>`;
 
     // A2. Annotated Video Download + Possession Bar
-    if (d.annotated_video_path) {
+    if (d.annotated_video_path || d.annotated_video_url) {
+        const videoHref = d.annotated_video_url || `/api/v1/jobs/${esc(d.job_id)}/video`;
         ov += `<div class="card" id="annotatedVideo">
             <div class="card-title">Match Video</div>
-            <a href="/api/v1/jobs/${esc(d.job_id)}/video" download
+            <a href="${videoHref}" download
                style="display:inline-block;padding:12px 28px;background:var(--teal);color:#0a0e1a;
                       font-weight:600;border-radius:8px;text-decoration:none;font-size:14px;
                       transition:opacity 0.2s;margin-bottom:16px"
