@@ -5,6 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>ATHLINK CV - Elite Football Analytics</title>
     <link href="https://fonts.googleapis.com/css2?family=Rajdhani:wght@400;600;700&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/marked/9.1.6/marked.min.js"></script>
     <style>
         :root {
             --bg: #0a0e1a;
@@ -337,7 +338,28 @@
 
         /* ── COACHING REPORT ── */
         .report-wrap { position: relative; }
-        .report-text { font-size: 14px; line-height: 1.8; color: #d1d5db; white-space: pre-wrap; word-break: break-word; font-family: 'Inter', sans-serif; }
+        .report-text { font-size: 14px; line-height: 1.8; color: #d1d5db; word-break: break-word; font-family: 'Inter', sans-serif; }
+        .report-markdown { white-space: normal; }
+        .report-markdown h1 { font-family: 'Rajdhani', sans-serif; font-size: 22px; font-weight: 700; color: var(--teal); margin: 24px 0 12px; letter-spacing: 1px; text-transform: uppercase; border-bottom: 1px solid var(--border); padding-bottom: 8px; }
+        .report-markdown h2 { font-family: 'Rajdhani', sans-serif; font-size: 17px; font-weight: 700; color: var(--text); margin: 18px 0 8px; letter-spacing: 0.5px; }
+        .report-markdown h3 { font-family: 'Rajdhani', sans-serif; font-size: 15px; font-weight: 600; color: var(--muted); margin: 14px 0 6px; }
+        .report-markdown p { margin: 8px 0; }
+        .report-markdown ul, .report-markdown ol { margin: 8px 0 8px 20px; }
+        .report-markdown li { margin: 4px 0; }
+        .report-markdown strong { color: var(--text); }
+        .report-markdown table { width: 100%; border-collapse: collapse; margin: 12px 0; font-size: 13px; }
+        .report-markdown th { background: var(--border); padding: 8px 12px; text-align: left; font-family: 'Rajdhani', sans-serif; font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px; font-size: 11px; color: var(--muted); }
+        .report-markdown td { padding: 8px 12px; border-bottom: 1px solid var(--border); }
+        .report-markdown hr { border: none; border-top: 1px solid var(--border); margin: 20px 0; }
+        .report-tabs { display: flex; gap: 0; margin-bottom: 16px; border-bottom: 1px solid var(--border); overflow-x: auto; }
+        .report-tab-btn { background: none; border: none; border-bottom: 2px solid transparent; color: var(--muted); padding: 10px 16px; cursor: pointer; font-family: 'Rajdhani', sans-serif; font-weight: 700; font-size: 13px; letter-spacing: 1px; text-transform: uppercase; white-space: nowrap; }
+        .report-tab-btn.active { color: var(--teal); border-bottom-color: var(--teal); }
+        .confidence-high { background: rgba(0,200,120,0.15); color: #00c878; border: 1px solid #00c878; border-radius: 4px; padding: 2px 8px; font-size: 11px; font-weight: 700; letter-spacing: 1px; }
+        .confidence-medium { background: rgba(255,180,0,0.15); color: #ffb400; border: 1px solid #ffb400; border-radius: 4px; padding: 2px 8px; font-size: 11px; font-weight: 700; letter-spacing: 1px; }
+        .confidence-low { background: rgba(255,60,60,0.15); color: #ff3c3c; border: 1px solid #ff3c3c; border-radius: 4px; padding: 2px 8px; font-size: 11px; font-weight: 700; letter-spacing: 1px; }
+        .report-tab { background: none; border: none; color: var(--muted); padding: 10px 16px; cursor: pointer; font-family: 'Rajdhani', sans-serif; font-weight: 700; font-size: 12px; letter-spacing: 1px; text-transform: uppercase; border-bottom: 2px solid transparent; transition: all 0.2s; white-space: nowrap; }
+        .report-tab.active { color: var(--teal); border-bottom-color: var(--teal); }
+        .report-tab:hover { color: var(--text); }
         .copy-btn {
             background: none; border: 1px solid var(--border); color: var(--muted);
             padding: 6px 14px; border-radius: 6px; font-size: 11px; cursor: pointer;
@@ -628,6 +650,10 @@
 
         <!-- RESULTS -->
         <section id="resultsSection" style="display:none">
+            <button onclick="sessionStorage.removeItem('lastResult'); resetToInitialState();"
+style="background:none;border:1px solid var(--border);color:var(--muted);padding:8px 20px;border-radius:6px;cursor:pointer;font-family:'Rajdhani',sans-serif;font-weight:600;font-size:12px;letter-spacing:1px;text-transform:uppercase;margin-bottom:20px;">
+↩ NEW ANALYSIS
+</button>
             <div class="tab-bar" id="tabBar">
                 <button class="tab-btn active" onclick="switchTab('overview')">Match Overview</button>
                 <button class="tab-btn" onclick="switchTab('players')">Players</button>
@@ -686,8 +712,17 @@ function resetToInitialState() {
 }
 
 // Reset on page load
-document.addEventListener('DOMContentLoaded', resetToInitialState);
-window.addEventListener('load', resetToInitialState);
+document.addEventListener('DOMContentLoaded', () => {
+    const saved = sessionStorage.getItem('lastResult');
+    if (saved) {
+        try { render(JSON.parse(saved)); return; }
+        catch(e) { sessionStorage.removeItem('lastResult'); }
+    }
+    resetToInitialState();
+});
+window.addEventListener('load', () => {
+    if (!sessionStorage.getItem('lastResult')) resetToInitialState();
+});
 
 const LOADING_MSGS = [
     'TRACKING PLAYERS...',
@@ -777,7 +812,7 @@ function poll(jobId) {
         fetch(`${API_BASE}/api/v1/jobs/status/${jobId}`)
             .then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); })
             .then(j => {
-                if (j.status === 'completed') { stopTimers(); clearInterval(pollIv); render(j.result); }
+                if (j.status === 'completed') { stopTimers(); clearInterval(pollIv); render(j.result); sessionStorage.setItem('lastResult', JSON.stringify(j.result)); }
                 else if (j.status === 'failed') { stopTimers(); clearInterval(pollIv); showError(j.error || 'Analysis failed'); }
             })
             .catch(e => console.error('Poll:', e));
@@ -1237,13 +1272,53 @@ function render(d) {
     // ──────────────────────────────────────────────────────
     let an = '';
 
-    // A. AI Coaching Report
+    // A. AI Coaching Report with sub-tabs and markdown
+    const rawReport = d.analysis || 'No report available';
+    window._lastRawReport = rawReport;
+    const renderedReport = (typeof marked !== 'undefined') ? marked.parse(rawReport) : esc(rawReport);
+
+    // Parse report sections by H1 headers for sub-tabs
+    const reportSections = {};
+    const sectionRegex = /^# (.+)$/gm;
+    const sectionParts = rawReport.split(/^(?=# )/m);
+    let fullReportHtml = renderedReport;
+
+    // Extract team-specific sections
+    let teamAHtml = '', teamBHtml = '', playersHtml = '', dataHtml = '';
+    sectionParts.forEach(part => {
+        const partRendered = (typeof marked !== 'undefined') ? marked.parse(part) : esc(part);
+        const partLower = part.toLowerCase();
+        if (partLower.includes(t0n.toLowerCase() + ' —') || partLower.includes(t0n.toLowerCase() + ' — team')) {
+            teamAHtml += partRendered;
+        } else if (partLower.includes(t1n.toLowerCase() + ' —') || partLower.includes(t1n.toLowerCase() + ' — team')) {
+            teamBHtml += partRendered;
+        } else if (partLower.includes('individual player') || partLower.includes('psychological') || partLower.includes('parent & player')) {
+            playersHtml += partRendered;
+        } else if (partLower.includes('data confidence') || partLower.includes('event statistics') || partLower.includes('head-to-head')) {
+            dataHtml += partRendered;
+        }
+    });
+
     an += `<div class="card" id="report">
         <div class="card-title-row">
             <div class="card-title">Coaching Report</div>
-            <button class="copy-btn" onclick="navigator.clipboard.writeText(this.parentElement.parentElement.querySelector('.report-text').textContent).then(()=>{this.textContent='COPIED';setTimeout(()=>this.textContent='COPY',1500)})">COPY</button>
         </div>
-        <div class="report-text">${esc(d.analysis || 'No report available')}</div>
+        <div class="report-tabs">
+            <button class="report-tab active" onclick="switchReportTab('full',this)">FULL REPORT</button>
+            <button class="report-tab" onclick="switchReportTab('teamA',this)">${esc(t0n)}</button>
+            <button class="report-tab" onclick="switchReportTab('teamB',this)">${esc(t1n)}</button>
+            <button class="report-tab" onclick="switchReportTab('rplayers',this)">PLAYERS</button>
+            <button class="report-tab" onclick="switchReportTab('rdata',this)">DATA</button>
+        </div>
+        <div class="report-tab-pane report-tab-full active"><div class="report-text report-markdown">${fullReportHtml}</div></div>
+        <div class="report-tab-pane report-tab-teamA" style="display:none"><div class="report-text report-markdown">${teamAHtml || '<p>No team-specific section found in report.</p>'}</div></div>
+        <div class="report-tab-pane report-tab-teamB" style="display:none"><div class="report-text report-markdown">${teamBHtml || '<p>No team-specific section found in report.</p>'}</div></div>
+        <div class="report-tab-pane report-tab-rplayers" style="display:none"><div class="report-text report-markdown">${playersHtml || '<p>No player section found in report.</p>'}</div></div>
+        <div class="report-tab-pane report-tab-rdata" style="display:none"><div class="report-text report-markdown">${dataHtml || '<p>No data section found in report.</p>'}</div></div>
+        <div style="display:flex;gap:10px;margin-top:16px;">
+            <button onclick="downloadReport()" style="background:var(--teal);color:#000;border:none;padding:10px 20px;border-radius:6px;cursor:pointer;font-family:'Rajdhani',sans-serif;font-weight:700;font-size:13px;letter-spacing:1px;text-transform:uppercase;">&#8595; DOWNLOAD REPORT</button>
+            <button onclick="copyReport()" id="copyReportBtn" style="background:none;border:1px solid var(--border);color:var(--muted);padding:10px 20px;border-radius:6px;cursor:pointer;font-family:'Rajdhani',sans-serif;font-weight:700;font-size:13px;letter-spacing:1px;text-transform:uppercase;">&#10697; COPY REPORT</button>
+        </div>
     </div>`;
 
     // B. Fatigue Clock
@@ -2074,6 +2149,42 @@ function renderMatchFeed() {
     
     $('feedContainer').innerHTML = feedHtml || '<div style="text-align:center;color:var(--muted);padding:20px;">No events to display</div>';
     $('matchFeed').style.display = 'block';
+}
+
+// === REPORT TABS ===
+function switchReportTab(tab, btn) {
+  document.querySelectorAll('.report-tab').forEach(t => t.classList.remove('active'));
+  document.querySelectorAll('.report-tab-pane').forEach(p => p.style.display = 'none');
+  const pane = document.querySelector('.report-tab-' + tab);
+  if (pane) pane.style.display = 'block';
+  if (btn) btn.classList.add('active');
+}
+
+// === DOWNLOAD REPORT ===
+function downloadReport() {
+  const raw = window._lastRawReport || '';
+  if (!raw) return;
+  const blob = new Blob([raw], { type: 'text/markdown' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `athlink-report-${Date.now()}.md`;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+// === COPY REPORT ===
+function copyReport() {
+  const raw = window._lastRawReport || '';
+  if (!raw) return;
+  navigator.clipboard.writeText(raw).then(() => {
+    const btn = document.getElementById('copyReportBtn');
+    const orig = btn.innerHTML;
+    btn.innerHTML = '&#10003; COPIED';
+    btn.style.color = 'var(--teal)';
+    btn.style.borderColor = 'var(--teal)';
+    setTimeout(() => { btn.innerHTML = orig; btn.style.color = ''; btn.style.borderColor = ''; }, 2000);
+  });
 }
 </script>
 </body>
