@@ -19,7 +19,7 @@ from services.confidence_service import (
     score_physical_metric,
     build_data_confidence_summary,
 )
-from services.job_queue_service import create_job, submit_job
+from services.job_queue_service import create_job, submit_job, get_job
 from services.runpod_service import is_runpod_available, run_on_runpod
 from services.observer_brain import ObserverBrain
 from services.fatigue_clock_service import FatigueClock
@@ -680,16 +680,26 @@ async def analyse_video(
 
 @router.get("/jobs/{job_id}/video")
 async def get_annotated_video(job_id: str):
-    """Return the annotated video file for download."""
+    """Return the annotated video — from Supabase URL (RunPod) or local file (CPU fallback)."""
+    from fastapi import HTTPException
+    from fastapi.responses import FileResponse, RedirectResponse
+
+    # First check if job result has a Supabase URL (RunPod path)
+    job = get_job(job_id)
+    if job:
+        result = job.get("result", {})
+        if isinstance(result, dict):
+            video_url = result.get("annotated_video_url")
+            if video_url:
+                return RedirectResponse(url=video_url, status_code=302)
+
+    # Fall back to local file (CPU processing path)
     video_path = f'/tmp/{job_id}_annotated.mp4'
     if os.path.exists(video_path):
-        from fastapi.responses import FileResponse
         return FileResponse(
             video_path,
             media_type='video/mp4',
             filename=f'athlink_analysis_{job_id}.mp4',
         )
-    return JSONResponse(
-        {"error": "Annotated video not found"},
-        status_code=404,
-    )
+
+    raise HTTPException(status_code=404, detail="Annotated video not found. Processing may still be in progress.")

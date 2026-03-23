@@ -59,6 +59,23 @@ def handler(job):
         logger.info(f"[JOB {job_id_str}] Starting analysis pipeline...")
         result = _run_analysis_pipeline(job_id, video_path)
         logger.info(f"[JOB {job_id_str}] Analysis completed successfully")
+
+        # After pipeline completes, upload annotated video to Supabase
+        annotated_path = result.get("annotated_video_path")
+        if annotated_path and os.path.exists(annotated_path):
+            try:
+                from services.storage_service import upload_file_from_path
+                remote_path = f"runpod/{job_id}/annotated.mp4"
+                url = upload_file_from_path("match-videos", remote_path, annotated_path)
+                if url:
+                    result["annotated_video_url"] = url
+                    logger.info("Annotated video uploaded to Supabase: %s", url)
+                    os.remove(annotated_path)  # clean up temp file
+                else:
+                    logger.warning("Annotated video upload failed for job %s", job_id)
+            except Exception as e:
+                logger.error("Failed to upload annotated video: %s", e)
+
         return {"output": result}
 
     except Exception as e:

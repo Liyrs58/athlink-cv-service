@@ -45,10 +45,15 @@ def run_on_runpod(video_path: str, job_id: str) -> dict:
         status = data.get("status")
         logger.info("RunPod status: %s", status)
         if status == "COMPLETED":
-            output = data.get("output", {})
-            if "error" in output:
-                raise Exception(f"RunPod error: {output['error']}")
-            return output.get("output", output)
+            output_data = data.get("output", {})
+            if "error" in output_data:
+                raise Exception(f"RunPod error: {output_data['error']}")
+            result = output_data.get("output", output_data)
+            # Preserve annotated_video_url at top level for easy access
+            if isinstance(result, dict) and "annotated_video_url" in result:
+                logger.info("RunPod job %s has annotated video at: %s",
+                            runpod_job_id, result["annotated_video_url"])
+            return result
         if status == "FAILED":
             error_detail = data.get("error") or data.get("output", {}).get("error") or str(data)
             raise Exception(f"RunPod job failed: {error_detail}")
