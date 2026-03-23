@@ -19,9 +19,6 @@ RUN pip install --no-cache-dir $(grep -v ultralytics requirements-runpod.txt | g
 RUN pip install --no-cache-dir --no-deps ultralytics && \
     pip install --no-cache-dir py-cpuinfo thop scipy matplotlib tqdm pyyaml seaborn psutil pandas
 
-# Install yolov5 as a pip package — eliminates torch.hub runtime downloads entirely
-RUN pip install yolov5==0.0.0 || pip install yolov5
-
 # Final verification: all critical imports work
 RUN python3 -c "\
 import torch; print('torch:', torch.__version__); \
