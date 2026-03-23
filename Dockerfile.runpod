@@ -25,12 +25,9 @@ RUN git clone --depth 1 https://github.com/mguti97/PnLCalib.git /app/pnlcalib &&
     pip install --no-cache-dir shapely lsq-ellipse sympy
 
 # Download PnLCalib HRNet-W48 weights (keypoints + lines)
-RUN python3 -c "\
-import gdown, os; \
-os.makedirs('/app/models/pnlcalib', exist_ok=True); \
-gdown.download('https://drive.google.com/uc?id=1W1m2l5Wm9GraFOoqGiSPTnGJzxYMkqh8', '/app/models/pnlcalib/SV_kp', quiet=False); \
-gdown.download('https://drive.google.com/uc?id=1pSLl_Dl0vEb3VH1MUkQbKNx0VTvXMhwJ', '/app/models/pnlcalib/SV_lines', quiet=False); \
-print('PnLCalib weights downloaded')" || echo "PnLCalib weight download failed — will use fallback calibration"
+COPY scripts/download_pnlcalib_weights.py /tmp/download_pnlcalib_weights.py
+RUN python3 /tmp/download_pnlcalib_weights.py \
+    || echo "PnLCalib weight download failed — will use Hough-line fallback"
 
 # Final verification: all critical imports work
 RUN python3 -c "\
