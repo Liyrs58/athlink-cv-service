@@ -354,8 +354,13 @@ class VideoAnnotator:
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        # Try H.264 first (browser-compatible), fall back to mp4v
+        fourcc = cv2.VideoWriter_fourcc(*'avc1')
         writer = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+        if not writer.isOpened():
+            writer.release()
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            writer = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
 
         num_frames = len(tracks["players"])
         frame_num = 0
