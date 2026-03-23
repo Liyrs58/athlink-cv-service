@@ -55,32 +55,14 @@ class BallTracker:
 
     # ------------------------------------------------------------------
     def load_model(self):
-        """Load YOLOv5 ball detector. Uses pre-cached repo, never downloads at runtime."""
         try:
-            _torch = _get_torch()
-            if os.path.isfile(BALL_MODEL_PATH):
-                # Custom ball.pt provided — load via torch.hub (repo pre-cached in Docker)
-                self.model = _torch.hub.load(
-                    "ultralytics/yolov5",
-                    "custom",
-                    path=BALL_MODEL_PATH,
-                    trust_repo=True,
-                    verbose=False,
-                    force_reload=False,
-                )
+            import yolov5
+            if os.path.exists(BALL_MODEL_PATH):
+                self.model = yolov5.load(BALL_MODEL_PATH)
+                logger.info("Ball detector loaded from %s", BALL_MODEL_PATH)
             else:
-                # No custom model — fall back to pre-trained yolov5s
-                logger.info("ball.pt not found, using pre-trained yolov5s")
-                self.model = _torch.hub.load(
-                    "ultralytics/yolov5",
-                    "yolov5s",
-                    trust_repo=True,
-                    verbose=False,
-                    force_reload=False,
-                )
-            self.model.conf = MIN_CONF
-            self.model.iou = 0.5
-            logger.info("Ball detector loaded OK")
+                self.model = yolov5.load('yolov5s.pt')
+                logger.info("Ball detector loaded: yolov5s fallback")
         except Exception as e:
             logger.error("Ball detector load failed: %s", e)
             self.model = None

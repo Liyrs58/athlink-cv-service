@@ -17,6 +17,7 @@ def run_on_runpod(video_path: str, job_id: str) -> dict:
     # Upload video to Supabase so RunPod can download it
     remote_path = f"runpod/{job_id}/{os.path.basename(video_path)}"
     video_url = upload_file_from_path("match-videos", remote_path, video_path)
+    logger.info("Supabase upload result for job %s: url=%s", job_id, video_url)
     if not video_url:
         raise Exception(f"Supabase upload failed for job {job_id} — video_url is None. Check bucket permissions and SUPABASE_URL/SUPABASE_KEY env vars.")
     logger.info("Video uploaded to Supabase: %s", video_url)

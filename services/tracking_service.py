@@ -7,6 +7,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 from services.pitch_service import _estimate_homography, validate_homography, _transform_point
+from services.scene_classifier import SceneClassifier
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -21,6 +22,7 @@ _pending_rescue_bboxes: list = []
 _model = None
 _device = None
 _use_half = False
+_scene_classifier = SceneClassifier()
 
 
 def _detect_device() -> str:
@@ -612,6 +614,18 @@ def run_tracking(
                             ]
 
         prev_gray = detect_frame_gray  # keep for next iteration
+
+        # --- Scene classification: skip non-pitch frames before YOLO inference ---
+        scene_class, scene_conf = _scene_classifier.classify_frame(frame)
+        if scene_class in ("cutaway", "graphic_overlay"):
+            logger.info(
+                "Frame %d: skipped (%s, confidence=%.2f)",
+                current_frame_idx, scene_class, scene_conf,
+            )
+            prev_gray = detect_frame_gray
+            raw_frame_idx += 1
+            processed_count += 1
+            continue
 
         # --- Player tracking via BoT-SORT (camera motion compensation) ---
         # FIX 3: BoT-SORT internal Kalman filters also benefit from tighter track lifecycle
