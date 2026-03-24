@@ -925,6 +925,21 @@ function render(d) {
     const t0n = ts.team_0_colour_name || 'Team A';
     const t1n = ts.team_1_colour_name || 'Team B';
 
+    // ── Confidence badge helper ──
+    const trustSet = new Set((dc.what_to_trust || []).map(s => s.toLowerCase()));
+    const approxSet = new Set((dc.what_to_treat_as_approximate || []).map(s => s.toLowerCase()));
+    function confBadge(keywords) {
+        const kw = keywords.map(k => k.toLowerCase());
+        const isTrusted = kw.some(k => [...trustSet].some(t => t.includes(k)));
+        const isApprox = kw.some(k => [...approxSet].some(t => t.includes(k)));
+        if (isTrusted && !isApprox) return '<span class="confidence-high">HIGH</span>';
+        if (isApprox) return '<span class="confidence-medium">MEDIUM</span>';
+        const g = (dc.overall_grade || 'B').toUpperCase();
+        if (g === 'A') return '<span class="confidence-high">HIGH</span>';
+        if (g === 'D') return '<span class="confidence-low">LOW</span>';
+        return '<span class="confidence-medium">MEDIUM</span>';
+    }
+
     // ── Sort players, assign numbered labels per team ──
     const allPlayers = ph.players || [];
     const t0Players = allPlayers.filter(p => (p.team || '').toLowerCase().includes(t0n.toLowerCase()) || p.team_id === 0 || p.team === '0').sort((a, b) => (b.distance_metres || 0) - (a.distance_metres || 0));
@@ -1050,7 +1065,7 @@ function render(d) {
         }).join('');
         const last = evts[evts.length - 1];
         ov += `<div class="card" id="timeline">
-            <div class="card-title">Match Flow</div>
+            <div class="card-title-row"><div class="card-title">Match Flow</div>${confBadge(['play','flow','timeline'])}</div>
             <div class="tl-bar">${segs}</div>
             <div class="tl-times"><span>0s</span><span>${last.end_time}s</span></div>
             <div class="tl-summary">${Math.round(openSecs)}s open play &nbsp;|&nbsp; ${Math.round(deadSecs)}s stopped</div>
@@ -1063,7 +1078,7 @@ function render(d) {
         const t1p = vor.team_1_control_pct || 0;
         const domName = vor.dominant_team === 0 ? t0n : t1n;
         ov += `<div class="card" id="voronoi">
-            <div class="card-title">Pitch Control</div>
+            <div class="card-title-row"><div class="card-title">Pitch Control</div>${confBadge(['pitch control','voronoi','territory'])}</div>
             <div class="ctrl-nums">
                 <div><div class="ctrl-name">${esc(t0n)}</div><div class="ctrl-pct" style="color:var(--teal)">${t0p.toFixed(1)}%</div></div>
                 <div><div class="ctrl-name">${esc(t1n)}</div><div class="ctrl-pct" style="color:var(--danger)">${t1p.toFixed(1)}%</div></div>
@@ -1107,7 +1122,7 @@ function render(d) {
         const interp1 = (e1.interpretation || '').replace(/entropy/gi, 'organisation score');
 
         ov += `<div class="card" id="spider">
-            <div class="card-title">Tactical Shape</div>
+            <div class="card-title-row"><div class="card-title">Tactical Shape</div>${confBadge(['shape','formation','width','depth','compact'])}</div>
             <div class="spider-wrap">
                 ${buildSpiderSVG(t0Scores, t1Scores, spiderLabels)}
                 <div class="spider-legend">
@@ -1122,9 +1137,9 @@ function render(d) {
     // F. Three big numbers
     ov += `<div style="margin-bottom:20px;opacity:0;transform:translateY(12px);transition:opacity 0.4s,transform 0.4s" class="card-anim" id="bignums">
         <div class="big-nums">
-            <div class="big-num-box"><div class="big-num">${ph.total_sprints ?? 0}</div><div class="big-num-label">Total Sprints</div></div>
-            <div class="big-num-box"><div class="big-num">${ph.max_speed_kmh ? ph.max_speed_kmh.toFixed(1) : '-'}</div><div class="big-num-label">Max Speed km/h</div></div>
-            <div class="big-num-box"><div class="big-num">${ph.players_analysed ?? 0}</div><div class="big-num-label">Players Analysed</div></div>
+            <div class="big-num-box"><div class="big-num">${ph.total_sprints ?? 0}</div><div class="big-num-label">Total Sprints ${confBadge(['sprint'])}</div></div>
+            <div class="big-num-box"><div class="big-num">${ph.max_speed_kmh ? ph.max_speed_kmh.toFixed(1) : '-'}</div><div class="big-num-label">Max Speed km/h ${confBadge(['speed'])}</div></div>
+            <div class="big-num-box"><div class="big-num">${ph.players_analysed ?? 0}</div><div class="big-num-label">Players Analysed ${confBadge(['player','track'])}</div></div>
         </div>
     </div>`;
 

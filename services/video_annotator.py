@@ -6,6 +6,9 @@ Adapted from Abdullah Tarek's football_analysis draw pipeline (MIT).
 import cv2
 import numpy as np
 import logging
+import subprocess
+import shutil
+import os
 from typing import Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
@@ -410,7 +413,41 @@ class VideoAnnotator:
         cap.release()
         writer.release()
 
+        # Re-encode to H.264 with ffmpeg for browser compatibility.
+        # OpenCV's mp4v codec (MPEG-4 Part 2) won't play in browsers.
+        output_path = self._remux_to_h264(output_path, fps)
+
         logger.info(
             "Annotated video written: %s (%d frames)", output_path, frame_num
         )
         return output_path
+
+    @staticmethod
+    def _remux_to_h264(path: str, fps: float) -> str:
+        """Re-encode video to H.264/AAC mp4 if ffmpeg is available."""
+        if not shutil.which("ffmpeg"):
+            logger.warning("ffmpeg not found — skipping H.264 re-encode")
+            return path
+
+        tmp = path + ".h264.mp4"
+        cmd = [
+            "ffmpeg", "-y",
+            "-i", path,
+            "-c:v", "libx264",
+            "-preset", "fast",
+            "-crf", "23",
+            "-r", str(fps),
+            "-pix_fmt", "yuv420p",
+            "-movflags", "+faststart",
+            "-an",
+            tmp,
+        ]
+        try:
+            subprocess.run(cmd, check=True, capture_output=True, timeout=300)
+            os.replace(tmp, path)
+            logger.info("Re-encoded to H.264: %s", path)
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+            logger.warning("ffmpeg re-encode failed: %s — keeping original", e)
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        return path

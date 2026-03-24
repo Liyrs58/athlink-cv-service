@@ -443,6 +443,15 @@ def cluster_teams(tracks: List[dict], video_path: str) -> Dict:
     t0_name = _detailed_colour_name(*t0_hsv)
     t1_name = _detailed_colour_name(*t1_hsv)
 
+    # If both teams get the same colour name, differentiate by brightness
+    if t0_name == t1_name:
+        if t0_hsv[2] >= t1_hsv[2]:
+            t0_name = f"light {t0_name}"
+            t1_name = f"dark {t1_name}"
+        else:
+            t0_name = f"dark {t0_name}"
+            t1_name = f"light {t1_name}"
+
     logger.info(
         "Team separation: team_0=%d (%s, HSV=[%.0f,%.0f,%.0f]), "
         "team_1=%d (%s, HSV=[%.0f,%.0f,%.0f])",
