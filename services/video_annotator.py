@@ -439,6 +439,7 @@ class VideoAnnotator:
             "-r", str(fps),
             "-pix_fmt", "yuv420p",
             "-movflags", "+faststart",
+            "-vf", "format=yuv420p",
             "-an",
             tmp,
         ]
