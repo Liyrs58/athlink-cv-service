@@ -117,7 +117,7 @@ def gemini_watch_clip(video_path: str, team_0_name: str, team_1_name: str) -> di
         if video_file.state.name == "FAILED":
             raise RuntimeError(f"Gemini file processing failed: {video_file.state.name}")
 
-        model = genai.GenerativeModel("gemini-1.5-pro")
+        model = genai.GenerativeModel("gemini-2.0-flash")
 
         prompt = f"""You are an elite football analyst with 20 years of experience coaching from grassroots Sunday league to professional academies. You understand every formation, every pressing system, every tactical concept in modern football.
 
@@ -257,7 +257,7 @@ def gemini_count_events(video_path: str, team_0_name: str, team_1_name: str) -> 
         if video_file.state.name == "FAILED":
             raise RuntimeError("Gemini file processing failed")
 
-        model = genai.GenerativeModel("gemini-1.5-pro")
+        model = genai.GenerativeModel("gemini-2.0-flash")
 
         prompt = f"""You are a professional football data analyst. Watch this clip and COUNT specific events as precisely as possible.
 
