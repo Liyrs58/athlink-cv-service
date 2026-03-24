@@ -2169,9 +2169,15 @@ function renderMatchFeed() {
 // === REPORT TABS ===
 function switchReportTab(tab, btn) {
   document.querySelectorAll('.report-tab').forEach(t => t.classList.remove('active'));
-  document.querySelectorAll('.report-tab-pane').forEach(p => p.style.display = 'none');
+  document.querySelectorAll('.report-tab-pane').forEach(p => {
+    p.style.display = 'none';
+    p.classList.remove('active');
+  });
   const pane = document.querySelector('.report-tab-' + tab);
-  if (pane) pane.style.display = 'block';
+  if (pane) {
+    pane.style.display = 'block';
+    pane.classList.add('active');
+  }
   if (btn) btn.classList.add('active');
 }
 
