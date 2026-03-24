@@ -440,17 +440,22 @@ def cluster_teams(tracks: List[dict], video_path: str) -> Dict:
     t0_count = sum(1 for t in tracks if t.get("teamId") == 0)
     t1_count = sum(1 for t in tracks if t.get("teamId") == 1)
 
-    t0_name = _detailed_colour_name(*t0_hsv)
-    t1_name = _detailed_colour_name(*t1_hsv)
+    # Get base colour names first (before brightness prefixes)
+    t0_base = hsv_to_colour_name(*t0_hsv)
+    t1_base = hsv_to_colour_name(*t1_hsv)
 
-    # If both teams get the same colour name, differentiate by brightness
-    if t0_name == t1_name:
-        if t0_hsv[2] >= t1_hsv[2]:
-            t0_name = f"light {t0_name}"
-            t1_name = f"dark {t1_name}"
+    # If both teams get the same base colour, differentiate by brightness before detailed naming
+    if t0_base == t1_base:
+        if t0_hsv[2] < t1_hsv[2]:
+            t0_name = f"dark {t0_base}"
+            t1_name = f"light {t1_base}"
         else:
-            t0_name = f"dark {t0_name}"
-            t1_name = f"light {t1_name}"
+            t0_name = f"light {t0_base}"
+            t1_name = f"dark {t1_base}"
+    else:
+        # Different base colours — use detailed naming
+        t0_name = _detailed_colour_name(*t0_hsv)
+        t1_name = _detailed_colour_name(*t1_hsv)
 
     logger.info(
         "Team separation: team_0=%d (%s, HSV=[%.0f,%.0f,%.0f]), "
