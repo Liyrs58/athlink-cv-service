@@ -357,13 +357,18 @@ class VideoAnnotator:
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-        # Try H.264 first (browser-compatible), fall back to mp4v
-        fourcc = cv2.VideoWriter_fourcc(*'avc1')
-        writer = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
-        if not writer.isOpened():
-            writer.release()
-            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-            writer = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+        # Try codecs in order until one works — ffmpeg re-encode ensures browser compat
+        writer = None
+        for codec in ['avc1', 'H264', 'X264', 'mp4v']:
+            fourcc = cv2.VideoWriter_fourcc(*codec)
+            w = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+            if w.isOpened():
+                logger.info("VideoWriter opened with codec: %s", codec)
+                writer = w
+                break
+            w.release()
+        if writer is None:
+            raise RuntimeError("No working video codec found")
 
         num_frames = len(tracks["players"])
         frame_num = 0
