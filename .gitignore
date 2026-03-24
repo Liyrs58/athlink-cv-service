@@ -104,3 +104,4 @@ logs/
 .pytest_cache/
 node_modules/
 nextjs-bridge/node_modules/
+nextjs-bridge/.next/

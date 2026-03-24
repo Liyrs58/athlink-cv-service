@@ -5,9 +5,10 @@ export const revalidate = 0;
 
 export async function GET(
   req: NextRequest,
-  { params }: { params: { jobId: string; trackId: string } }
+  { params }: { params: Promise<{ jobId: string; trackId: string }> }
 ) {
-  const path = `/api/v1/reports/${params.jobId}/player/${params.trackId}`;
+  const { jobId, trackId } = await params;
+  const path = `/api/v1/reports/${jobId}/player/${trackId}`;
   const res = await cvFetch(path);
 
   if (!res.ok) {
@@ -20,7 +21,7 @@ export async function GET(
     status: 200,
     headers: {
       "Content-Type": "application/pdf",
-      "Content-Disposition": `attachment; filename="player_${params.trackId}_report.pdf"`,
+      "Content-Disposition": `attachment; filename="player_${trackId}_report.pdf"`,
     },
   });
 }

@@ -5,14 +5,15 @@ export const revalidate = 0;
 
 export async function GET(
   _req: NextRequest,
-  { params }: { params: { jobId: string } }
+  { params }: { params: Promise<{ jobId: string }> }
 ) {
+  const { jobId } = await params;
   const res = await cvFetch(
     "/api/v1/highlight/detect",
     {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ jobId: params.jobId }),
+      body: JSON.stringify({ jobId }),
     }
   );
   const data = await res.json();

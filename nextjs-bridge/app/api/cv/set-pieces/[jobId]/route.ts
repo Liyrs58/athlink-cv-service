@@ -5,11 +5,12 @@ export const revalidate = 0;
 
 export async function GET(
   req: NextRequest,
-  { params }: { params: { jobId: string } }
+  { params }: { params: Promise<{ jobId: string }> }
 ) {
+  const { jobId } = await params;
   const url = new URL(req.url);
   const query = url.searchParams.toString();
-  const path = `/api/v1/set-pieces/${params.jobId}${query ? `?${query}` : ""}`;
+  const path = `/api/v1/set-pieces/${jobId}${query ? `?${query}` : ""}`;
   const res = await cvFetch(path);
   const data = await res.json();
   return Response.json(data, { status: res.status });
