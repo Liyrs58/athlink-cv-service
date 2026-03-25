@@ -1,130 +1,16 @@
 "use client";
 
-import { useEffect, useRef, useState, useCallback } from "react";
+import { useRef, useCallback, useEffect, useState } from "react";
 import { motion, useInView } from "framer-motion";
+import dynamic from "next/dynamic";
+import { Upload, Filter, Eye, Users, Layers, Brain, ShieldCheck, FileText } from "lucide-react";
 import { GlowingEffect } from "@/components/ui/glowing-effect";
+import AnalysisCanvas from "@/components/AnalysisCanvas";
+
+const PlayerModel3D = dynamic(() => import("@/components/PlayerModel3D"), { ssr: false });
 
 const APP_URL = "https://web-production-6b7ca.up.railway.app";
 
-/* ============================================================
-   ANIMATED FOOTBALL PITCH
-   ============================================================ */
-// Team A (teal) — 4-2 formation: 4 defenders, 2 midfielders
-const TEAM_A_POSITIONS = [
-  // Phase 1
-  [
-    { x: 20, y: 65 }, { x: 40, y: 62 }, { x: 60, y: 62 }, { x: 80, y: 65 },
-    { x: 35, y: 50 }, { x: 65, y: 50 },
-  ],
-  // Phase 2 — shift right
-  [
-    { x: 22, y: 63 }, { x: 42, y: 58 }, { x: 62, y: 60 }, { x: 82, y: 63 },
-    { x: 40, y: 46 }, { x: 60, y: 44 },
-  ],
-  // Phase 3 — press higher
-  [
-    { x: 18, y: 60 }, { x: 38, y: 55 }, { x: 58, y: 56 }, { x: 78, y: 60 },
-    { x: 38, y: 42 }, { x: 62, y: 40 },
-  ],
-  // Phase 4 — drop back
-  [
-    { x: 20, y: 68 }, { x: 40, y: 66 }, { x: 60, y: 66 }, { x: 80, y: 68 },
-    { x: 36, y: 54 }, { x: 64, y: 54 },
-  ],
-];
-
-// Team B (white) — 4-3 formation
-const TEAM_B_POSITIONS = [
-  [
-    { x: 20, y: 35 }, { x: 40, y: 38 }, { x: 60, y: 38 }, { x: 80, y: 35 },
-    { x: 30, y: 48 }, { x: 50, y: 45 }, 
-  ],
-  [
-    { x: 22, y: 37 }, { x: 38, y: 42 }, { x: 58, y: 40 }, { x: 78, y: 37 },
-    { x: 32, y: 52 }, { x: 55, y: 48 },
-  ],
-  [
-    { x: 18, y: 40 }, { x: 42, y: 44 }, { x: 62, y: 42 }, { x: 82, y: 40 },
-    { x: 28, y: 54 }, { x: 52, y: 52 },
-  ],
-  [
-    { x: 20, y: 33 }, { x: 40, y: 36 }, { x: 60, y: 36 }, { x: 80, y: 33 },
-    { x: 34, y: 46 }, { x: 48, y: 42 },
-  ],
-];
-
-const BALL_POSITIONS = [
-  { x: 50, y: 50 },
-  { x: 42, y: 44 },
-  { x: 60, y: 40 },
-  { x: 55, y: 52 },
-  { x: 38, y: 55 },
-  { x: 62, y: 48 },
-  { x: 48, y: 42 },
-  { x: 52, y: 54 },
-];
-
-function AnimatedPitch() {
-  const [phase, setPhase] = useState(0);
-  const [ballIdx, setBallIdx] = useState(0);
-
-  useEffect(() => {
-    const interval = setInterval(() => {
-      setPhase((p) => (p + 1) % TEAM_A_POSITIONS.length);
-      setBallIdx((b) => (b + 1) % BALL_POSITIONS.length);
-    }, 3000);
-    return () => clearInterval(interval);
-  }, []);
-
-  const teamA = TEAM_A_POSITIONS[phase];
-  const teamB = TEAM_B_POSITIONS[phase];
-  const ball = BALL_POSITIONS[ballIdx];
-
-  return (
-    <div className="pitch-container mx-auto">
-      <div className="pitch">
-        {/* Pitch markings */}
-        <div className="pitch-markings">
-          <div className="halfway-line" />
-          <div className="centre-circle" />
-          <div className="centre-spot" />
-          <div className="penalty-box-top" />
-          <div className="goal-box-top" />
-          <div className="penalty-box-bottom" />
-          <div className="goal-box-bottom" />
-          <div className="corner-tl" />
-          <div className="corner-tr" />
-          <div className="corner-bl" />
-          <div className="corner-br" />
-        </div>
-
-        {/* Team A dots (teal) */}
-        {teamA.map((pos, i) => (
-          <div
-            key={`a-${i}`}
-            className="player-dot team-a"
-            style={{ left: `${pos.x}%`, top: `${pos.y}%` }}
-          />
-        ))}
-
-        {/* Team B dots (white) */}
-        {teamB.map((pos, i) => (
-          <div
-            key={`b-${i}`}
-            className="player-dot team-b"
-            style={{ left: `${pos.x}%`, top: `${pos.y}%` }}
-          />
-        ))}
-
-        {/* Ball */}
-        <div
-          className="player-dot ball"
-          style={{ left: `${ball.x}%`, top: `${ball.y}%` }}
-        />
-      </div>
-    </div>
-  );
-}
 
 /* ============================================================
    FEATURE CARD WITH 3D TILT + GLOWING EFFECT
@@ -244,11 +130,238 @@ const IconTeam = () => (
   </svg>
 );
 
-const IconSpeed = () => (
-  <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-    <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2" />
-  </svg>
-);
+
+/* ============================================================
+   PIPELINE DIAGRAM
+   ============================================================ */
+const PIPELINE_NODES = [
+  { label: "VIDEO UPLOAD", sub: "Any format, any angle", icon: Upload, glow: "" },
+  { label: "SCENE FILTER", sub: "Removes cutaways", icon: Filter, glow: "" },
+  { label: "YOLO DETECTION", sub: "Every visible player", icon: Eye, glow: "" },
+  { label: "PLAYER TRACKING", sub: "BoT-SORT + ReID", icon: Users, glow: "" },
+  { label: "TEAM SEPARATION", sub: "K-means by kit colour", icon: Layers, glow: "" },
+  { label: "GEMINI VISION", sub: "Watches the footage", icon: Brain, glow: "0 0 20px rgba(99,102,241,0.3)" },
+  { label: "CLAUDE AUDIT", sub: "Cross-checks the data", icon: ShieldCheck, glow: "0 0 20px rgba(251,146,60,0.3)" },
+  { label: "COACHING REPORT", sub: "Tactics + players + training", icon: FileText, glow: "0 0 24px rgba(0,212,170,0.4)" },
+];
+
+function PipelineDiagram() {
+  const ref = useRef(null);
+  const isInView = useInView(ref, { once: true, margin: "-60px" });
+
+  return (
+    <div ref={ref}>
+      {/* Desktop: horizontal */}
+      <div className="hidden md:flex items-start justify-center gap-0">
+        {PIPELINE_NODES.map((node, i) => {
+          const Icon = node.icon;
+          const isOutput = i === PIPELINE_NODES.length - 1;
+          return (
+            <div key={node.label} className="flex items-center">
+              <motion.div
+                initial={{ opacity: 0, y: 20 }}
+                animate={isInView ? { opacity: 1, y: 0 } : { opacity: 0, y: 20 }}
+                transition={{ duration: 0.5, delay: i * 0.15, ease: [0.25, 0.1, 0.25, 1] }}
+                className={`flex flex-col items-center text-center ${isOutput ? "w-[130px]" : "w-[110px]"}`}
+              >
+                <div
+                  className={`rounded-xl border flex items-center justify-center mb-3 ${
+                    isOutput
+                      ? "w-16 h-16 border-[#00d4aa]/60 bg-[#0d1117]"
+                      : "w-14 h-14 border-[rgba(0,212,170,0.4)] bg-[#0d1117]"
+                  }`}
+                  style={node.glow ? { boxShadow: node.glow } : undefined}
+                >
+                  <Icon size={isOutput ? 26 : 22} className="text-[#00d4aa]" />
+                </div>
+                <span className="text-white text-[11px] font-bold leading-tight mb-1">
+                  {node.label}
+                </span>
+                <span className="text-gray-500 text-[10px] leading-tight">
+                  {node.sub}
+                </span>
+              </motion.div>
+
+              {/* Connecting arrow */}
+              {i < PIPELINE_NODES.length - 1 && (
+                <motion.div
+                  initial={{ opacity: 0, scaleX: 0 }}
+                  animate={isInView ? { opacity: 1, scaleX: 1 } : { opacity: 0, scaleX: 0 }}
+                  transition={{ duration: 0.4, delay: i * 0.15 + 0.1 }}
+                  className="flex-shrink-0 mb-8"
+                  style={{ originX: 0 }}
+                >
+                  <svg width="24" height="12" viewBox="0 0 24 12">
+                    <line
+                      x1="0" y1="6" x2="18" y2="6"
+                      stroke="#00d4aa" strokeWidth="1.5"
+                      strokeDasharray="4 3"
+                      className="pipeline-dash"
+                    />
+                    <polygon points="18,2 24,6 18,10" fill="#00d4aa" opacity="0.7" />
+                  </svg>
+                </motion.div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+
+      {/* Mobile: vertical */}
+      <div className="flex md:hidden flex-col items-center gap-0">
+        {PIPELINE_NODES.map((node, i) => {
+          const Icon = node.icon;
+          const isOutput = i === PIPELINE_NODES.length - 1;
+          return (
+            <div key={node.label} className="flex flex-col items-center">
+              <motion.div
+                initial={{ opacity: 0, y: 20 }}
+                animate={isInView ? { opacity: 1, y: 0 } : { opacity: 0, y: 20 }}
+                transition={{ duration: 0.5, delay: i * 0.12, ease: [0.25, 0.1, 0.25, 1] }}
+                className="flex items-center gap-4 w-full max-w-xs"
+              >
+                <div
+                  className={`rounded-xl border flex-shrink-0 flex items-center justify-center ${
+                    isOutput
+                      ? "w-14 h-14 border-[#00d4aa]/60 bg-[#0d1117]"
+                      : "w-12 h-12 border-[rgba(0,212,170,0.4)] bg-[#0d1117]"
+                  }`}
+                  style={node.glow ? { boxShadow: node.glow } : undefined}
+                >
+                  <Icon size={20} className="text-[#00d4aa]" />
+                </div>
+                <div>
+                  <p className="text-white text-xs font-bold">{node.label}</p>
+                  <p className="text-gray-500 text-[10px]">{node.sub}</p>
+                </div>
+              </motion.div>
+
+              {/* Vertical arrow */}
+              {i < PIPELINE_NODES.length - 1 && (
+                <motion.div
+                  initial={{ opacity: 0, scaleY: 0 }}
+                  animate={isInView ? { opacity: 1, scaleY: 1 } : { opacity: 0, scaleY: 0 }}
+                  transition={{ duration: 0.3, delay: i * 0.12 + 0.08 }}
+                  className="my-1"
+                  style={{ originY: 0 }}
+                >
+                  <svg width="12" height="20" viewBox="0 0 12 20">
+                    <line
+                      x1="6" y1="0" x2="6" y2="14"
+                      stroke="#00d4aa" strokeWidth="1.5"
+                      strokeDasharray="4 3"
+                      className="pipeline-dash-v"
+                    />
+                    <polygon points="2,14 6,20 10,14" fill="#00d4aa" opacity="0.7" />
+                  </svg>
+                </motion.div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+/* ============================================================
+   BROADCAST-STYLE TACTICAL ANALYSIS CANVAS
+   ============================================================ */
+
+/* ============================================================
+   SCROLL EXPAND ANALYSIS
+   ============================================================ */
+function ScrollExpandAnalysis() {
+  const sectionRef = useRef<HTMLDivElement>(null);
+  const [progress, setProgress] = useState(0);
+  const progressRef = useRef(progress);
+
+  useEffect(() => {
+    progressRef.current = progress;
+  }, [progress]);
+
+  useEffect(() => {
+    const section = sectionRef.current;
+    if (!section) return;
+
+    const handleScroll = () => {
+      if (!section) return;
+      const rect = section.getBoundingClientRect();
+      const viewH = window.innerHeight;
+      const raw = Math.max(0, Math.min(1, 1 - rect.top / viewH));
+      if (Math.abs(raw - progressRef.current) > 0.01) {
+        setProgress(raw);
+      }
+    };
+
+    const observer = new IntersectionObserver(() => handleScroll(), { threshold: [0, 0.5, 1] });
+    observer.observe(section);
+
+    window.addEventListener("scroll", handleScroll, { passive: true });
+    return () => {
+      window.removeEventListener("scroll", handleScroll);
+      observer.disconnect();
+    };
+  }, []);
+
+  const mediaWidth = 300 + progress * 900;
+  const mediaHeight = 400 + progress * 300;
+  const textTx = progress * 150;
+  const contentOpacity = progress >= 0.95 ? 1 : 0;
+
+  return (
+    <div ref={sectionRef} className="relative">
+      {/* Split text */}
+      <div className="flex justify-center gap-4 mb-8">
+        <span
+          className="text-4xl md:text-6xl font-bold text-white transition-transform duration-100"
+          style={{ transform: `translateX(-${textTx}px)` }}
+        >
+          WATCH
+        </span>
+        <span
+          className="text-4xl md:text-6xl font-bold text-[#00d4aa] transition-transform duration-100"
+          style={{ transform: `translateX(${textTx}px)` }}
+        >
+          IT WORK
+        </span>
+      </div>
+
+      {/* Expanding media frame */}
+      <div className="flex justify-center">
+        <div
+          className="overflow-hidden rounded-xl border border-[rgba(0,212,170,0.3)] transition-[width,height] duration-100"
+          style={{
+            width: `min(${mediaWidth}px, 100%)`,
+            height: `${mediaHeight}px`,
+          }}
+        >
+          <AnalysisCanvas />
+        </div>
+      </div>
+
+      {/* Stat cards — appear after full expansion */}
+      <div
+        className="grid md:grid-cols-3 gap-6 mt-12 max-w-4xl mx-auto transition-opacity duration-500"
+        style={{ opacity: contentOpacity }}
+      >
+        {[
+          { title: "Players Detected", sub: "Every visible player tracked per frame" },
+          { title: "Teams Separated", sub: "Kit colour clustering, automatic" },
+          { title: "Report Generated", sub: "Tactics, players, training plan" },
+        ].map((card) => (
+          <div
+            key={card.title}
+            className="rounded-xl bg-[#0d1117] border border-white/5 p-6 text-center"
+          >
+            <h4 className="text-white font-bold text-lg mb-2">{card.title}</h4>
+            <p className="text-gray-500 text-sm">{card.sub}</p>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
 
 /* ============================================================
    MAIN PAGE
@@ -289,65 +402,47 @@ export default function Home() {
               <span className="text-white font-semibold">£10,000+</span> per
               match. Athlink CV is{" "}
               <span className="text-[#00d4aa] font-semibold">£30/month</span>.
-              Upload a clip. Get a full coaching report in 90 seconds.
+              Upload a clip. Get a full coaching report.
             </p>
             <a href={APP_URL} className="cta-button">
               START ANALYSING →
             </a>
           </FadeInSection>
 
-          {/* Right — animated pitch */}
+          {/* Right — live analysis preview */}
           <FadeInSection delay={0.3} className="flex justify-center">
-            <AnimatedPitch />
+            <div className="relative w-full max-w-[560px] aspect-[4/3] rounded-xl overflow-hidden shadow-2xl shadow-black/40">
+              <AnalysisCanvas />
+              <div className="absolute inset-0 pointer-events-none rounded-xl" style={{ boxShadow: "inset 0 0 60px rgba(0,212,170,0.12)" }} />
+            </div>
           </FadeInSection>
         </div>
       </section>
 
-      {/* ===== HOW IT WORKS ===== */}
-      <section className="py-24 px-6 relative">
-        <div className="max-w-5xl mx-auto">
+      {/* ===== THE PIPELINE ===== */}
+      <section className="py-24 px-6 relative overflow-hidden">
+        {/* Subtle teal glow */}
+        <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[800px] h-[400px] bg-[#00d4aa]/5 rounded-full blur-[160px] pointer-events-none" />
+
+        <div className="max-w-7xl mx-auto relative">
           <FadeInSection>
-            <h2 className="section-title">How It Works</h2>
+            <h2 className="section-title">The Pipeline</h2>
             <p className="text-gray-400 text-center mb-16 max-w-xl mx-auto">
-              Three steps. Ninety seconds. One complete coaching report.
+              Every job runs through eight layers of analysis. No shortcuts.
             </p>
           </FadeInSection>
 
-          <div className="grid md:grid-cols-3 gap-8">
-            {[
-              {
-                step: "01",
-                title: "Upload Your Clip",
-                desc: "Upload any football clip — broadcast or amateur. Any angle, any quality.",
-              },
-              {
-                step: "02",
-                title: "AI Pipeline Runs",
-                desc: "AI pipeline tracks every player, separates teams, detects the ball frame by frame.",
-              },
-              {
-                step: "03",
-                title: "Get Your Report",
-                desc: "Full coaching report in 90 seconds — tactics, player cards, training plan.",
-              },
-            ].map((item, i) => (
-              <FadeInSection key={item.step} delay={i * 0.15}>
-                <div className="relative p-6 rounded-xl bg-[#111827]/60 border border-white/5 text-center group hover:border-[#00d4aa]/20 transition-all duration-300">
-                  <span className="text-5xl font-bold text-[#00d4aa]/15 absolute top-3 left-1/2 -translate-x-1/2">
-                    {item.step}
-                  </span>
-                  <div className="pt-10">
-                    <h3 className="text-xl font-bold text-white mb-3">
-                      {item.title}
-                    </h3>
-                    <p className="text-gray-400 text-sm leading-relaxed">
-                      {item.desc}
-                    </p>
-                  </div>
-                </div>
-              </FadeInSection>
-            ))}
-          </div>
+          <PipelineDiagram />
+        </div>
+      </section>
+
+      {/* ===== SEE THE ANALYSIS ===== */}
+      <section className="py-24 px-6 relative overflow-hidden">
+        <div className="max-w-7xl mx-auto">
+          <FadeInSection>
+            <h2 className="section-title mb-16">See The Analysis</h2>
+          </FadeInSection>
+          <ScrollExpandAnalysis />
         </div>
       </section>
 
@@ -387,63 +482,101 @@ export default function Home() {
             </FadeInSection>
             <FadeInSection delay={0.3}>
               <FeatureCard
-                icon={<IconSpeed />}
-                title="90 Second Turnaround"
-                description="GPU-accelerated pipeline. Upload at half time, read the report before the second half."
+                icon={<ShieldCheck size={24} />}
+                title="Audit-Grade Accuracy"
+                description="The pipeline cross-checks itself. Gemini watches the footage. Claude audits the tracking data against the actual frames. Unreliable metrics get flagged, not reported."
               />
             </FadeInSection>
           </div>
         </div>
       </section>
 
-      {/* ===== COMPETITOR TABLE ===== */}
+      {/* ===== YOUR PLAYER PROFILE ===== */}
+      <section className="py-24 px-6 relative overflow-hidden">
+        <div className="absolute top-1/2 right-0 w-[600px] h-[600px] bg-[#00d4aa]/5 rounded-full blur-[160px] pointer-events-none -translate-y-1/2" />
+
+        <div className="max-w-7xl mx-auto relative">
+          <div className="grid lg:grid-cols-2 gap-12 items-center">
+            {/* Left — text */}
+            <FadeInSection>
+              <p className="text-[#00d4aa] text-sm font-semibold mb-4 uppercase tracking-[0.3em]">
+                Player Profiles
+              </p>
+              <h2 className="text-3xl md:text-4xl font-bold text-white mb-6 leading-tight">
+                Every Player Gets a{" "}
+                <span className="text-[#00d4aa]">Card</span>
+              </h2>
+              <p className="text-gray-400 text-lg leading-relaxed mb-6">
+                The pipeline tracks each player individually. Speed, distance covered,
+                sprint count, defensive actions, positional heatmap — all extracted
+                automatically from the footage.
+              </p>
+              <p className="text-gray-400 text-lg leading-relaxed mb-8">
+                When a coach signs in, their players get named profiles that persist
+                across matches. Track development over time, compare performance,
+                identify who needs rotation.
+              </p>
+              <div className="flex gap-6 text-sm">
+                <div className="border border-white/10 rounded-lg px-5 py-3 bg-[#0d1117]">
+                  <span className="text-[#00d4aa] font-bold text-2xl block">22</span>
+                  <span className="text-gray-500">Players Tracked</span>
+                </div>
+                <div className="border border-white/10 rounded-lg px-5 py-3 bg-[#0d1117]">
+                  <span className="text-[#00d4aa] font-bold text-2xl block">30fps</span>
+                  <span className="text-gray-500">Frame Resolution</span>
+                </div>
+                <div className="border border-white/10 rounded-lg px-5 py-3 bg-[#0d1117]">
+                  <span className="text-[#00d4aa] font-bold text-2xl block">±0.3m</span>
+                  <span className="text-gray-500">Position Accuracy</span>
+                </div>
+              </div>
+            </FadeInSection>
+
+            {/* Right — 3D player model */}
+            <FadeInSection delay={0.2}>
+              <div className="h-[550px] rounded-2xl border border-white/5 bg-[#0a0f1a] overflow-hidden relative">
+                <PlayerModel3D playerName="ATHLINK" playerNumber={10} />
+                <div className="absolute bottom-4 left-0 right-0 text-center">
+                  <span className="text-gray-600 text-xs tracking-wider">DRAG TO ROTATE &middot; SCROLL TO ZOOM</span>
+                </div>
+              </div>
+            </FadeInSection>
+          </div>
+        </div>
+      </section>
+
+      {/* ===== THE PROBLEM WE SOLVE ===== */}
       <section className="py-24 px-6 relative">
         <div className="max-w-4xl mx-auto">
           <FadeInSection>
-            <h2 className="section-title">The Competition</h2>
-            <p className="text-gray-400 text-center mb-16 max-w-xl mx-auto">
-              See how Athlink CV stacks up against industry players.
-            </p>
-          </FadeInSection>
+            <div className="rounded-2xl bg-[#111827] border border-white/5 p-8 md:p-14">
+              <h2 className="text-3xl md:text-4xl font-bold mb-10">
+                Grassroots Football Has a{" "}
+                <span className="text-[#00d4aa]">Data Problem</span>
+              </h2>
 
-          <FadeInSection delay={0.15}>
-            <div className="overflow-x-auto rounded-xl bg-[#111827]/40 border border-white/5 p-4">
-              <table className="competitor-table">
-                <thead>
-                  <tr>
-                    <th>Platform</th>
-                    <th>Price</th>
-                    <th>AI Report</th>
-                    <th>Auto Tracking</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  <tr>
-                    <td className="text-white font-semibold">TRACAB</td>
-                    <td className="text-gray-300">£10,000+ / match</td>
-                    <td className="text-[#00d4aa]">✓</td>
-                    <td className="text-[#00d4aa]">✓</td>
-                  </tr>
-                  <tr>
-                    <td className="text-white font-semibold">Hudl</td>
-                    <td className="text-gray-300">£200+ / month</td>
-                    <td className="text-red-400">✗</td>
-                    <td className="text-red-400">✗</td>
-                  </tr>
-                  <tr>
-                    <td className="text-white font-semibold">Veo</td>
-                    <td className="text-gray-300">£99+ / month</td>
-                    <td className="text-red-400">✗</td>
-                    <td className="text-red-400">✗</td>
-                  </tr>
-                  <tr className="athlink-row">
-                    <td>ATHLINK CV</td>
-                    <td>£30 / month</td>
-                    <td>✓</td>
-                    <td>✓</td>
-                  </tr>
-                </tbody>
-              </table>
+              <p className="text-gray-300 text-lg leading-relaxed mb-6">
+                Professional clubs spend millions on performance analysis. They know
+                exactly how far each player ran, where the team lost possession,
+                which pressing triggers broke down, and how individual decision
+                quality holds up under pressure. Their coaches walk into half time
+                with data. Yours walk in with a feeling.
+              </p>
+
+              <p className="text-gray-300 text-lg leading-relaxed mb-6">
+                Athlink CV closes that gap. Upload any clip — broadcast footage, a
+                phone recording from the touchline, anything. The system watches the
+                footage with AI, tracks every visible player, separates teams
+                automatically, and builds a complete coaching report. Formation
+                analysis. Individual player cards. Pressing pattern breakdown.
+                Training recommendations based on what the data actually shows.
+              </p>
+
+              <p className="text-gray-300 text-lg leading-relaxed">
+                This isn&apos;t a highlight reel tool. It&apos;s not a video library.
+                It&apos;s the analytical infrastructure that professional clubs pay
+                for, rebuilt for the coaches who actually need it.
+              </p>
             </div>
           </FadeInSection>
         </div>

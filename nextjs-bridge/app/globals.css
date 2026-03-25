@@ -387,3 +387,11 @@ body {
 ::-webkit-scrollbar-thumb:hover {
   background: #00d4aa;
 }
+
+/* ===== PIPELINE DASH ANIMATION ===== */
+@keyframes dash-flow {
+  to { stroke-dashoffset: -14; }
+}
+.pipeline-dash, .pipeline-dash-v {
+  animation: dash-flow 0.8s linear infinite;
+}
