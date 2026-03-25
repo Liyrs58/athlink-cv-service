@@ -1,0 +1,12 @@
+.next/
+node_modules/
+next/
+*.tsbuildinfo
+check.js
+fix.js
+fix2.js
+fix3.js
+fix4.js
+sample.js
+nextjs-bridge@1.0.0
+texture_*.png
