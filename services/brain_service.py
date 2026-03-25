@@ -773,8 +773,12 @@ def _fallback_report(tracking_data: dict, team_0_name: str, team_1_name: str) ->
     max_spd = phys.get("max_speed_kmh", "?")
     lines.append(f"- {players} players tracked, {sprints} total sprints")
     lines.append(f"- Top speed recorded: {max_spd} km/h")
-    if possession.get("team_0_pct"):
-        lines.append(f"- Possession: {team_0_name} {possession['team_0_pct']:.0f}% vs {team_1_name} {possession.get('team_1_pct', 0):.0f}%")
+    _t0p = possession.get("team_0_pct")
+    _t1p = possession.get("team_1_pct")
+    if _t0p is not None and _t1p is not None:
+        lines.append(f"- Possession: {team_0_name} {_t0p:.0f}% vs {team_1_name} {_t1p:.0f}%")
+    else:
+        lines.append("- Possession: insufficient data")
     lines.append("")
 
     lines.append("ONE THING TO FIX THIS WEEK")
@@ -837,8 +841,8 @@ def generate_brain_report(job_id: str, video_path: str, result: dict) -> str:
             "total_sprints": phys.get("total_sprints", 0),
             "max_speed_kmh": phys.get("max_speed_kmh", 0),
             "ball_tracking_rate": result.get("ball", {}).get("tracking_rate", 0),
-            "possession_team_0": result.get("possession", {}).get("team_0_pct", 0),
-            "possession_team_1": result.get("possession", {}).get("team_1_pct", 0),
+            "possession_team_0": result.get("possession", {}).get("team_0_pct"),
+            "possession_team_1": result.get("possession", {}).get("team_1_pct"),
         }
 
         # LAYER 2 — Claude audits tracking vs frames

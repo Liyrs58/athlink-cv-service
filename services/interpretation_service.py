@@ -346,9 +346,12 @@ def build_rich_context(events, tracks, vel_summary, shape_summary, velocities, j
         lines.append(f"  Ball tracked in {tracking_rate:.0f}% of frames")
 
         if possession_data:
-            t0_poss = possession_data.get("team_0_pct", 0)
-            t1_poss = possession_data.get("team_1_pct", 0)
-            lines.append(f"  Possession: {t0_name} {t0_poss:.0f}% | {t1_name} {t1_poss:.0f}%")
+            t0_poss = possession_data.get("team_0_pct")
+            t1_poss = possession_data.get("team_1_pct")
+            if t0_poss is not None and t1_poss is not None:
+                lines.append(f"  Possession: {t0_name} {t0_poss:.0f}% | {t1_name} {t1_poss:.0f}%")
+            else:
+                lines.append("  Possession: insufficient data")
 
         if pass_data and pass_data.get("total", 0) > 0:
             total_passes = pass_data["total"]
