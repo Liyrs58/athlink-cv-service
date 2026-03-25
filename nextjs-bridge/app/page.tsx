@@ -3,7 +3,7 @@
 import { useRef, useCallback, useEffect, useState } from "react";
 import { motion, useInView } from "framer-motion";
 import dynamic from "next/dynamic";
-import { Upload, Filter, Eye, Users, Layers, Brain, ShieldCheck, FileText } from "lucide-react";
+import { Upload, Filter, Eye, Users, Layers, Brain, ShieldCheck, FileText, X } from "lucide-react";
 import { GlowingEffect } from "@/components/ui/glowing-effect";
 import AnalysisCanvas from "@/components/AnalysisCanvas";
 
@@ -135,17 +135,276 @@ const IconTeam = () => (
    PIPELINE DIAGRAM
    ============================================================ */
 const PIPELINE_NODES = [
-  { label: "VIDEO UPLOAD", sub: "Any format, any angle", icon: Upload, glow: "" },
-  { label: "SCENE FILTER", sub: "Removes cutaways", icon: Filter, glow: "" },
-  { label: "YOLO DETECTION", sub: "Every visible player", icon: Eye, glow: "" },
-  { label: "PLAYER TRACKING", sub: "BoT-SORT + ReID", icon: Users, glow: "" },
-  { label: "TEAM SEPARATION", sub: "K-means by kit colour", icon: Layers, glow: "" },
-  { label: "GEMINI VISION", sub: "Watches the footage", icon: Brain, glow: "0 0 20px rgba(99,102,241,0.3)" },
-  { label: "CLAUDE AUDIT", sub: "Cross-checks the data", icon: ShieldCheck, glow: "0 0 20px rgba(251,146,60,0.3)" },
-  { label: "COACHING REPORT", sub: "Tactics + players + training", icon: FileText, glow: "0 0 24px rgba(0,212,170,0.4)" },
+  {
+    id: 1,
+    label: "Video Upload",
+    sub: "Drop in any match clip — phone footage, broadcast, or dashcam. Any format works.",
+    icon: Upload,
+    glow: "",
+  },
+  {
+    id: 2,
+    label: "Scene Filter",
+    sub: "Crowd shots, bench cuts, and replays are automatically removed. Only live pitch action counts.",
+    icon: Filter,
+    glow: "",
+  },
+  {
+    id: 3,
+    label: "Player Detection",
+    sub: "Every player on the pitch is located in under 60 milliseconds per frame using AI vision.",
+    icon: Eye,
+    glow: "",
+  },
+  {
+    id: 4,
+    label: "Player Tracking",
+    sub: "Each player receives a unique ID and is followed continuously across every frame of the match.",
+    icon: Users,
+    glow: "",
+  },
+  {
+    id: 5,
+    label: "Team Separation",
+    sub: "Players are sorted into two teams automatically based on their kit colour. No tagging needed.",
+    icon: Layers,
+    glow: "",
+  },
+  {
+    id: 6,
+    label: "Gemini Vision",
+    sub: "Google's AI watches your footage and identifies tactical patterns, pressure zones, and key moments.",
+    icon: Brain,
+    glow: "0 0 20px rgba(99,102,241,0.3)",
+  },
+  {
+    id: 7,
+    label: "Accuracy Check",
+    sub: "A second AI reviews all the numbers and removes anything that looks incorrect or unreliable.",
+    icon: ShieldCheck,
+    glow: "0 0 20px rgba(251,146,60,0.3)",
+  },
+  {
+    id: 8,
+    label: "Coaching Report",
+    sub: "You get a full report — player stats, team shape, sprint data, and specific training recommendations.",
+    icon: FileText,
+    glow: "0 0 24px rgba(0,212,170,0.4)",
+  },
 ];
 
-function PipelineDiagram() {
+/* ============================================================
+   STEP ANIMATIONS
+   ============================================================ */
+function StepAnimation({ stepId }: { stepId: number }) {
+  if (stepId === 1) return (
+    <div className="w-full h-40 flex items-center justify-center gap-8 relative overflow-hidden">
+      <style>{`
+        @keyframes slideInLeft { from { opacity:0; transform:translateX(-40px); } to { opacity:1; transform:translateX(0); } }
+        @keyframes slideInRight { from { opacity:0; transform:translateX(40px); } to { opacity:1; transform:translateX(0); } }
+        @keyframes bounceUp { 0%,100%{transform:translateY(0)} 50%{transform:translateY(-12px)} }
+      `}</style>
+      <div style={{ animation: "slideInLeft 0.6s ease forwards" }}>
+        <svg width="48" height="60" viewBox="0 0 48 60"><rect x="4" y="4" width="40" height="52" rx="4" fill="none" stroke="#00d4aa" strokeWidth="2"/><line x1="12" y1="16" x2="36" y2="16" stroke="#00d4aa" strokeWidth="1.5"/><line x1="12" y1="24" x2="36" y2="24" stroke="#00d4aa" strokeWidth="1.5"/><line x1="12" y1="32" x2="28" y2="32" stroke="#00d4aa" strokeWidth="1.5"/></svg>
+      </div>
+      <div style={{ animation: "bounceUp 1.2s ease infinite" }}>
+        <svg width="40" height="40" viewBox="0 0 40 40"><polyline points="20,32 20,8" stroke="white" strokeWidth="2.5" strokeLinecap="round"/><polyline points="10,18 20,8 30,18" stroke="white" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" fill="none"/><line x1="8" y1="34" x2="32" y2="34" stroke="#00d4aa" strokeWidth="2" strokeLinecap="round"/></svg>
+      </div>
+      <div style={{ animation: "slideInRight 0.6s ease 0.2s both" }}>
+        <svg width="48" height="60" viewBox="0 0 48 60"><rect x="4" y="4" width="40" height="52" rx="4" fill="none" stroke="#00d4aa" strokeWidth="2"/><line x1="12" y1="16" x2="36" y2="16" stroke="#00d4aa" strokeWidth="1.5"/><line x1="12" y1="24" x2="36" y2="24" stroke="#00d4aa" strokeWidth="1.5"/><line x1="12" y1="32" x2="28" y2="32" stroke="#00d4aa" strokeWidth="1.5"/></svg>
+      </div>
+    </div>
+  );
+
+  if (stepId === 2) return (
+    <div className="w-full h-40 flex items-center justify-center gap-12">
+      <style>{`
+        @keyframes crossIn { from{opacity:0;transform:scale(0.5)rotate(-45deg)}to{opacity:1;transform:scale(1)rotate(0deg)} }
+        @keyframes checkIn { from{opacity:0;transform:scale(0.5)}to{opacity:1;transform:scale(1)} }
+      `}</style>
+      <div className="flex flex-col items-center gap-2">
+        <svg width="56" height="40" viewBox="0 0 56 40"><rect x="2" y="2" width="52" height="36" rx="4" fill="#1a1a2e" stroke="#444" strokeWidth="1.5"/><circle cx="14" cy="28" r="6" fill="#333"/><circle cx="22" cy="28" r="8" fill="#333"/><circle cx="34" cy="28" r="8" fill="#333"/><circle cx="42" cy="28" r="6" fill="#333"/><ellipse cx="28" cy="20" rx="10" ry="4" fill="#333"/></svg>
+        <div style={{ animation: "crossIn 0.5s ease forwards" }}>
+          <svg width="32" height="32" viewBox="0 0 32 32"><line x1="4" y1="4" x2="28" y2="28" stroke="#ef4444" strokeWidth="3" strokeLinecap="round"/><line x1="28" y1="4" x2="4" y2="28" stroke="#ef4444" strokeWidth="3" strokeLinecap="round"/></svg>
+        </div>
+      </div>
+      <div className="flex flex-col items-center gap-2">
+        <svg width="56" height="36" viewBox="0 0 56 36"><rect x="2" y="2" width="52" height="32" rx="4" fill="#0a2a1a" stroke="#00d4aa" strokeWidth="1.5"/><ellipse cx="28" cy="20" rx="18" ry="8" fill="#0d4a2a"/></svg>
+        <div style={{ animation: "checkIn 0.5s ease 0.3s both" }}>
+          <svg width="32" height="32" viewBox="0 0 32 32"><polyline points="4,18 12,26 28,8" stroke="#22c55e" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" fill="none"/></svg>
+        </div>
+      </div>
+    </div>
+  );
+
+  if (stepId === 3) return (
+    <div className="w-full h-40 flex items-center justify-center">
+      <style>{`
+        @keyframes dotAppear { from{opacity:0;transform:scale(0)} 60%{transform:scale(1.4)} to{opacity:1;transform:scale(1)} }
+      `}</style>
+      <svg width="160" height="100" viewBox="0 0 160 100">
+        <rect x="2" y="2" width="156" height="96" rx="6" fill="#0a2a1a" stroke="#00d4aa" strokeWidth="1.5"/>
+        {[
+          [30,30],[60,20],[90,35],[120,25],[45,60],[80,65],[110,55],[140,40],[25,75],[65,80],[100,70]
+        ].map(([cx,cy],i) => (
+          <circle key={i} cx={cx} cy={cy} r="5" fill="#00d4aa" style={{ animation: `dotAppear 0.4s ease ${i*0.12}s both` }}/>
+        ))}
+      </svg>
+    </div>
+  );
+
+  if (stepId === 4) return (
+    <div className="w-full h-40 flex items-center justify-center">
+      <style>{`
+        @keyframes moveDot1 { 0%{offset-distance:0%}100%{offset-distance:100%} }
+        @keyframes moveDot2 { 0%{offset-distance:0%}100%{offset-distance:100%} }
+        @keyframes trailFade { 0%,100%{opacity:0}50%{opacity:0.5} }
+      `}</style>
+      <svg width="160" height="100" viewBox="0 0 160 100">
+        <rect x="2" y="2" width="156" height="96" rx="6" fill="#0a2a1a" stroke="#00d4aa" strokeWidth="1.5"/>
+        <path d="M20,70 Q50,20 90,50 T150,30" fill="none" stroke="#00d4aa" strokeWidth="1" strokeDasharray="4 3" opacity="0.4"/>
+        <path d="M20,50 Q60,80 100,40 T150,60" fill="none" stroke="#00d4aa" strokeWidth="1" strokeDasharray="4 3" opacity="0.4"/>
+        <path d="M30,80 Q80,30 130,70" fill="none" stroke="#00d4aa" strokeWidth="1" strokeDasharray="4 3" opacity="0.4"/>
+        <circle r="6" fill="#ef4444" style={{ offsetPath: "path('M20,70 Q50,20 90,50 T150,30')", animation: "moveDot1 2s linear infinite" } as React.CSSProperties}/>
+        <circle r="6" fill="#3b82f6" style={{ offsetPath: "path('M20,50 Q60,80 100,40 T150,60')", animation: "moveDot2 2.5s linear infinite 0.5s" } as React.CSSProperties}/>
+        <circle r="6" fill="#00d4aa" style={{ offsetPath: "path('M30,80 Q80,30 130,70')", animation: "moveDot1 1.8s linear infinite 1s" } as React.CSSProperties}/>
+      </svg>
+    </div>
+  );
+
+  if (stepId === 5) return (
+    <div className="w-full h-40 flex items-center justify-center">
+      <style>{`
+        @keyframes toRed { 0%{fill:#888}100%{fill:#ef4444} }
+        @keyframes toBlue { 0%{fill:#888}100%{fill:#3b82f6} }
+      `}</style>
+      <svg width="160" height="100" viewBox="0 0 160 100">
+        <rect x="2" y="2" width="156" height="96" rx="6" fill="#0a2a1a" stroke="#00d4aa" strokeWidth="1.5"/>
+        {[
+          [40,30,"red"],[60,25,"red"],[35,55,"red"],[55,60,"red"],[48,42,"red"],
+          [100,30,"blue"],[120,25,"blue"],[105,55,"blue"],[125,60,"blue"],[115,42,"blue"],
+        ].map(([cx,cy,team],i) => (
+          <circle key={i} cx={cx as number} cy={cy as number} r="7"
+            style={{ animation: `${team === "red" ? "toRed" : "toBlue"} 0.8s ease ${0.5 + i*0.1}s both` }}/>
+        ))}
+        <line x1="80" y1="10" x2="80" y2="90" stroke="#00d4aa" strokeWidth="1" strokeDasharray="4 3" opacity="0.5"/>
+      </svg>
+    </div>
+  );
+
+  if (stepId === 6) return (
+    <div className="w-full h-40 flex items-center justify-center">
+      <style>{`
+        @keyframes scanLine { 0%{transform:translateX(-60px)}100%{transform:translateX(60px)} }
+      `}</style>
+      <div className="relative">
+        <svg width="140" height="100" viewBox="0 0 140 100">
+          <rect x="10" y="10" width="120" height="80" rx="6" fill="#111" stroke="#444" strokeWidth="1.5"/>
+          <rect x="20" y="20" width="100" height="60" rx="4" fill="#0a2a1a"/>
+          <ellipse cx="70" cy="50" rx="25" ry="15" fill="none" stroke="#00d4aa" strokeWidth="2"/>
+          <circle cx="70" cy="50" r="8" fill="none" stroke="#00d4aa" strokeWidth="1.5"/>
+          <circle cx="70" cy="50" r="3" fill="#00d4aa"/>
+          <rect x="20" y="20" width="4" height="60" rx="2" fill="#00d4aa" opacity="0.7"
+            style={{ animation: "scanLine 1.5s ease-in-out infinite" }}/>
+        </svg>
+      </div>
+    </div>
+  );
+
+  if (stepId === 7) return (
+    <div className="w-full h-40 flex items-center justify-center">
+      <style>{`
+        @keyframes itemAppear { from{opacity:0;transform:translateX(-10px)}to{opacity:1;transform:translateX(0)} }
+        @keyframes tickAppear { from{opacity:0;transform:scale(0)}to{opacity:1;transform:scale(1)} }
+      `}</style>
+      <div className="flex flex-col gap-3">
+        {["Sprint data validated","Team shape confirmed","Possession verified","Distances cross-checked"].map((item,i) => (
+          <div key={i} className="flex items-center gap-3" style={{ animation: `itemAppear 0.4s ease ${i*0.4}s both` }}>
+            <div style={{ animation: `tickAppear 0.3s ease ${i*0.4+0.3}s both` }}>
+              <svg width="20" height="20" viewBox="0 0 20 20"><circle cx="10" cy="10" r="9" fill="#22c55e" opacity="0.2"/><polyline points="4,10 8,14 16,6" stroke="#22c55e" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" fill="none"/></svg>
+            </div>
+            <span className="text-white text-sm">{item}</span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+
+  if (stepId === 8) return (
+    <div className="w-full h-40 flex items-center justify-center">
+      <style>{`
+        @keyframes lineType { from{width:0}to{width:100%} }
+        @keyframes unfold { from{opacity:0;transform:scaleY(0)}to{opacity:1;transform:scaleY(1)} }
+      `}</style>
+      <div className="flex items-start gap-4">
+        <svg width="48" height="60" viewBox="0 0 48 60" style={{ animation: "unfold 0.5s ease forwards", transformOrigin: "top" }}>
+          <rect x="4" y="4" width="40" height="52" rx="4" fill="#0a2a1a" stroke="#00d4aa" strokeWidth="2"/>
+          <path d="M28 4 L28 16 L40 16" fill="none" stroke="#00d4aa" strokeWidth="1.5"/>
+          <rect x="4" y="4" width="24" height="12" fill="#0a2a1a"/>
+        </svg>
+        <div className="flex flex-col gap-2 pt-1">
+          {[80,65,90,55,70].map((w,i) => (
+            <div key={i} className="h-2 bg-[#00d4aa]/30 rounded overflow-hidden" style={{ width: "100px" }}>
+              <div className="h-full bg-[#00d4aa] rounded" style={{ width: `${w}%`, animation: `lineType 0.5s ease ${0.3+i*0.2}s both` }}/>
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+
+  return null;
+}
+
+/* ============================================================
+   PIPELINE MODAL
+   ============================================================ */
+function PipelineModal({ node, onClose }: { node: typeof PIPELINE_NODES[0]; onClose: () => void }) {
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => { if (e.key === "Escape") onClose(); };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, [onClose]);
+
+  const Icon = node.icon;
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80"
+      onClick={onClose}
+    >
+      <div
+        className="relative w-full max-w-lg rounded-2xl border border-white/10 bg-[#0a0e1a] p-8 shadow-2xl"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <button
+          onClick={onClose}
+          className="absolute top-4 right-4 text-gray-400 hover:text-white transition-colors"
+        >
+          <X size={20} />
+        </button>
+
+        <div className="flex items-center gap-3 mb-2">
+          <div className="w-10 h-10 rounded-lg bg-[#00d4aa]/10 flex items-center justify-center text-[#00d4aa]">
+            <Icon size={20} />
+          </div>
+          <p className="text-[#00d4aa] text-xs font-semibold uppercase tracking-widest">
+            Step {node.id} of 8
+          </p>
+        </div>
+
+        <h3 className="text-2xl font-bold text-white mb-4">{node.label}</h3>
+        <p className="text-gray-400 leading-relaxed mb-6">{node.sub}</p>
+
+        <div className="rounded-xl bg-[#060a14] border border-white/5 overflow-hidden">
+          <StepAnimation stepId={node.id} />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function PipelineDiagram({ onStepClick }: { onStepClick: (node: typeof PIPELINE_NODES[0]) => void }) {
   const ref = useRef(null);
   const isInView = useInView(ref, { once: true, margin: "-60px" });
 
@@ -155,30 +414,26 @@ function PipelineDiagram() {
       <div className="hidden md:flex items-start justify-center gap-0">
         {PIPELINE_NODES.map((node, i) => {
           const Icon = node.icon;
-          const isOutput = i === PIPELINE_NODES.length - 1;
           return (
-            <div key={node.label} className="flex items-center">
+            <div key={node.id} className="flex items-center">
               <motion.div
                 initial={{ opacity: 0, y: 20 }}
                 animate={isInView ? { opacity: 1, y: 0 } : { opacity: 0, y: 20 }}
                 transition={{ duration: 0.5, delay: i * 0.15, ease: [0.25, 0.1, 0.25, 1] }}
-                className={`flex flex-col items-center text-center ${isOutput ? "w-[130px]" : "w-[110px]"}`}
+                className="flex flex-col items-center text-center w-[110px] cursor-pointer group"
+                onClick={() => onStepClick(node)}
               >
                 <div
-                  className={`rounded-xl border flex items-center justify-center mb-3 ${
-                    isOutput
-                      ? "w-16 h-16 border-[#00d4aa]/60 bg-[#0d1117]"
-                      : "w-14 h-14 border-[rgba(0,212,170,0.4)] bg-[#0d1117]"
-                  }`}
+                  className="w-14 h-14 rounded-xl border border-[rgba(0,212,170,0.4)] bg-[#0d1117] flex items-center justify-center mb-3 group-hover:border-[#00d4aa] group-hover:bg-[#0d1f1a] transition-colors"
                   style={node.glow ? { boxShadow: node.glow } : undefined}
                 >
-                  <Icon size={isOutput ? 26 : 22} className="text-[#00d4aa]" />
+                  <Icon size={22} className="text-[#00d4aa]" />
                 </div>
                 <span className="text-white text-[11px] font-bold leading-tight mb-1">
                   {node.label}
                 </span>
-                <span className="text-gray-500 text-[10px] leading-tight">
-                  {node.sub}
+                <span className="text-[#00d4aa] text-[9px] leading-tight opacity-0 group-hover:opacity-100 transition-opacity">
+                  tap to learn more
                 </span>
               </motion.div>
 
@@ -211,28 +466,24 @@ function PipelineDiagram() {
       <div className="flex md:hidden flex-col items-center gap-0">
         {PIPELINE_NODES.map((node, i) => {
           const Icon = node.icon;
-          const isOutput = i === PIPELINE_NODES.length - 1;
           return (
-            <div key={node.label} className="flex flex-col items-center">
+            <div key={node.id} className="flex flex-col items-center">
               <motion.div
                 initial={{ opacity: 0, y: 20 }}
                 animate={isInView ? { opacity: 1, y: 0 } : { opacity: 0, y: 20 }}
                 transition={{ duration: 0.5, delay: i * 0.12, ease: [0.25, 0.1, 0.25, 1] }}
-                className="flex items-center gap-4 w-full max-w-xs"
+                className="flex items-center gap-4 w-full max-w-xs cursor-pointer"
+                onClick={() => onStepClick(node)}
               >
                 <div
-                  className={`rounded-xl border flex-shrink-0 flex items-center justify-center ${
-                    isOutput
-                      ? "w-14 h-14 border-[#00d4aa]/60 bg-[#0d1117]"
-                      : "w-12 h-12 border-[rgba(0,212,170,0.4)] bg-[#0d1117]"
-                  }`}
+                  className="w-14 h-14 rounded-xl border border-[rgba(0,212,170,0.4)] bg-[#0d1117] flex-shrink-0 flex items-center justify-center"
                   style={node.glow ? { boxShadow: node.glow } : undefined}
                 >
                   <Icon size={20} className="text-[#00d4aa]" />
                 </div>
                 <div>
                   <p className="text-white text-xs font-bold">{node.label}</p>
-                  <p className="text-gray-500 text-[10px]">{node.sub}</p>
+                  <p className="text-[#00d4aa] text-[10px] opacity-60">tap to learn more</p>
                 </div>
               </motion.div>
 
@@ -367,8 +618,13 @@ function ScrollExpandAnalysis() {
    MAIN PAGE
    ============================================================ */
 export default function Home() {
+  const [activeStep, setActiveStep] = useState<typeof PIPELINE_NODES[0] | null>(null);
+
   return (
     <main className="min-h-screen">
+      {activeStep && (
+        <PipelineModal node={activeStep} onClose={() => setActiveStep(null)} />
+      )}
       {/* ===== NAVBAR ===== */}
       <nav className="fixed top-0 inset-x-0 z-40 bg-[#0a0f1a]/80 backdrop-blur-xl border-b border-white/5">
         <div className="max-w-7xl mx-auto px-6 h-16 flex items-center justify-between">
@@ -398,11 +654,7 @@ export default function Home() {
               <span className="text-[#00d4aa]">Not Professional Prices.</span>
             </h1>
             <p className="text-gray-400 text-lg leading-relaxed mb-8 max-w-lg">
-              TRACAB charges{" "}
-              <span className="text-white font-semibold">£10,000+</span> per
-              match. Athlink CV is{" "}
-              <span className="text-[#00d4aa] font-semibold">£30/month</span>.
-              Upload a clip. Get a full coaching report.
+              Upload a clip. Get a full coaching report in minutes — player stats, team shape, sprint data, and training recommendations.
             </p>
             <a href={APP_URL} className="cta-button">
               START ANALYSING →
@@ -432,7 +684,7 @@ export default function Home() {
             </p>
           </FadeInSection>
 
-          <PipelineDiagram />
+          <PipelineDiagram onStepClick={setActiveStep} />
         </div>
       </section>
 
