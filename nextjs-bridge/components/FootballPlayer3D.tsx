@@ -125,6 +125,55 @@ uniform vec3 uHair;`,
   return mat
 }
 
+function applyMaterials(
+  scene: THREE.Object3D,
+  kitColour: string,
+  skinColour: string,
+  hairColour: string,
+) {
+  scene.traverse((child) => {
+    if (!(child instanceof THREE.Mesh || child instanceof THREE.SkinnedMesh)) return
+    child.frustumCulled = false
+    child.castShadow = true
+
+    const raw = child.material as THREE.MeshStandardMaterial
+    if ((raw as any)._u || (raw as any)._uHair) return // already replaced
+
+    const matName = (raw?.name || '').toLowerCase()
+    const meshName = child.name.toLowerCase()
+    const name = matName || meshName
+
+    if (name.includes('hair') || name.includes('eyelash')) {
+      child.material = makeHairMaterial(raw.map, hairColour)
+    } else if (
+      name.includes('body') || name.includes('shirt') || name.includes('shorts') ||
+      name.includes('socks') || name.includes('shoes') || name.includes('mesh')
+    ) {
+      child.material = makeBodyMaterial(raw.map, kitColour, skinColour, hairColour)
+    }
+  })
+}
+
+function updateUniforms(
+  scene: THREE.Object3D,
+  kitColour: string,
+  skinColour: string,
+  hairColour: string,
+) {
+  scene.traverse((child) => {
+    if (!(child instanceof THREE.Mesh || child instanceof THREE.SkinnedMesh)) return
+    const mat = child.material as any
+    if (mat?._u) {
+      mat._u.uKit.value.set(kitColour)
+      mat._u.uSkin.value.set(skinColour)
+      mat._u.uHair.value.set(hairColour)
+    }
+    if (mat?._uHair) {
+      mat._uHair.value.set(hairColour)
+    }
+  })
+}
+
 /* ── PlayerModel ─────────────────────────────────────────── */
 function PlayerModel({
   kitColour,
@@ -137,56 +186,79 @@ function PlayerModel({
   hairColour: string
   onScene: (scene: THREE.Object3D) => void
 }) {
-  const { scene, animations } = useGLTF('/models/idle.glb')
-  const { actions } = useAnimations(animations, scene)
+  const { scene: idleScene, animations: idleAnims } = useGLTF('/models/idle.glb')
+  const { animations: shovedAnims } = useGLTF('/models/shoved.glb')
 
-  useEffect(() => { onScene(scene) }, [scene, onScene])
+  // Merge both animation clips into one useAnimations call on the idle scene
+  const allAnims = useMemo(
+    () => [...idleAnims, ...shovedAnims],
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [idleAnims, shovedAnims],
+  )
+  const { actions, mixer } = useAnimations(allAnims, idleScene)
 
-  // Play animation
+  // Expose scene to parent for football bone tracking
+  useEffect(() => { onScene(idleScene) }, [idleScene, onScene])
+
+  // Install materials once on scene load
   useEffect(() => {
-    const action = actions['Armature|mixamo.com|Layer0']
-    if (!action) return
-    action.reset().setLoop(THREE.LoopRepeat, Infinity).play()
-    return () => { action.stop() }
-  }, [actions])
-
-  // Install custom materials once per scene load
-  useEffect(() => {
-    scene.traverse((child) => {
-      if (!(child instanceof THREE.Mesh || child instanceof THREE.SkinnedMesh)) return
-      child.frustumCulled = false
-      child.castShadow = true
-
-      const raw = child.material as THREE.MeshStandardMaterial
-      if ((raw as any)._u || (raw as any)._uHair) return // already replaced
-
-      const name = (raw?.name || '').toLowerCase()
-      if (name.includes('body')) {
-        child.material = makeBodyMaterial(raw.map, kitColour, skinColour, hairColour)
-      } else if (name.includes('hair')) {
-        child.material = makeHairMaterial(raw.map, hairColour)
-      }
-    })
+    applyMaterials(idleScene, kitColour, skinColour, hairColour)
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [scene])
+  }, [idleScene])
 
-  // Live-update uniform values when pickers change
+  // Live-update uniforms when colour pickers change
   useEffect(() => {
-    scene.traverse((child) => {
-      if (!(child instanceof THREE.Mesh || child instanceof THREE.SkinnedMesh)) return
-      const mat = child.material as any
-      if (mat?._u) {
-        mat._u.uKit.value.set(kitColour)
-        mat._u.uSkin.value.set(skinColour)
-        mat._u.uHair.value.set(hairColour)
-      }
-      if (mat?._uHair) {
-        mat._uHair.value.set(hairColour)
-      }
-    })
-  }, [scene, kitColour, skinColour, hairColour])
+    updateUniforms(idleScene, kitColour, skinColour, hairColour)
+  }, [idleScene, kitColour, skinColour, hairColour])
 
-  return <primitive object={scene} scale={1.3} position={[0, -1.15, 0]} />
+  // Animation sequencing: idle loop → shoved (one-shot) → back to idle
+  useEffect(() => {
+    const idleAction  = actions['Armature|mixamo.com|Layer0']
+    const shovedAction = actions['mixamo.com']
+
+    if (!idleAction) return
+
+    idleAction.reset().setLoop(THREE.LoopRepeat, Infinity).play()
+
+    if (!shovedAction) return
+
+    shovedAction.setLoop(THREE.LoopOnce, 1)
+    shovedAction.clampWhenFinished = true
+
+    // Every ~8 seconds, crossfade to shoved then back to idle
+    let cancelled = false
+    const IDLE_HOLD = 8000     // ms before triggering shoved
+    const FADE_IN   = 0.4      // s crossfade idle → shoved
+    const FADE_OUT  = 0.4      // s crossfade shoved → idle
+    const SHOVED_DURATION = 4500 // ms (4.5s)
+
+    function triggerShoved() {
+      if (cancelled) return
+      shovedAction!.reset().play()
+      idleAction!.crossFadeTo(shovedAction!, FADE_IN, true)
+
+      // After shoved finishes, fade back to idle
+      setTimeout(() => {
+        if (cancelled) return
+        idleAction!.reset().play()
+        shovedAction!.crossFadeTo(idleAction!, FADE_OUT, true)
+
+        // Schedule next shoved cycle
+        setTimeout(triggerShoved, IDLE_HOLD)
+      }, SHOVED_DURATION)
+    }
+
+    const firstTimer = setTimeout(triggerShoved, IDLE_HOLD)
+
+    return () => {
+      cancelled = true
+      clearTimeout(firstTimer)
+      idleAction.stop()
+      shovedAction.stop()
+    }
+  }, [actions, mixer])
+
+  return <primitive object={idleScene} scale={1.3} position={[0, -1.15, 0]} />
 }
 
 /* ── Football ────────────────────────────────────────────── */
@@ -310,3 +382,4 @@ export default function FootballPlayer3D({
 }
 
 useGLTF.preload('/models/idle.glb')
+useGLTF.preload('/models/shoved.glb')

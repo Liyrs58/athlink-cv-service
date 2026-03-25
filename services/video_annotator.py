@@ -13,6 +13,32 @@ from typing import Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
+# IMPROVEMENT 2: Supervision ellipse annotators — broadcast-style player tracking [2026-03-25]
+# Falls back gracefully to existing OpenCV drawing if supervision unavailable.
+try:
+    import supervision as sv
+    _sv_ellipse = sv.EllipseAnnotator(
+        color=sv.ColorPalette.from_hex(['#FF1744', '#00E676']),
+        thickness=2,
+    )
+    _sv_label = sv.LabelAnnotator(
+        color=sv.ColorPalette.from_hex(['#FF1744', '#00E676']),
+        text_color=sv.Color.WHITE,
+        text_scale=0.4,
+        text_thickness=1,
+        text_padding=3,
+    )
+    _sv_triangle = sv.TriangleAnnotator(
+        color=sv.Color.from_hex('#FFD700'),
+        base=12,
+        height=10,
+    )
+    _SV_AVAILABLE = True
+    logger.info("supervision available — using broadcast-style ellipse annotations")
+except Exception:
+    _SV_AVAILABLE = False
+    logger.info("supervision not available — using OpenCV ellipse annotations")
+
 
 def _get_center_of_bbox(bbox):
     x1, y1, x2, y2 = bbox
@@ -378,17 +404,43 @@ class VideoAnnotator:
             player_dict = tracks["players"][frame_num]
             ball_dict = tracks["ball"][frame_num]
 
-            # Draw players
-            for track_id, player in player_dict.items():
-                team = player.get("team", -1)
-                color = self.team_colors.get(team, (128, 128, 128))
-                frame = self._draw_ellipse(frame, player["bbox"], color, track_id)
+            # IMPROVEMENT 2: Draw players with supervision ellipses if available [2026-03-25]
+            if _SV_AVAILABLE and player_dict:
+                try:
+                    boxes, ids, class_ids, labels = [], [], [], []
+                    for track_id, player in player_dict.items():
+                        bbox = player.get("bbox")
+                        team = player.get("team", -1)
+                        if bbox and len(bbox) >= 4:
+                            boxes.append(bbox[:4])
+                            ids.append(int(track_id))
+                            class_ids.append(0 if team == 0 else 1 if team == 1 else 0)
+                            labels.append(str(track_id))
+                    if boxes:
+                        det = sv.Detections(
+                            xyxy=np.array(boxes, dtype=np.float32),
+                            tracker_id=np.array(ids),
+                            class_id=np.array(class_ids),
+                        )
+                        frame = _sv_ellipse.annotate(frame, det)
+                        frame = _sv_label.annotate(frame, det, labels=labels)
+                except Exception as _sv_err:
+                    logger.debug("supervision annotation failed: %s", _sv_err)
+                    # fall through to OpenCV path
+                    for track_id, player in player_dict.items():
+                        team = player.get("team", -1)
+                        color = self.team_colors.get(team, (128, 128, 128))
+                        frame = self._draw_ellipse(frame, player["bbox"], color, track_id)
+            else:
+                for track_id, player in player_dict.items():
+                    team = player.get("team", -1)
+                    color = self.team_colors.get(team, (128, 128, 128))
+                    frame = self._draw_ellipse(frame, player["bbox"], color, track_id)
 
-                # Ball possession triangle
+            # Ball possession triangle + speed/distance (always OpenCV)
+            for track_id, player in player_dict.items():
                 if player.get("has_ball", False):
                     frame = self._draw_triangle(frame, player["bbox"], (0, 0, 255))
-
-                # Speed and distance
                 speed = player.get("speed", 0)
                 distance = player.get("distance", 0)
                 if speed > 0 or distance > 0:
@@ -397,8 +449,23 @@ class VideoAnnotator:
                     )
 
             # Draw ball
-            for _, ball in ball_dict.items():
-                frame = self._draw_ball(frame, ball["bbox"])
+            if _SV_AVAILABLE and ball_dict:
+                try:
+                    for _, ball in ball_dict.items():
+                        bbox = ball.get("bbox", [])
+                        if len(bbox) >= 4:
+                            cx = (bbox[0] + bbox[2]) / 2
+                            cy = (bbox[1] + bbox[3]) / 2
+                            ball_det = sv.Detections(
+                                xyxy=np.array([[cx - 10, cy - 20, cx + 10, cy]], dtype=np.float32)
+                            )
+                            frame = _sv_triangle.annotate(frame, ball_det)
+                except Exception:
+                    for _, ball in ball_dict.items():
+                        frame = self._draw_ball(frame, ball["bbox"])
+            else:
+                for _, ball in ball_dict.items():
+                    frame = self._draw_ball(frame, ball["bbox"])
 
             # Draw camera movement
             if frame_num < len(camera_movement):
