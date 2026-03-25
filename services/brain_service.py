@@ -118,7 +118,8 @@ def gemini_watch_clip(video_path: str, team_0_name: str, team_1_name: str) -> di
             raise RuntimeError(f"Gemini file processing failed: {video_file.state.name}")
 
         # FIX 4: gemini-2.0-flash deprecated on RunPod — use 1.5 [2026-03-25]
-        model = genai.GenerativeModel("gemini-1.5-flash")
+        model_name = os.environ.get("GEMINI_MODEL", "gemini-1.5-flash")
+        model = genai.GenerativeModel(model_name)
 
         prompt = f"""You are an elite football analyst with 20 years of experience coaching from grassroots Sunday league to professional academies. You understand every formation, every pressing system, every tactical concept in modern football.
 
@@ -259,7 +260,8 @@ def gemini_count_events(video_path: str, team_0_name: str, team_1_name: str) -> 
             raise RuntimeError("Gemini file processing failed")
 
         # FIX 4: gemini-2.0-flash deprecated on RunPod — use 1.5 [2026-03-25]
-        model = genai.GenerativeModel("gemini-1.5-flash")
+        model_name = os.environ.get("GEMINI_MODEL", "gemini-1.5-flash")
+        model = genai.GenerativeModel(model_name)
 
         prompt = f"""You are a professional football data analyst. Watch this clip and COUNT specific events as precisely as possible.
 

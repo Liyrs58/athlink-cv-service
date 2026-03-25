@@ -6,7 +6,10 @@ and writes temp/{jobId}/render/output.mp4
 """
 
 import json
+import logging
 import os
+import shutil
+import subprocess
 from collections import deque
 from pathlib import Path
 
@@ -14,6 +17,8 @@ import cv2
 import numpy as np
 
 from services.export_service import build_export
+
+logger = logging.getLogger(__name__)
 
 
 TEAM_BGR = {
@@ -66,12 +71,11 @@ def run_render(job_id: str, include_minimap: bool = False) -> dict:
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = str(out_dir / "output.mp4")
 
-    # Try avc1 (H.264) first; fall back to mp4v if unavailable
-    fourcc = cv2.VideoWriter_fourcc(*"avc1")
+    # Use mp4v (CPU) to avoid unavailable GPU encoders on RunPod
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     writer = cv2.VideoWriter(out_path, fourcc, fps, (out_w, out_h))
     if not writer.isOpened():
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        writer = cv2.VideoWriter(out_path, fourcc, fps, (out_w, out_h))
+        raise RuntimeError("Failed to open VideoWriter with mp4v codec")
 
     # ── Build per-track keyframe list ────────────────────────────────────────
     # Collect every (frameIndex, bbox, teamId, pitchX, pitchY) observation per track.
@@ -199,6 +203,9 @@ def run_render(job_id: str, include_minimap: bool = False) -> dict:
     cap.release()
     writer.release()
 
+    # Optional: re-encode to H.264 for browser/device compatibility
+    out_path = _remux_to_h264(out_path, fps)
+
     # Upload to Supabase if configured
     render_url = None
     try:
@@ -218,6 +225,48 @@ def run_render(job_id: str, include_minimap: bool = False) -> dict:
         "fps":            fps,
         "render_url":     render_url,
     }
+
+
+def _remux_to_h264(path: str, fps: float) -> str:
+    """Re-encode an mp4v file to H.264 using ffmpeg if available.
+
+    Args:
+        path: Path to the source mp4v file.
+        fps:  Frame rate used for the ``-r`` output flag.
+
+    Returns:
+        The same ``path`` value; the file on disk is replaced in-place with
+        the H.264-encoded version if re-encoding succeeds, or left unchanged
+        if ffmpeg is unavailable or re-encoding fails.
+    """
+    if not shutil.which("ffmpeg"):
+        return path
+
+    # Detect NVENC availability by parsing ffmpeg's encoder list
+    enc_result = subprocess.run(
+        ["ffmpeg", "-hide_banner", "-encoders"],
+        capture_output=True, text=True,
+    )
+    has_nvenc = "h264_nvenc" in enc_result.stdout
+    vcodec = "h264_nvenc" if has_nvenc else "libx264"
+    # NVENC preset: p4 = balanced quality/speed (P1=fastest … P7=slowest)
+    preset = "p4" if has_nvenc else "fast"
+
+    tmp = path + ".h264.mp4"
+    cmd = ["ffmpeg", "-y", "-i", path, "-c:v", vcodec, "-preset", preset]
+    if has_nvenc:
+        cmd += ["-b:v", "6M"]
+    cmd += ["-r", str(fps), "-pix_fmt", "yuv420p", "-movflags", "+faststart", "-an", tmp]
+
+    try:
+        subprocess.run(cmd, check=True, capture_output=True, timeout=300)
+        os.replace(tmp, path)
+        logger.info("Re-encoded to H.264 (%s): %s", vcodec, path)
+    except Exception as exc:
+        logger.warning("ffmpeg re-encode failed (%s) — keeping mp4v original: %s", exc, path)
+        if os.path.exists(tmp):
+            os.remove(tmp)
+    return path
 
 
 def _draw_players(frame, players, include_minimap: bool, frame_w: int, frame_h: int):
