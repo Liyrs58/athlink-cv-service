@@ -264,11 +264,25 @@ def _run_analysis_pipeline(job_id: str, temp_path: str, skip_cleanup: bool = Fal
                     pass_detector.update(poss, bp, fi, fps, ppm)
 
                 poss_pct = possession_det.get_team_possession_pct()
-                possession_data = {
-                    "team_0_pct": poss_pct.get(0, 0.0),
-                    "team_1_pct": poss_pct.get(1, 0.0),
-                    "events": possession_det.get_possession_events(),
-                }
+                # FIX 3: Handle None possession (insufficient data) [2026-03-25]
+                t0_pct = poss_pct.get(0)
+                t1_pct = poss_pct.get(1)
+                if t0_pct is None or t1_pct is None:
+                    possession_data = {
+                        "team_0_pct": None,
+                        "team_1_pct": None,
+                        "status": "insufficient_data",
+                        "display": "—",
+                        "events": possession_det.get_possession_events(),
+                    }
+                else:
+                    possession_data = {
+                        "team_0_pct": t0_pct,
+                        "team_1_pct": t1_pct,
+                        "status": "valid",
+                        "display": f"{t0_pct}% / {t1_pct}%",
+                        "events": possession_det.get_possession_events(),
+                    }
                 pass_data = {
                     "total": len(pass_detector.get_passes()),
                     "per_player": pass_detector.get_passes_per_player(),
@@ -558,6 +572,48 @@ def _run_analysis_pipeline(job_id: str, temp_path: str, skip_cleanup: bool = Fal
         total_players = high_count + data_confidence.get("medium_confidence_players", 0) + data_confidence.get("low_confidence_players", 0)
         phys_conf = "high" if total_players > 0 and high_count / total_players >= 0.6 else "medium"
 
+        # IMPROVEMENT 3: Clip quality score [2026-03-25]
+        total_frames_count = r.get("framesProcessed", 0) or len(frame_metadata)
+        valid_pitch_count = sum(1 for m in frame_metadata if m.get("analysis_valid", True))
+        ball_detected_count = sum(1 for m in frame_metadata if m.get("ball_detected", False))
+        avg_players = sum(m.get("tracks_active", 0) for m in frame_metadata) / max(len(frame_metadata), 1)
+        pitch_coverage_ratio = valid_pitch_count / max(total_frames_count, 1)
+        ball_det_pct = ball_detected_count / max(total_frames_count, 1)
+
+        if pitch_coverage_ratio < 0.5:
+            clip_quality = "low"
+            clip_quality_msg = "Less than 50% of clip shows the pitch. Metrics may be unreliable."
+        elif pitch_coverage_ratio < 0.75:
+            clip_quality = "medium"
+            clip_quality_msg = "Some cutaway frames detected. Core metrics are valid."
+        else:
+            clip_quality = "high"
+            clip_quality_msg = "Good pitch coverage. All metrics are reliable."
+
+        clip_quality_report = {
+            "quality": clip_quality,
+            "pitch_coverage_pct": round(pitch_coverage_ratio * 100, 1),
+            "valid_frames": valid_pitch_count,
+            "total_frames": total_frames_count,
+            "message": clip_quality_msg,
+            "ball_detection_pct": round(ball_det_pct * 100, 1),
+        }
+
+        # IMPROVEMENT 1: Rename fatigue → intensity_score [2026-03-25]
+        intensity_result = fatigue_result
+        if isinstance(intensity_result, dict):
+            # Rename keys if present
+            if "most_fatigued_player" in intensity_result:
+                intensity_result["highest_intensity_player"] = intensity_result.pop("most_fatigued_player")
+            intensity_result["note"] = "Based on sprint load in this clip. Not a physiological fatigue measure."
+            # Hide if clip < 30s of valid pitch frames
+            clip_duration_s = valid_pitch_count / max(fps, 25.0) if fps else valid_pitch_count / 25.0
+            if clip_duration_s < 30:
+                intensity_result["status"] = "insufficient_data"
+
+        # IMPROVEMENT 2: AI report mode separation [2026-03-25]
+        ai_analysis_available = bool(os.environ.get("GEMINI_API_KEY")) and bool(os.environ.get("ANTHROPIC_API_KEY"))
+
         base_result = {
             "job_id": job_id,
             "matches_in_memory": get_match_count(),
@@ -602,7 +658,9 @@ def _run_analysis_pipeline(job_id: str, temp_path: str, skip_cleanup: bool = Fal
                 "fragments_merged": tracks_before_merge - tracks_after_merge,
             },
             "corrections_applied": corrections_applied,
-            "fatigue_clock": fatigue_result,
+            "clip_quality": clip_quality_report,
+            "intensity_score": intensity_result,
+            "ai_analysis_available": ai_analysis_available,
             "voronoi": {
                 "status": voronoi.get("status"),
                 "team_0_control_pct": voronoi.get("team_0_control_pct"),

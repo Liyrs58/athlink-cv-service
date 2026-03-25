@@ -250,8 +250,17 @@ def compute_player_velocity(track, calibration: Optional[Dict[str, Any]] = None,
             "high_intensity_runs": 0,
         }
 
+    # FIX 2: Use world_x/world_y from physics_corrector when available [2026-03-25]
+    # This gives real-world distances in metres instead of pixel-space guesses.
+    use_world_coords = all("world_x" in e and "world_y" in e for e in valid_entries)
+
+    if use_world_coords:
+        # World-space positions (already in metres)
+        positions = [(e["world_x"], e["world_y"]) for e in valid_entries]
+    else:
+        positions = [get_centre(e["bbox"]) for e in valid_entries]
+
     # Part 3b: smooth trajectory before distance computation
-    positions = [get_centre(e["bbox"]) for e in valid_entries]
     smoothed = _smooth_trajectory(positions)
 
     # Compute raw frame-to-frame speeds and distances
@@ -268,8 +277,16 @@ def compute_player_velocity(track, calibration: Optional[Dict[str, Any]] = None,
 
         dx = smoothed[i][0] - smoothed[i-1][0]
         dy = smoothed[i][1] - smoothed[i-1][1]
-        dist_px = math.sqrt(dx*dx + dy*dy)
-        dist_m = dist_px / ppm
+
+        if use_world_coords:
+            # FIX 2: Already in metres — no ppm conversion needed
+            dist_m = math.sqrt(dx*dx + dy*dy)
+            # Sanity cap: max 0.46m per frame at 25fps (11.5 m/s)
+            if dist_m > 0.46:
+                dist_m = 0.0  # reject — impossible human speed per frame
+        else:
+            dist_px = math.sqrt(dx*dx + dy*dy)
+            dist_m = dist_px / ppm
 
         # Low homography confidence: apply a conservative distance discount
         is_approx = valid_entries[i].get("metric_quality") == "approximate"
@@ -280,7 +297,7 @@ def compute_player_velocity(track, calibration: Optional[Dict[str, Any]] = None,
         if dist_m >= MIN_DISPLACEMENT_M:
             total_distance_m += dist_m
 
-        speed_ms = dist_m / dt
+        speed_ms = dist_m / dt if dt > 0 else 0.0
         if speed_ms > MAX_REALISTIC_SPEED_MS:
             speed_ms = 0.0  # discard artifact
         raw_speeds.append(speed_ms)

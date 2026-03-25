@@ -357,18 +357,13 @@ class VideoAnnotator:
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-        # Try codecs in order until one works — ffmpeg re-encode ensures browser compat
-        writer = None
-        for codec in ['avc1', 'H264', 'X264', 'mp4v']:
-            fourcc = cv2.VideoWriter_fourcc(*codec)
-            w = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
-            if w.isOpened():
-                logger.info("VideoWriter opened with codec: %s", codec)
-                writer = w
-                break
-            w.release()
-        if writer is None:
-            raise RuntimeError("No working video codec found")
+        # Use mp4v directly — ffmpeg re-encodes to H.264 afterwards anyway.
+        # Skipping avc1/H264/X264 avoids noisy hardware-encoder errors on RunPod.
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        writer = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+        if not writer.isOpened():
+            raise RuntimeError("Failed to open VideoWriter with mp4v codec")
+        logger.info("VideoWriter opened with codec: mp4v")
 
         num_frames = len(tracks["players"])
         frame_num = 0

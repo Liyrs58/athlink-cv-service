@@ -293,8 +293,9 @@ class PossessionDetector:
                 counts[tid] = counts.get(tid, 0) + 1
                 total += 1
 
+        # FIX 3: Never default to 50/50 — return None when no data [2026-03-25]
         if total == 0:
-            return {0: 50.0, 1: 50.0}
+            return {0: None, 1: None}
 
         return {k: round(v / total * 100, 1) for k, v in counts.items()}
 

@@ -211,6 +211,15 @@ def detect_scene_cut(prev_frame_gray, curr_frame_gray, threshold=45.0) -> bool:
     return mean_diff > threshold
 
 
+def is_pitch_frame(frame: np.ndarray, threshold: float = 0.25) -> bool:
+    """
+    FIX 1: Returns True only if this frame shows a pitch. [2026-03-25]
+    Uses HSV green pixel fraction — proven in production football CV.
+    Threshold 0.25 = at least 25% of frame must be pitch-green.
+    """
+    return is_valid_pitch_frame(frame, min_green_pct=threshold)
+
+
 def is_valid_pitch_frame(frame_bgr, min_green_pct=0.25) -> bool:
     """
     Returns True only if frame contains enough green pitch to be a valid
