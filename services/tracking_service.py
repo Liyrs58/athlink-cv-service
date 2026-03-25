@@ -274,15 +274,14 @@ class BallKalmanTracker:
         self.kf.transitionMatrix = np.array(
             [[1,0,1,0],[0,1,0,1],
              [0,0,1,0],[0,0,0,1]], np.float32)
-        # FIX 3: Increased process noise — allows faster state changes (less smoothing)
-        self.kf.processNoiseCov = np.eye(4, dtype=np.float32) * 0.1
-        # FIX 3: Decreased measurement noise — trust YOLO detections more
-        self.kf.measurementNoiseCov = np.eye(2, dtype=np.float32) * 0.3
+        # Lower process noise: assume smooth ball motion between frames
+        self.kf.processNoiseCov = np.eye(4, dtype=np.float32) * 0.03
+        # Higher measurement noise: smooth out noisy YOLO detections more aggressively
+        self.kf.measurementNoiseCov = np.eye(2, dtype=np.float32) * 1.5
         self.kf.errorCovPost = np.eye(4, dtype=np.float32)
         self.initialized = False
         self.frames_since_detection = 0
-        # FIX 3: Reduced max prediction frames — stop predicting after 0.8s without detection
-        self.max_prediction_frames = 20  # ~0.8s at 25fps (was 45)
+        self.max_prediction_frames = 20  # ~0.8s at 25fps
 
     def update(self, x, y):
         """Call when YOLO detects ball. Returns corrected position."""
@@ -299,8 +298,7 @@ class BallKalmanTracker:
         return float(corrected[0]), float(corrected[1])
 
     def predict(self):
-        """Call when YOLO does NOT detect ball.
-        Returns predicted position if within window."""
+        """Return predicted position if still within the prediction window."""
         if not self.initialized:
             return None
         if self.frames_since_detection >= self.max_prediction_frames:
@@ -309,22 +307,6 @@ class BallKalmanTracker:
         self.frames_since_detection += 1
         x, y = float(predicted[0]), float(predicted[1])
         return x, y
-
-    def search_region(self, frame_gray, radius=60):
-        """
-        Returns a bounding box to search for ball candidates
-        near the predicted position.
-        """
-        pred = self.predict()
-        if pred is None:
-            return None
-        px, py = pred
-        return (
-            max(0, int(px - radius)),
-            max(0, int(py - radius)),
-            min(frame_gray.shape[1], int(px + radius)),
-            min(frame_gray.shape[0], int(py + radius))
-        )
 
 
 def is_on_pitch(world_x, world_y,
@@ -956,142 +938,28 @@ def run_tracking(
 
         prev_active_ids = current_active_ids
 
-        # --- Ball detection with Roboflow dedicated model ---
-        ball_detected = False
+        # --- Ball detection: local YOLO only (COCO class 32 = sports ball) ---
+        # Gaps where ball is not detected are filled by linear interpolation after the loop.
         try:
-            import requests as _requests
-            import base64 as _base64
-            import os as _os
-
-            _rf_key = _os.environ.get("ROBOFLOW_API_KEY", "uS7ciF51wtr6QxlZrXGJ")
-            _, _buf = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
-            _b64 = _base64.b64encode(_buf.tobytes()).decode('utf-8')
-
-            _resp = _requests.post(
-                'https://detect.roboflow.com/footballs-1trlz/3',
-                params={'api_key': _rf_key},
-                data=_b64,
-                headers={'Content-Type': 'application/x-www-form-urlencoded'},
-                timeout=2.0
-            )
-
-            if _resp.status_code == 200:
-                _rf_data = _resp.json()
-                _preds = _rf_data.get('predictions', [])
-                if _preds:
-                    _best = max(_preds, key=lambda p: p.get('confidence', 0))
-                    _cx = _best['x']
-                    _cy = _best['y']
-                    _w = _best['width']
-                    _h = _best['height']
-                    _bx1 = _cx - _w/2
-                    _by1 = _cy - _h/2
-                    _bx2 = _cx + _w/2
-                    _by2 = _cy + _h/2
-                    _cx, _cy = ball_tracker.update(_cx, _cy)
-                    ball_trajectory.append({
-                        "frameIndex": current_frame_idx,
-                        "x": _cx,
-                        "y": _cy,
-                        "bbox": [_bx1, _by1, _bx2, _by2],
-                        "confidence": float(_best.get('confidence', 0)),
-                        "source": "roboflow",
-                    })
-                    ball_detected = True
-        except Exception as _ball_err:
+            ball_results = model(frame, verbose=False, conf=0.1, classes=[32], half=_use_half)
+            if ball_results[0].boxes is not None and len(ball_results[0].boxes) > 0:
+                ball_boxes = ball_results[0].boxes.xyxy.cpu().tolist()
+                ball_confs = ball_results[0].boxes.conf.cpu().tolist()
+                best_idx = int(np.argmax(ball_confs))
+                bx1, by1, bx2, by2 = ball_boxes[best_idx]
+                cx = (bx1 + bx2) / 2.0
+                cy = (by1 + by2) / 2.0
+                cx, cy = ball_tracker.update(cx, cy)
+                ball_trajectory.append({
+                    "frameIndex": current_frame_idx,
+                    "x": cx,
+                    "y": cy,
+                    "bbox": [bx1, by1, bx2, by2],
+                    "confidence": float(ball_confs[best_idx]),
+                    "source": "yolo",
+                })
+        except Exception:
             pass
-
-        # Fallback to YOLO if Roboflow failed
-        if not ball_detected:
-            try:
-                ball_results = model(frame, verbose=False, conf=0.15, classes=[32], half=_use_half)
-                if ball_results[0].boxes is not None and len(ball_results[0].boxes) > 0:
-                    ball_boxes = ball_results[0].boxes.xyxy.cpu().tolist()
-                    ball_confs = ball_results[0].boxes.conf.cpu().tolist()
-                    best_idx = int(np.argmax(ball_confs))
-                    bx1, by1, bx2, by2 = ball_boxes[best_idx]
-                    cx = (bx1 + bx2) / 2.0
-                    cy = (by1 + by2) / 2.0
-                    cx, cy = ball_tracker.update(cx, cy)
-                    ball_trajectory.append({
-                        "frameIndex": current_frame_idx,
-                        "x": cx,
-                        "y": cy,
-                        "bbox": [bx1, by1, bx2, by2],
-                        "confidence": float(ball_confs[best_idx]),
-                        "source": "yolo_fallback",
-                    })
-                    ball_detected = True
-            except Exception:
-                pass
-
-        # If YOLO did not detect ball, use Kalman prediction + Hough circles
-        if not ball_detected:
-            predicted = ball_tracker.predict()
-            if predicted is not None:
-                px, py = predicted
-                region = ball_tracker.search_region(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), radius=50)
-                if region is not None:
-                    x1, y1, x2, y2 = region
-                    crop = frame[y1:y2, x1:x2]
-                    if crop.size > 0:
-                        crop_gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-                        circles = cv2.HoughCircles(
-                            crop_gray, cv2.HOUGH_GRADIENT, dp=1.2,
-                            minDist=20, param1=50, param2=25,
-                            minRadius=3, maxRadius=20
-                        )
-                        if circles is not None:
-                            circles = np.uint16(np.around(circles))
-                            # Pick circle nearest to prediction centre
-                            best_circle = None
-                            best_dist = float('inf')
-                            pred_in_crop_x = px - x1
-                            pred_in_crop_y = py - y1
-                            for circle in circles[0]:
-                                cx_crop, cy_crop, r = circle
-                                # Convert numpy types to Python types for JSON serialization
-                                cx_crop = int(cx_crop)
-                                cy_crop = int(cy_crop)
-                                r = int(r)
-                                dist = ((cx_crop - pred_in_crop_x)**2 + (cy_crop - pred_in_crop_y)**2)**0.5
-                                if dist < best_dist:
-                                    best_dist = dist
-                                    best_circle = circle
-                            if best_circle is not None:
-                                cx_crop, cy_crop, r = best_circle
-                                # Convert numpy types to Python types for JSON serialization
-                                cx_crop = int(cx_crop)
-                                cy_crop = int(cy_crop)
-                                r = int(r)
-                                cx = x1 + cx_crop
-                                cy = y1 + cy_crop
-                                ball_tracker.update(cx, cy)
-                                ball_trajectory.append({
-                                    "frameIndex": current_frame_idx,
-                                    "x": cx,
-                                    "y": cy,
-                                    "confidence": 0.5,
-                                    "source": "hough_candidate",
-                                })
-                            else:
-                                # No circle found, use Kalman prediction
-                                ball_trajectory.append({
-                                    "frameIndex": current_frame_idx,
-                                    "x": px,
-                                    "y": py,
-                                    "confidence": 0.3,
-                                    "source": "kalman_prediction",
-                                })
-                        else:
-                            # No circles detected, use Kalman prediction
-                            ball_trajectory.append({
-                                "frameIndex": current_frame_idx,
-                                "x": px,
-                                "y": py,
-                                "confidence": 0.3,
-                                "source": "kalman_prediction",
-                            })
 
         frame_results.append({
             "frameIndex": current_frame_idx,
@@ -1106,7 +974,7 @@ def run_tracking(
             "analysis_valid": frame_is_valid,
             "scene_cut": scene_cut_flag,
             "tracks_active": len(current_active_ids),
-            "ball_detected": any(bt["source"] == "yolo" for bt in ball_trajectory if bt.get("frameIndex") == current_frame_idx),
+            "ball_detected": any(bt.get("frameIndex") == current_frame_idx for bt in ball_trajectory),
             "ball_source": next((bt.get("source") for bt in ball_trajectory if bt.get("frameIndex") == current_frame_idx), None),
         })
 
@@ -1123,12 +991,11 @@ def run_tracking(
                         "confirmed": (_trk.get("_confirmed_detections", 0) or 0) >= 3,
                         "frame_index": _last.get("frameIndex", current_frame_idx),
                     })
-            # Find latest ball detection
+            # Find latest YOLO ball detection for progress reporting
             _ball_bbox = None
             if ball_trajectory:
                 _last_ball = ball_trajectory[-1]
-                if _last_ball.get("source") == "yolo":
-                    _ball_bbox = _last_ball.get("bbox")
+                _ball_bbox = _last_ball.get("bbox")
             _progress_data = {
                 "frames_processed": raw_frame_idx,
                 "total_frames": _total_frames_est,
@@ -1166,7 +1033,52 @@ def run_tracking(
 
     cap.release()
 
-    # Merge active + completed
+    # --- Ball trajectory post-processing: linear interpolation for missing frames ---
+    # For every consecutive pair of YOLO detections, linearly interpolate ball position
+    # through any processed frames in between that had no detection (up to 25 frames).
+    # This is the same technique used in the football_analysis reference implementation
+    # and eliminates flicker/gaps caused by missed detections.
+    if len(ball_trajectory) >= 2:
+        ball_by_frame = {bt["frameIndex"]: bt for bt in ball_trajectory}
+        processed_frame_indices = sorted(r["frameIndex"] for r in frame_results)
+        detected_sorted = sorted(ball_by_frame.keys())
+        interp_entries = []
+        for i in range(len(detected_sorted) - 1):
+            f0 = detected_sorted[i]
+            f1 = detected_sorted[i + 1]
+            b0 = ball_by_frame[f0]
+            b1 = ball_by_frame[f1]
+            # Count processed frames in the gap (not including endpoints)
+            gap_frames = [fi for fi in processed_frame_indices if f0 < fi < f1]
+            if 0 < len(gap_frames) <= 25:
+                for fi in gap_frames:
+                    if fi not in ball_by_frame:
+                        t_frac = (fi - f0) / (f1 - f0)
+                        ix = b0["x"] + t_frac * (b1["x"] - b0["x"])
+                        iy = b0["y"] + t_frac * (b1["y"] - b0["y"])
+                        entry = {
+                            "frameIndex": fi,
+                            "x": ix,
+                            "y": iy,
+                            "confidence": 0.0,
+                            "source": "interpolated",
+                        }
+                        if "bbox" in b0 and "bbox" in b1:
+                            # bbox is [x1, y1, x2, y2] — interpolate each coordinate
+                            entry["bbox"] = [
+                                b0["bbox"][k] + t_frac * (b1["bbox"][k] - b0["bbox"][k])
+                                for k in range(4)
+                            ]
+                        interp_entries.append(entry)
+        if interp_entries:
+            ball_trajectory.extend(interp_entries)
+            ball_trajectory.sort(key=lambda bt: bt["frameIndex"])
+            logger.info(
+                f"Ball interpolation: added {len(interp_entries)} entries, "
+                f"total={len(ball_trajectory)}"
+            )
+
+
     all_tracks = completed_tracks + list(active_tracks.values())
 
     # Track stitching: merge tracks that likely represent the same player
