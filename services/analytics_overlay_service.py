@@ -539,12 +539,12 @@ def render_analytics_highlight(
     merged_ranges = merge_frame_ranges(ranges)
     
     # Setup output video writer
-    fourcc = cv2.VideoWriter_fourcc(*'avc1')
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     out = cv2.VideoWriter(output_path, fourcc, fps, (frame_w, frame_h))
     
     if not out.isOpened():
         cap.release()
-        raise RuntimeError(f"Cannot create output video: {output_path}")
+        raise RuntimeError(f"Cannot create output video with mp4v: {output_path}")
     
     # Process each frame in merged ranges
     for start_frame, end_frame in merged_ranges:
@@ -620,12 +620,12 @@ def render_full_match_analytics(
     output_path = f"temp/{job_id}/render/analytics_full.mp4"
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     
-    fourcc = cv2.VideoWriter_fourcc(*'avc1')
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     out = cv2.VideoWriter(output_path, fourcc, fps, (frame_w, frame_h))
     
     if not out.isOpened():
         cap.release()
-        raise RuntimeError(f"Cannot create output video: {output_path}")
+        raise RuntimeError(f"Cannot create output video with mp4v: {output_path}")
     
     # Process every frame
     for frame_idx in range(total_frames):

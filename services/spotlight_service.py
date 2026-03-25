@@ -138,11 +138,10 @@ def render_spotlight(
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = str(out_dir / f"{track_id}_{effect_style}.mp4")
 
-    fourcc = cv2.VideoWriter_fourcc(*"avc1")
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     writer = cv2.VideoWriter(out_path, fourcc, fps, (out_w, out_h))
     if not writer.isOpened():
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        writer = cv2.VideoWriter(out_path, fourcc, fps, (out_w, out_h))
+        raise RuntimeError("Failed to open VideoWriter with mp4v codec")
 
     # Seek to start frame
     cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
@@ -237,11 +236,10 @@ def export_clip(
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = str(out_dir / f"{track_id}_{int(start_second)}.mp4")
 
-    fourcc = cv2.VideoWriter_fourcc(*"avc1")
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     writer = cv2.VideoWriter(out_path, fourcc, fps, (out_w, out_h))
     if not writer.isOpened():
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        writer = cv2.VideoWriter(out_path, fourcc, fps, (out_w, out_h))
+        raise RuntimeError("Failed to open VideoWriter with mp4v codec")
 
     cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
     frames_written = 0
