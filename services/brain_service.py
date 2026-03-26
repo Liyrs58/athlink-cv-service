@@ -95,31 +95,29 @@ def _parse_json_response(text: str) -> dict:
 def gemini_watch_clip(video_path: str, team_0_name: str, team_1_name: str) -> dict:
     """Upload video to Gemini and get tactical observations."""
     try:
-        import google.generativeai as genai
+        from google import genai
+        import time
 
         api_key = os.environ.get("GEMINI_API_KEY", "")
         if not api_key:
             raise RuntimeError("GEMINI_API_KEY not set")
 
-        genai.configure(api_key=api_key)
+        client = genai.Client(api_key=api_key)
+        model_name = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash-preview-04-17")
 
         # Upload video file
         logger.info("Uploading video to Gemini File API...")
-        video_file = genai.upload_file(path=video_path)
+        with open(video_path, "rb") as f:
+            video_file = client.files.upload(file=f, config={"mime_type": "video/mp4"})
         logger.info("Gemini upload complete: %s", video_file.name)
 
         # Wait for file to be processed
-        import time
         while video_file.state.name == "PROCESSING":
             time.sleep(2)
-            video_file = genai.get_file(video_file.name)
+            video_file = client.files.get(name=video_file.name)
 
         if video_file.state.name == "FAILED":
             raise RuntimeError(f"Gemini file processing failed: {video_file.state.name}")
-
-        # FIX 4: gemini-2.0-flash deprecated on RunPod — use 1.5 [2026-03-25]
-        model_name = os.environ.get("GEMINI_MODEL", "gemini-1.5-flash")
-        model = genai.GenerativeModel(model_name)
 
         prompt = f"""You are an elite football analyst with 20 years of experience coaching from grassroots Sunday league to professional academies. You understand every formation, every pressing system, every tactical concept in modern football.
 
@@ -225,7 +223,10 @@ Populate individual_observations with observations for as many players as you ca
 Populate key_moments with up to 5 significant moments.
 Return ONLY valid JSON. No markdown. No explanation. No apologies if something is hard to see — just describe what you can observe."""
 
-        response = model.generate_content([video_file, prompt])
+        response = client.models.generate_content(
+            model=model_name,
+            contents=[video_file, prompt],
+        )
         result = _parse_json_response(response.text)
         logger.info("Gemini analysis complete")
         return result
@@ -242,26 +243,25 @@ Return ONLY valid JSON. No markdown. No explanation. No apologies if something i
 def gemini_count_events(video_path: str, team_0_name: str, team_1_name: str) -> dict:
     """Second Gemini pass — count specific events and identify patterns."""
     try:
-        import google.generativeai as genai
+        from google import genai
         import time
 
         api_key = os.environ.get("GEMINI_API_KEY", "")
         if not api_key:
             raise RuntimeError("GEMINI_API_KEY not set")
 
-        genai.configure(api_key=api_key)
-        video_file = genai.upload_file(path=video_path)
+        client = genai.Client(api_key=api_key)
+        model_name = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash-preview-04-17")
+
+        with open(video_path, "rb") as f:
+            video_file = client.files.upload(file=f, config={"mime_type": "video/mp4"})
 
         while video_file.state.name == "PROCESSING":
             time.sleep(2)
-            video_file = genai.get_file(video_file.name)
+            video_file = client.files.get(name=video_file.name)
 
         if video_file.state.name == "FAILED":
             raise RuntimeError("Gemini file processing failed")
-
-        # FIX 4: gemini-2.0-flash deprecated on RunPod — use 1.5 [2026-03-25]
-        model_name = os.environ.get("GEMINI_MODEL", "gemini-1.5-flash")
-        model = genai.GenerativeModel(model_name)
 
         prompt = f"""You are a professional football data analyst. Watch this clip and COUNT specific events as precisely as possible.
 
@@ -374,7 +374,10 @@ Return JSON:
 
 Return ONLY valid JSON. No markdown. No explanation."""
 
-        response = model.generate_content([video_file, prompt])
+        response = client.models.generate_content(
+            model=model_name,
+            contents=[video_file, prompt],
+        )
         result = _parse_json_response(response.text)
         logger.info("Gemini event counting complete")
         return result
@@ -841,8 +844,8 @@ def generate_brain_report(job_id: str, video_path: str, result: dict) -> str:
             "total_sprints": phys.get("total_sprints", 0),
             "max_speed_kmh": phys.get("max_speed_kmh", 0),
             "ball_tracking_rate": result.get("ball", {}).get("tracking_rate", 0),
-            "possession_team_0": result.get("possession", {}).get("team_0_pct"),
-            "possession_team_1": result.get("possession", {}).get("team_1_pct"),
+
+
         }
 
         # LAYER 2 — Claude audits tracking vs frames
