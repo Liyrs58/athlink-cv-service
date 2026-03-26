@@ -17,7 +17,16 @@ _FOOTBALL_MODEL = os.path.join(os.path.dirname(__file__), '..', 'models', 'footb
 MODEL_PATH = os.getenv("YOLO_MODEL_PATH", _FOOTBALL_MODEL if os.path.exists(_FOOTBALL_MODEL) else "yolo11n.pt")
 CONFIDENCE_THRESHOLD = float(os.getenv("YOLO_CONF", "0.25"))
 IOU_THRESHOLD = float(os.getenv("YOLO_IOU", "0.45"))
-TARGET_CLASSES = [0]
+# For generic COCO model: class 0 = person
+# For football_yolo11 model: 0=ball, 1=goalkeeper, 2=player, 3=referee
+# Detected at runtime after model load
+TARGET_CLASSES = [0]  # updated after model load in _get_model()
+
+# Football model class IDs (set after model load)
+_FOOTBALL_CLASS_PLAYER = None
+_FOOTBALL_CLASS_GOALKEEPER = None
+_FOOTBALL_CLASS_REFEREE = None
+_IS_FOOTBALL_MODEL = False
 
 _pending_rescue_bboxes: list = []
 
@@ -55,19 +64,37 @@ def _detect_device() -> str:
 
 
 def _get_model():
-    global _model, _use_half
+    global _model, _use_half, TARGET_CLASSES
+    global _FOOTBALL_CLASS_PLAYER, _FOOTBALL_CLASS_GOALKEEPER, _FOOTBALL_CLASS_REFEREE, _IS_FOOTBALL_MODEL
     if _model is None:
         try:
             from ultralytics import YOLO
             device = _detect_device()
             _model = YOLO(MODEL_PATH)
             _model.to(device)
-            # FP16 half-precision on GPU for faster inference
             _use_half = device in ("cuda", "mps")
-            logger.info(
-                "Loaded YOLO model for tracking: %s on %s (half=%s)",
-                MODEL_PATH, device, _use_half,
-            )
+
+            # Detect if this is the football-specific model by checking class names
+            class_names = _model.names  # {0: 'ball', 1: 'goalkeeper', 2: 'player', 3: 'referee'}
+            name_to_id = {v: k for k, v in class_names.items()}
+
+            if "player" in name_to_id and "goalkeeper" in name_to_id and "referee" in name_to_id:
+                _IS_FOOTBALL_MODEL = True
+                _FOOTBALL_CLASS_PLAYER = name_to_id["player"]
+                _FOOTBALL_CLASS_GOALKEEPER = name_to_id["goalkeeper"]
+                _FOOTBALL_CLASS_REFEREE = name_to_id["referee"]
+                # Track players, goalkeepers, referees — not ball (handled separately)
+                TARGET_CLASSES = [_FOOTBALL_CLASS_GOALKEEPER, _FOOTBALL_CLASS_PLAYER, _FOOTBALL_CLASS_REFEREE]
+                logger.info(
+                    "Football model detected — classes: player=%d, goalkeeper=%d, referee=%d",
+                    _FOOTBALL_CLASS_PLAYER, _FOOTBALL_CLASS_GOALKEEPER, _FOOTBALL_CLASS_REFEREE,
+                )
+            else:
+                _IS_FOOTBALL_MODEL = False
+                TARGET_CLASSES = [0]  # COCO person class
+                logger.info("Generic COCO model — using class 0 (person)")
+
+            logger.info("Loaded YOLO model: %s on %s (half=%s)", MODEL_PATH, device, _use_half)
         except ImportError:
             raise RuntimeError("ultralytics package not found. Install with: pip install ultralytics")
         except Exception as e:
@@ -747,6 +774,7 @@ def run_tracking(
             bt_ids = bt_results[0].boxes.id.cpu().tolist()
             bboxes = bt_results[0].boxes.xyxy.cpu().tolist()
             confs = bt_results[0].boxes.conf.cpu().tolist()
+            cls_ids = bt_results[0].boxes.cls.cpu().tolist() if bt_results[0].boxes.cls is not None else [None] * len(bt_ids)
 
             # FootyVision: pitch boundary bystander removal
             # Scale bboxes back to original coords for pitch filter
@@ -757,8 +785,17 @@ def run_tracking(
                 pitch_ok_set.add((round(fb[0], 1), round(fb[1], 1),
                                   round(fb[2], 1), round(fb[3], 1)))
 
-            for bt_id_f, bbox, conf in zip(bt_ids, bboxes, confs):
+            for bt_id_f, bbox, conf, cls_id in zip(bt_ids, bboxes, confs, cls_ids):
                 track_id = int(bt_id_f)
+
+                # Football model: classify as player, goalkeeper (→player), or referee
+                det_is_referee = False
+                if _IS_FOOTBALL_MODEL and cls_id is not None:
+                    cls_id_int = int(cls_id)
+                    if cls_id_int == _FOOTBALL_CLASS_REFEREE:
+                        det_is_referee = True
+                    elif cls_id_int not in (_FOOTBALL_CLASS_PLAYER, _FOOTBALL_CLASS_GOALKEEPER):
+                        continue  # skip ball or unknown class
 
                 # Scale bbox back to original frame coordinates
                 if scale != 1.0:
@@ -820,8 +857,8 @@ def run_tracking(
 
                 current_active_ids.add(track_id)
 
-                # FIX 2: Detect if this detection is a potential official
-                is_official_detection = _is_potential_official(frame, bbox)
+                # Football model gives explicit referee class; fall back to heuristic for COCO
+                is_official_detection = det_is_referee if _IS_FOOTBALL_MODEL else _is_potential_official(frame, bbox)
 
                 trajectory_entry = {
                     "frameIndex": current_frame_idx,
@@ -841,7 +878,8 @@ def run_tracking(
                         "_predicted_frames": 0,
                         "_id_switches": 0,
                         "_official_votes": 1 if is_official_detection else 0,
-                        "_first_processed_frame": processed_count,  # Track when first processed
+                        "_referee_class_votes": 1 if det_is_referee else 0,
+                        "_first_processed_frame": processed_count,
                         "_last_processed_frame": processed_count,
                     }
                     # FIX 1: Check if this is a ReID recovery from recently_lost
@@ -886,6 +924,7 @@ def run_tracking(
                     active_tracks[track_id]["trajectory"].append(trajectory_entry)
                     active_tracks[track_id]["_confirmed_detections"] += 1
                     active_tracks[track_id]["_official_votes"] += 1 if is_official_detection else 0
+                    active_tracks[track_id]["_referee_class_votes"] = active_tracks[track_id].get("_referee_class_votes", 0) + (1 if det_is_referee else 0)
 
                 # ReID: update appearance histogram (EMA blend)
                 hist = _compute_histogram(frame, bbox)
@@ -1408,14 +1447,18 @@ def run_tracking(
         confirmed = track.pop("_confirmed_detections", 0)
         predicted = track.pop("_predicted_frames", 0)
         official_votes = track.pop("_official_votes", 0)
+        referee_class_votes = track.pop("_referee_class_votes", 0)
         id_switches = track.pop("_id_switches", 0)
         total_confirmed_detections += confirmed
         total_predicted_frames += predicted
         if confirmed >= 5:
             stable_tracks += 1
-        # Mark track as official if ≥30% of frames voted official
+        # Football model: any track with ≥50% referee class votes is definitively a referee
         traj_len = len(track["trajectory"])
-        is_official = (official_votes >= traj_len * 0.3) if traj_len > 0 else False
+        if _IS_FOOTBALL_MODEL and traj_len > 0 and referee_class_votes >= traj_len * 0.5:
+            is_official = True
+        else:
+            is_official = (official_votes >= traj_len * 0.3) if traj_len > 0 else False
         if is_official:
             official_tracks_count += 1
         # Add quality metadata to track output
