@@ -567,6 +567,7 @@ def run_tracking(
     # Estimate homography once from first valid frame (for accurate world coordinate conversion)
     homography_H = None
     homography_found = False
+    detect_frame_gray = None
 
     while True:
         ret, frame = cap.read()
@@ -576,7 +577,7 @@ def run_tracking(
         # FIX 2: override stride if previous frame had fast camera motion
         if not force_next_frame and raw_frame_idx % frame_stride != 0:
             # Feed skipped frames to BoT-SORT silently to keep Kalman state current
-            if prev_gray is not None and prev_gray.shape == detect_frame_gray.shape:
+            if prev_gray is not None and detect_frame_gray is not None and prev_gray.shape == detect_frame_gray.shape:
                 model.track(
                     detect_frame,
                     tracker="tracker_config/botsort_football.yaml",
