@@ -103,7 +103,7 @@ def gemini_watch_clip(video_path: str, team_0_name: str, team_1_name: str) -> di
             raise RuntimeError("GEMINI_API_KEY not set")
 
         client = genai.Client(api_key=api_key)
-        model_name = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash-preview-04-17")
+        model_name = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 
         # Upload video file
         logger.info("Uploading video to Gemini File API...")
@@ -251,7 +251,7 @@ def gemini_count_events(video_path: str, team_0_name: str, team_1_name: str) -> 
             raise RuntimeError("GEMINI_API_KEY not set")
 
         client = genai.Client(api_key=api_key)
-        model_name = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash-preview-04-17")
+        model_name = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 
         with open(video_path, "rb") as f:
             video_file = client.files.upload(file=f, config={"mime_type": "video/mp4"})
