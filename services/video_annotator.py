@@ -169,31 +169,39 @@ class VideoAnnotator:
         team_1_frames = np.sum(arr == 1)
         total = team_0_frames + team_1_frames
 
+        font_scale = min(1.0, rect_w / 550)
+
         if total > 0:
             t0_pct = team_0_frames / total * 100
             t1_pct = team_1_frames / total * 100
+            cv2.putText(
+                frame,
+                f"Team 1 Ball Control: {t0_pct:.1f}%",
+                (x1 + 10, y1 + 40),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                font_scale,
+                (0, 0, 0),
+                2,
+            )
+            cv2.putText(
+                frame,
+                f"Team 2 Ball Control: {t1_pct:.1f}%",
+                (x1 + 10, y1 + 80),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                font_scale,
+                (0, 0, 0),
+                2,
+            )
         else:
-            t0_pct = t1_pct = 50.0
-
-        font_scale = min(1.0, rect_w / 550)
-        cv2.putText(
-            frame,
-            f"Team 1 Ball Control: {t0_pct:.1f}%",
-            (x1 + 10, y1 + 40),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            font_scale,
-            (0, 0, 0),
-            2,
-        )
-        cv2.putText(
-            frame,
-            f"Team 2 Ball Control: {t1_pct:.1f}%",
-            (x1 + 10, y1 + 80),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            font_scale,
-            (0, 0, 0),
-            2,
-        )
+            cv2.putText(
+                frame,
+                "Possession: insufficient data",
+                (x1 + 10, y1 + 40),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                font_scale,
+                (0, 0, 0),
+                2,
+            )
 
         return frame
 
@@ -338,7 +346,7 @@ class VideoAnnotator:
         t1 = np.sum(arr == 1)
         total = t0 + t1
         if total == 0:
-            return {0: 50.0, 1: 50.0}
+            return {0: None, 1: None}
         return {
             0: round(t0 / total * 100, 1),
             1: round(t1 / total * 100, 1),
@@ -467,9 +475,7 @@ class VideoAnnotator:
                 for _, ball in ball_dict.items():
                     frame = self._draw_ball(frame, ball["bbox"])
 
-            # Draw camera movement
-            if frame_num < len(camera_movement):
-                frame = self._draw_camera_movement(frame, camera_movement[frame_num])
+            # Camera movement overlay removed — debug info not for end users
 
             # Draw ball control
             frame = self._draw_team_ball_control(frame, frame_num, team_ball_control)

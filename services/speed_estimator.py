@@ -15,6 +15,10 @@ def _measure_distance(p1, p2):
     return ((p1[0] - p2[0]) ** 2 + (p1[1] - p2[1]) ** 2) ** 0.5
 
 
+PIXELS_PER_METRE = 15.5
+MAX_REALISTIC_SPEED_KMH = 40.0  # ~11 m/s sprint cap
+
+
 class SpeedEstimator:
     """
     Calculates speed and distance for all tracked players.
@@ -25,7 +29,7 @@ class SpeedEstimator:
         self.frame_window = frame_window
         self.frame_rate = frame_rate
 
-    def calculate(self, tracks: dict, fps: float) -> dict:
+    def calculate(self, tracks: dict, fps: float, pixels_per_metre: float = 0) -> dict:
         """
         Add speed (km/h) and distance (metres) to each player track entry.
         Uses position_transformed if available, else position_adjusted.
@@ -33,11 +37,13 @@ class SpeedEstimator:
         Args:
             tracks: Abdullah-format tracks dict with "players", "ball" keys
             fps: video frame rate
+            pixels_per_metre: calibration value (how many pixels = 1 metre)
 
         Returns:
             Updated tracks dict with speed and distance fields.
         """
         self.frame_rate = fps if fps > 0 else 24.0
+        ppm = pixels_per_metre if pixels_per_metre > 0 else PIXELS_PER_METRE
         total_distance = {}
 
         for object_key in tracks:
@@ -70,13 +76,19 @@ class SpeedEstimator:
                     if start_position is None or end_position is None:
                         continue
 
-                    distance_covered = _measure_distance(start_position, end_position)
+                    distance_px = _measure_distance(start_position, end_position)
+                    distance_m = distance_px / ppm
                     time_elapsed = (last_frame - frame_num) / self.frame_rate
                     if time_elapsed <= 0:
                         continue
 
-                    speed_ms = distance_covered / time_elapsed
+                    speed_ms = distance_m / time_elapsed
                     speed_kmh = speed_ms * 3.6
+
+                    # Cap impossible speeds (tracking jitter / ID swap)
+                    if speed_kmh > MAX_REALISTIC_SPEED_KMH:
+                        speed_kmh = 0.0
+                        distance_m = 0.0
 
                     if object_key not in total_distance:
                         total_distance[object_key] = {}
@@ -84,7 +96,7 @@ class SpeedEstimator:
                     if track_id not in total_distance[object_key]:
                         total_distance[object_key][track_id] = 0
 
-                    total_distance[object_key][track_id] += distance_covered
+                    total_distance[object_key][track_id] += distance_m
 
                     for frame_num_batch in range(frame_num, last_frame):
                         if track_id not in tracks[object_key][frame_num_batch]:

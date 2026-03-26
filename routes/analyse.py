@@ -316,8 +316,9 @@ def _run_analysis_pipeline(job_id: str, temp_path: str, skip_cleanup: bool = Fal
                 at_tracks = compensator.adjust_positions(at_tracks, camera_movement)
 
                 # Speed estimation with camera correction
+                speed_ppm = calibration.get("pixels_per_metre", 15.5) if calibration else 15.5
                 speed_est = SpeedEstimator()
-                at_tracks = speed_est.calculate(at_tracks, ann_fps)
+                at_tracks = speed_est.calculate(at_tracks, ann_fps, pixels_per_metre=speed_ppm)
 
                 # Ball possession
                 annotator = VideoAnnotator()
