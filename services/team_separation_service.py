@@ -271,8 +271,8 @@ def cluster_teams(tracks: List[dict], video_path: str) -> Dict:
     confirmed_indices = []
 
     for track_idx, track in enumerate(tracks):
-        # Only cluster confirmed player tracks (not staff, not too short)
-        if track.get("is_staff", False):
+        # Only cluster confirmed player tracks (not staff, not officials, not too short)
+        if track.get("is_staff", False) or track.get("is_official", False):
             track["teamId"] = -1
             continue
         confirmed = track.get("confirmed_detections", 0)

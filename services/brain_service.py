@@ -42,7 +42,7 @@ def _call_claude(messages: list, max_tokens: int = 1024, model: str = "claude-so
         },
     )
 
-    with urllib.request.urlopen(req, timeout=120) as resp:
+    with urllib.request.urlopen(req, timeout=300) as resp:
         return json.loads(resp.read())
 
 
@@ -763,42 +763,173 @@ Rules you must follow:
 # ---------------------------------------------------------------------------
 
 def _fallback_report(tracking_data: dict, team_0_name: str, team_1_name: str) -> str:
-    """Generate a basic report from tracking data alone when APIs fail."""
+    """Generate a structured report from tracking data alone when APIs fail.
+
+    Uses H1 markdown headers matching the synthesis prompt so the frontend
+    tab parser (static/index.html) can split sections correctly into:
+    - FULL REPORT tab: everything
+    - Team A tab: matched by `{team_0_name} —` in H1
+    - Team B tab: matched by `{team_1_name} —` in H1
+    - PLAYERS tab: matched by 'individual player' / 'psychological' / 'parent & player'
+    - DATA tab: matched by 'data confidence' / 'event statistics' / 'head-to-head'
+    """
     phys = tracking_data.get("physical", {})
     shape = tracking_data.get("shape", {})
     possession = tracking_data.get("possession", {})
+    tracking = tracking_data.get("tracking", {})
+    fatigue = tracking_data.get("fatigue", {})
 
-    lines = ["WHAT WE SAW", "AI analysis was unavailable for this clip.", ""]
-
-    lines.append("WHAT THE DATA SHOWS")
-    players = phys.get("players_analysed", "?")
-    sprints = phys.get("total_sprints", "?")
-    max_spd = phys.get("max_speed_kmh", "?")
-    lines.append(f"- {players} players tracked, {sprints} total sprints")
-    lines.append(f"- Top speed recorded: {max_spd} km/h")
+    players = phys.get("players_analysed", 0)
+    sprints = phys.get("total_sprints", 0)
+    max_spd = phys.get("max_speed_kmh", 0)
     _t0p = possession.get("team_0_pct")
     _t1p = possession.get("team_1_pct")
-    if _t0p is not None and _t1p is not None:
-        lines.append(f"- Possession: {team_0_name} {_t0p:.0f}% vs {team_1_name} {_t1p:.0f}%")
-    else:
-        lines.append("- Possession: insufficient data")
-    lines.append("")
+    t0_count = tracking.get("team_0_count", "?")
+    t1_count = tracking.get("team_1_count", "?")
 
-    lines.append("ONE THING TO FIX THIS WEEK")
+    poss_line = f"{team_0_name} {_t0p:.0f}% vs {team_1_name} {_t1p:.0f}%" if (_t0p is not None and _t1p is not None) else "Insufficient ball tracking data to determine possession."
+
+    # Shape data
+    formation = shape.get("formation", "Unable to determine from data alone")
+    avg_width = shape.get("avg_width_metres")
+    width_note = f"{avg_width:.0f}m average width" if isinstance(avg_width, (int, float)) else "unknown"
+
+    # Sprint data
+    sprint_note = ""
     if isinstance(sprints, (int, float)) and sprints < 10:
-        lines.append("Sprint count is low. Run repeated sprint drills (6x30m with 45s rest) to build match intensity.")
-    elif shape.get("data_quality") == "ok" and isinstance(shape.get("avg_width_metres"), (int, float)) and shape["avg_width_metres"] < 35:
-        lines.append(f"Team shape is narrow ({shape['avg_width_metres']:.0f}m width). Use wide channel games to encourage width in possession.")
-    else:
-        lines.append("Focus on maintaining team compactness during transitions. Use 5v5 transition games with counter-attack triggers.")
+        sprint_note = "Sprint count is low — consider repeated sprint drills (6x30m with 45s rest) to build match intensity."
+    elif isinstance(sprints, (int, float)):
+        sprint_note = f"{sprints} sprints recorded across all tracked players."
+
+    # Training focus
+    training_focus = "Focus on maintaining team compactness during transitions. Use 5v5 transition games with counter-attack triggers."
+    if isinstance(sprints, (int, float)) and sprints < 10:
+        training_focus = "Sprint count is low. Run repeated sprint drills (6x30m with 45s rest) to build match intensity."
+    elif shape.get("data_quality") == "ok" and isinstance(avg_width, (int, float)) and avg_width < 35:
+        training_focus = f"Team shape is narrow ({avg_width:.0f}m width). Use wide channel games to encourage width in possession."
+
+    # Player to watch
+    top_runner = phys.get("top_runner_id")
+    player_watch = f"Player #{top_runner} — covered the most distance. Assess whether this effort is sustainable across a full match or if they are chasing the ball reactively." if top_runner else "Individual player analysis requires clearer camera footage or longer clips."
+
+    # Per-player stats table
+    per_player = phys.get("players", [])
+    player_rows = ""
+    if per_player:
+        for p in per_player[:15]:
+            label = p.get("display_label") or f"Player #{p.get('track_id', '?')}"
+            team = p.get("team_name", "—")
+            dist = p.get("distance_metres", 0)
+            spd = p.get("max_speed_kmh", 0)
+            sp = p.get("sprints", 0)
+            conf = p.get("confidence", "—")
+            player_rows += f"| {label} | {team} | {dist:.0f}m | {spd:.1f} km/h | {sp} | {conf} |\n"
+
+    lines = []
+
+    # ── MATCH ANALYSIS REPORT (goes into FULL REPORT tab) ──
+    lines.append("# MATCH ANALYSIS REPORT")
+    lines.append("")
+    lines.append("## EXECUTIVE SUMMARY")
+    lines.append(f"AI video analysis was unavailable for this clip (API timeout). This report is generated from tracking data only. {players} players were tracked with measurable movement. Top speed recorded: {max_spd} km/h. {poss_line}")
     lines.append("")
 
-    lines.append("PLAYER TO WATCH")
-    top_runner = phys.get("top_runner_id")
-    if top_runner:
-        lines.append(f"Player #{top_runner} — covered the most distance. Check if their effort is sustainable or if they're chasing the ball.")
+    # ── TEAM A (goes into team A tab) ──
+    lines.append(f"# {team_0_name} — TEAM ANALYSIS")
+    lines.append("")
+    lines.append("## Formation & Shape")
+    lines.append(f"Detected formation: {formation}. Team width: {width_note}.")
+    lines.append(f"Players tracked for {team_0_name}: {t0_count}.")
+    lines.append("")
+    lines.append("## Attacking Play")
+    lines.append("Video analysis was unavailable — attacking patterns could not be assessed from tracking data alone.")
+    lines.append("")
+    lines.append("## Defensive Organisation")
+    lines.append("Video analysis was unavailable — defensive shape requires visual observation.")
+    lines.append("")
+    lines.append(f"## {team_0_name} — THIS WEEK'S TRAINING FOCUS")
+    lines.append(training_focus)
+    lines.append("")
+
+    # ── TEAM B (goes into team B tab) ──
+    lines.append(f"# {team_1_name} — TEAM ANALYSIS")
+    lines.append("")
+    lines.append("## Formation & Shape")
+    lines.append(f"Players tracked for {team_1_name}: {t1_count}.")
+    lines.append("")
+    lines.append("## Attacking Play")
+    lines.append("Video analysis was unavailable — attacking patterns could not be assessed from tracking data alone.")
+    lines.append("")
+    lines.append("## Defensive Organisation")
+    lines.append("Video analysis was unavailable — defensive shape requires visual observation.")
+    lines.append("")
+    lines.append(f"## {team_1_name} — THIS WEEK'S TRAINING FOCUS")
+    lines.append(training_focus)
+    lines.append("")
+
+    # ── INDIVIDUAL PLAYER OBSERVATIONS (goes into PLAYERS tab) ──
+    lines.append("# INDIVIDUAL PLAYER OBSERVATIONS")
+    lines.append("")
+    lines.append(f"**Player to watch:** {player_watch}")
+    lines.append("")
+    if sprint_note:
+        lines.append(f"**Sprint analysis:** {sprint_note}")
+        lines.append("")
+    lines.append("Individual tactical observations require video analysis (Gemini + Claude). This report contains tracking data only.")
+    lines.append("")
+
+    # ── PSYCHOLOGICAL & LEADERSHIP ANALYSIS (also goes into PLAYERS tab) ──
+    lines.append("# PSYCHOLOGICAL & LEADERSHIP ANALYSIS")
+    lines.append("")
+    lines.append("Body language and leadership signals require video analysis and are not available from tracking data alone.")
+    lines.append("")
+
+    # ── HEAD-TO-HEAD (goes into DATA tab) ──
+    lines.append("# HEAD-TO-HEAD TACTICAL COMPARISON")
+    lines.append("")
+    lines.append(f"| Aspect | {team_0_name} | {team_1_name} |")
+    lines.append("|--------|--------------|--------------|")
+    lines.append(f"| Players Tracked | {t0_count} | {t1_count} |")
+    if _t0p is not None and _t1p is not None:
+        lines.append(f"| Possession | {_t0p:.0f}% | {_t1p:.0f}% |")
     else:
-        lines.append("Unable to identify standout players from available data.")
+        lines.append("| Possession | — | — |")
+    lines.append(f"| Top Speed | {max_spd} km/h | — |")
+    lines.append("")
+
+    # ── DATA CONFIDENCE REPORT (goes into DATA tab) ──
+    lines.append("# DATA CONFIDENCE REPORT")
+    lines.append("")
+    lines.append("**Overall data confidence:** LOW — AI video analysis timed out. Report is generated from tracking data only.")
+    lines.append("")
+    lines.append("**Reliable metrics:** Player count, basic distance (if confidence is high/medium)")
+    lines.append("")
+    lines.append("**Unreliable metrics:** Formation, tactical observations, pressing intensity, possession (if ball tracking rate was low)")
+    lines.append("")
+    lines.append("**Why:** The three-layer AI brain (Gemini video + Claude audit + Claude synthesis) did not complete. Retry the analysis or check API keys (GEMINI_API_KEY, ANTHROPIC_API_KEY) and network connectivity on RunPod.")
+    lines.append("")
+
+    # ── EVENT STATISTICS (also goes into DATA tab) ──
+    lines.append("# EVENT STATISTICS")
+    lines.append("")
+    lines.append(f"- **Players tracked:** {players}")
+    lines.append(f"- **Total sprints:** {sprints}")
+    lines.append(f"- **Top speed:** {max_spd} km/h")
+    lines.append(f"- **Possession:** {poss_line}")
+    lines.append("")
+
+    if player_rows:
+        lines.append("## Player Stats")
+        lines.append("")
+        lines.append("| Player | Team | Distance | Top Speed | Sprints | Confidence |")
+        lines.append("|--------|------|----------|-----------|---------|------------|")
+        lines.append(player_rows)
+
+    # ── PARENT & PLAYER SUMMARY (also goes into PLAYERS tab) ──
+    lines.append("# PARENT & PLAYER SUMMARY")
+    lines.append("")
+    lines.append("A full analysis was not available for this clip. The basic tracking data shows players were detected and movement was measured. For a complete coaching report with tactical insights and training recommendations, please retry the analysis.")
+    lines.append("")
 
     return "\n".join(lines)
 
@@ -814,26 +945,37 @@ def generate_brain_report(job_id: str, video_path: str, result: dict) -> str:
     Layer 1: Gemini watches the video
     Layer 2: Claude audits tracking data against key frames
     Layer 3: Claude synthesises the final coaching report
-    """
-    try:
-        # Extract team names
-        team_sep = result.get("team_separation", {})
-        team_0_name = team_sep.get("team_0_colour_name", "Team A")
-        team_1_name = team_sep.get("team_1_colour_name", "Team B")
 
-        # LAYER 1a — Gemini watches the clip
+    Resilience: each layer can fail independently. If L3 fails we still
+    produce a structured fallback with proper H1 headers for the frontend.
+    """
+    team_sep = result.get("team_separation", {})
+    team_0_name = team_sep.get("team_0_colour_name", "Team A")
+    team_1_name = team_sep.get("team_1_colour_name", "Team B")
+
+    gemini_obs = {}
+    gemini_events = {}
+    audit = {"confidence": "low", "unreliable_metrics": [], "player_count_valid": False}
+
+    # LAYER 1a — Gemini watches the clip
+    try:
         logger.info("[Brain L1a] Gemini watching clip for job %s", job_id)
         gemini_obs = gemini_watch_clip(video_path, team_0_name, team_1_name)
+    except Exception as e:
+        logger.error("[Brain L1a] Gemini watch failed for job %s: %s", job_id, e)
 
-        # LAYER 1b — Gemini event counting and psychology
+    # LAYER 1b — Gemini event counting and psychology
+    try:
         logger.info("[Brain L1b] Gemini counting events for job %s", job_id)
         gemini_events = gemini_count_events(video_path, team_0_name, team_1_name)
+    except Exception as e:
+        logger.error("[Brain L1b] Gemini events failed for job %s: %s", job_id, e)
 
-        # Extract 8 key frames for audit
+    # LAYER 2 — Claude audits tracking vs frames
+    try:
         logger.info("[Brain L2] Extracting key frames for audit")
         frames = _extract_key_frames(video_path, count=8)
 
-        # Build tracking summary for the auditor
         phys = result.get("physical", {})
         tracking_summary = {
             "player_count": phys.get("players_analysed", 0),
@@ -844,21 +986,19 @@ def generate_brain_report(job_id: str, video_path: str, result: dict) -> str:
             "total_sprints": phys.get("total_sprints", 0),
             "max_speed_kmh": phys.get("max_speed_kmh", 0),
             "ball_tracking_rate": result.get("ball", {}).get("tracking_rate", 0),
-
-
         }
 
-        # LAYER 2 — Claude audits tracking vs frames
         logger.info("[Brain L2] Claude auditing tracking data for job %s", job_id)
         audit = claude_audit_tracking(frames, tracking_summary)
+    except Exception as e:
+        logger.error("[Brain L2] Claude audit failed for job %s: %s", job_id, e)
 
-        # LAYER 3 — Claude synthesises the report
+    # LAYER 3 — Claude synthesises the report
+    try:
         logger.info("[Brain L3] Synthesising coaching report for job %s", job_id)
         report = synthesise_report(gemini_obs, audit, result, team_0_name, team_1_name, gemini_events=gemini_events)
-
         logger.info("[Brain] Report complete for job %s (%d chars)", job_id, len(report))
         return report
-
     except Exception as e:
-        logger.error("[Brain] Failed for job %s: %s", job_id, e)
-        return _fallback_report(result, result.get("team_separation", {}).get("team_0_colour_name", "Team A"), result.get("team_separation", {}).get("team_1_colour_name", "Team B"))
+        logger.error("[Brain L3] Synthesis failed for job %s: %s", job_id, e)
+        return _fallback_report(result, team_0_name, team_1_name)

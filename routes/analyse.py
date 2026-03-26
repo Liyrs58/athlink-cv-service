@@ -253,12 +253,17 @@ def _run_analysis_pipeline(job_id: str, temp_path: str, skip_cleanup: bool = Fal
                             if closest and abs(closest["frameIndex"] - fi) <= 4:
                                 bbox = closest.get("bbox", [])
                                 if len(bbox) >= 4:
-                                    frame_players.append({
-                                        "track_id": t.get("trackId"),
-                                        "cx": (bbox[0] + bbox[2]) / 2.0,
-                                        "cy": (bbox[1] + bbox[3]) / 2.0,
-                                        "team_id": t.get("teamId", -1),
-                                    })
+                                    team_id = t.get("teamId", -1)
+                                    # Only include players with valid team assignment
+                                    # for possession — unassigned (-1) players can't
+                                    # contribute to team possession stats
+                                    if team_id in (0, 1):
+                                        frame_players.append({
+                                            "track_id": t.get("trackId"),
+                                            "cx": (bbox[0] + bbox[2]) / 2.0,
+                                            "cy": (bbox[1] + bbox[3]) / 2.0,
+                                            "team_id": team_id,
+                                        })
 
                     poss = possession_det.update(bp, frame_players, fi, ppm)
                     pass_detector.update(poss, bp, fi, fps, ppm)
@@ -640,7 +645,7 @@ def _run_analysis_pipeline(job_id: str, temp_path: str, skip_cleanup: bool = Fal
                 "total_distance_metres": vel_summary.get("total_distance_metres", 0),
                 "players_analysed": sum(
                     1 for p in players_physical
-                    if p["distance_metres"] > 5 and p["confidence"] in ("high", "medium")
+                    if p["distance_metres"] > 1 and p["confidence"] in ("high", "medium", "low")
                 ),
                 "top_sprinter_id": vel_summary.get("top_sprinter_id"),
                 "top_runner_id": vel_summary.get("top_runner_id"),
