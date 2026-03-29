@@ -58,7 +58,7 @@ def download_roboflow_dataset() -> Path:
         _pip_install("roboflow")
         from roboflow import Roboflow
 
-    rf = Roboflow(api_key="YOUR_API_KEY_HERE")  # free key at roboflow.com
+    rf = Roboflow(api_key="yEXRVSODXWQsshHWg2P5")  # free key at roboflow.com
     project = rf.workspace("roboflow-jvuqo").project("football-players-detection-3zvbc")
     version = project.version(2)
     dataset = version.download("yolov8", location=str(DATASET_DIR / "roboflow_football"))

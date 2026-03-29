@@ -33,6 +33,7 @@ from routes.analytics_overlay import router as analytics_overlay_router
 from routes.conversation import router as conversation_router
 from routes.oracle import router as oracle_router
 from routes.stream import router as stream_router
+from routes.whatif import router as whatif_router
 from services.memory_service import clean_memory
 
 TAGS_METADATA = [
@@ -122,6 +123,7 @@ app.include_router(analytics_overlay_router, prefix="/api/v1/analytics-overlay",
 app.include_router(conversation_router, prefix="/api/v1", tags=["conversation"])
 app.include_router(oracle_router, prefix="/api/v1", tags=["oracle"])
 app.include_router(stream_router, prefix="/api/v1", tags=["stream"])
+app.include_router(whatif_router, tags=["whatif"])
 
 @app.get("/health")
 async def root():

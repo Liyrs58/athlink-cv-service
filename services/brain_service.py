@@ -194,6 +194,8 @@ Return a JSON object with ALL of these fields populated:
   }},
   "match_context": {{
     "dominant_team": "which team controlled the clip and why",
+    "estimated_possession_team_0_pct": "your best estimate of {team_0_name} possession as a number 0-100",
+    "estimated_possession_team_1_pct": "your best estimate of {team_1_name} possession as a number 0-100 (must sum to 100 with team_0)",
     "momentum_shifts": "did momentum shift and when",
     "physical_intensity": "high, medium, low intensity match",
     "referee_context": "any notable decisions or stoppages observed",
