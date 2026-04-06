@@ -1129,6 +1129,9 @@ def _run_tracking_impl(
             "tracks": frame_track_entries,
         })
 
+        # Frame is valid if at least 2 tracks are active
+        frame_is_valid = len(current_active_ids) >= 2
+
         # FIX 5: Record per-frame metadata for validity analysis
         frame_metadata.append({
             "frameIndex": current_frame_idx,
