@@ -24,6 +24,9 @@ _device = None
 _use_half = False
 _scene_classifier = SceneClassifier()
 
+import threading
+_tracking_lock = threading.Lock()
+
 
 def _detect_device() -> str:
     """Auto-detect the best available device: cuda > mps > cpu."""
@@ -420,7 +423,27 @@ def run_tracking(
     progress_path: Optional[str] = None,  # Path to write progress.json for live streaming
 ) -> Dict[str, Any]:
     """Run BoT-SORT object tracking on video frames with camera motion compensation."""
+    with _tracking_lock:
+        return _run_tracking_impl(video_path, job_id, frame_stride, max_frames, max_track_age, adaptive_stride, progress_path)
+
+
+def _run_tracking_impl(
+    video_path: str,
+    job_id: str,
+    frame_stride: int = 5,
+    max_frames: Optional[int] = None,
+    max_track_age: int = 90,
+    adaptive_stride: bool = True,
+    progress_path: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Internal implementation — must be called under _tracking_lock."""
+    logger.info("Tracking started — single loop only")
     model = _get_model()
+
+    # Reset BoT-SORT tracker state so a previous job's persisted state
+    # doesn't bleed into this run (the global model keeps tracker state
+    # between calls when persist=True).
+    model.predictor = None
 
     # PERF: process only every SAMPLE_RATE-th strided frame for 5x speedup
     SAMPLE_RATE = 5
@@ -1412,5 +1435,6 @@ def run_tracking(
         except Exception:
             pass
 
+    logger.info(f"Tracking complete — {len(frame_results)} frames processed in single pass")
     logger.info(f"Tracking complete: {len(filtered)} tracks saved to {results_file}")
     return results_data
