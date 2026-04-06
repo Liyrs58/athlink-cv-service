@@ -93,7 +93,7 @@ def _parse_json_response(text: str) -> dict:
 # ---------------------------------------------------------------------------
 
 def gemini_watch_clip(video_path: str, team_0_name: str, team_1_name: str) -> dict:
-    """Upload video to Gemini and get tactical observations."""
+    """Upload video to Gemini once and get tactical observations + event counts + psychology."""
     try:
         import google.generativeai as genai
 
@@ -221,163 +221,44 @@ Return a JSON object with ALL of these fields populated:
 
 Populate individual_observations with observations for as many players as you can identify — aim for at least 6-8 individual observations across both teams.
 Populate key_moments with up to 5 significant moments.
+
+ALSO count specific events for each team:
+- Passes attempted/completed (estimate), shots on/off target, corners, free kicks, headers, tackles
+- Times defensive line was broken, press beaten by single pass, successful counter-attacks
+- Wide players failing to track back, times entered opposition half
+
+And observe player behaviour:
+- Who is organising/communicating, positive vs negative body language after mistakes
+- Leadership by position or communication, fatigue or asymmetric movement (injury risk)
+- Any player making the same mistake more than once, visible shirt numbers
+
+Include these additional fields in the JSON:
+
+"team_0_events": {{
+  "passes_estimated": number, "shots_on_target": number, "shots_off_target": number,
+  "corners": number, "free_kicks": number, "headers_won": number, "tackles_attempted": number,
+  "defensive_line_breaks_conceded": number, "press_beaten_by_single_pass": number,
+  "successful_counter_attacks": number, "wide_players_failed_to_track_back": number,
+  "times_entered_opposition_half": number
+}},
+"team_1_events": {{ same fields }},
+"player_psychology": [{{ "team": "team_0 or team_1", "description": "shirt colour and position", "shirt_number": "if visible", "behaviour": "specific observed behaviour", "interpretation": "mental state interpretation", "coaching_note": "specific coaching point" }}],
+"leadership_identified": [{{ "team": "team_0 or team_1", "description": "shirt colour and position", "evidence": "specific leadership behaviour" }}],
+"injury_risk_flags": [{{ "team": "team_0 or team_1", "description": "shirt colour and position", "observation": "specific asymmetric movement or fatigue sign" }}],
+"shirt_numbers_visible": ["list any visible shirt numbers with team and position"],
+"physical_conditions": {{ "pitch_quality": "good/average/poor", "weather_visible": "description or none visible", "lighting": "daylight/floodlit/dusk" }},
+"repeated_mistakes": [{{ "team": "team_0 or team_1", "player_description": "position and colour", "mistake": "specific mistake observed more than once", "count": number, "coaching_point": "how to fix this" }}]
+
 Return ONLY valid JSON. No markdown. No explanation. No apologies if something is hard to see — just describe what you can observe."""
 
         response = model.generate_content([video_file, prompt])
         result = _parse_json_response(response.text)
-        logger.info("Gemini analysis complete")
+        logger.info("Gemini combined analysis complete")
         return result
 
     except Exception as e:
         logger.warning("Gemini layer failed: %s", e)
         return {"error": f"Gemini unavailable: {e}", "one_thing_to_fix": "Analysis unavailable"}
-
-
-# ---------------------------------------------------------------------------
-# LAYER 1b — EYES (Gemini event counting and psychology)
-# ---------------------------------------------------------------------------
-
-def gemini_count_events(video_path: str, team_0_name: str, team_1_name: str) -> dict:
-    """Second Gemini pass — count specific events and identify patterns."""
-    try:
-        import google.generativeai as genai
-        import time
-
-        api_key = os.environ.get("GEMINI_API_KEY", "")
-        if not api_key:
-            raise RuntimeError("GEMINI_API_KEY not set")
-
-        genai.configure(api_key=api_key)
-        video_file = genai.upload_file(path=video_path)
-
-        while video_file.state.name == "PROCESSING":
-            time.sleep(2)
-            video_file = genai.get_file(video_file.name)
-
-        if video_file.state.name == "FAILED":
-            raise RuntimeError("Gemini file processing failed")
-
-        model = genai.GenerativeModel("gemini-2.0-flash")
-
-        prompt = f"""You are a professional football data analyst. Watch this clip and COUNT specific events as precisely as possible.
-
-Teams: {team_0_name} vs {team_1_name}
-
-Count and observe the following for EACH team separately:
-
-EVENTS TO COUNT:
-- Passes attempted and completed (estimate)
-- Shots on target vs off target
-- Corners won
-- Free kicks won
-- Throw-ins
-- Headers contested
-- Tackles attempted
-- Times ball went out of play
-- Times goalkeeper had the ball
-- Number of times each team entered the opposition half
-
-PLAYER BEHAVIOUR:
-- Which players are organising and communicating (pointing, directing teammates)
-- Which players show positive body language after mistakes vs negative
-- Which players are pressing with intensity vs jogging
-- Any player who makes the same mistake more than once
-- Any player who shows leadership by position or communication
-- Any player who looks fatigued or is moving asymmetrically (possible injury risk)
-
-TACTICAL EVENTS:
-- How many times did the defensive line break (opponent got in behind)
-- How many times was the press beaten with one pass
-- How many successful counter-attacks
-- How many times did wide players fail to track back
-- Any visible shirt numbers on players
-
-PHYSICAL CONDITIONS:
-- Pitch quality (good, average, poor)
-- Any visible weather effects
-- Time of day (day/floodlit/dusk)
-
-Return JSON:
-{{
-  "team_0_events": {{
-    "passes_estimated": number,
-    "shots_on_target": number,
-    "shots_off_target": number,
-    "corners": number,
-    "free_kicks": number,
-    "headers_won": number,
-    "tackles_attempted": number,
-    "defensive_line_breaks_conceded": number,
-    "press_beaten_by_single_pass": number,
-    "successful_counter_attacks": number,
-    "wide_players_failed_to_track_back": number,
-    "times_entered_opposition_half": number
-  }},
-  "team_1_events": {{
-    "passes_estimated": number,
-    "shots_on_target": number,
-    "shots_off_target": number,
-    "corners": number,
-    "free_kicks": number,
-    "headers_won": number,
-    "tackles_attempted": number,
-    "defensive_line_breaks_conceded": number,
-    "press_beaten_by_single_pass": number,
-    "successful_counter_attacks": number,
-    "wide_players_failed_to_track_back": number,
-    "times_entered_opposition_half": number
-  }},
-  "player_psychology": [
-    {{
-      "team": "team_0 or team_1",
-      "description": "shirt colour and position",
-      "shirt_number": "if visible",
-      "behaviour": "specific observed behaviour",
-      "interpretation": "what this suggests about their mental state or role",
-      "coaching_note": "specific coaching point"
-    }}
-  ],
-  "leadership_identified": [
-    {{
-      "team": "team_0 or team_1",
-      "description": "shirt colour and position",
-      "evidence": "specific behaviour that indicates leadership"
-    }}
-  ],
-  "injury_risk_flags": [
-    {{
-      "team": "team_0 or team_1",
-      "description": "shirt colour and position",
-      "observation": "specific asymmetric movement or fatigue sign"
-    }}
-  ],
-  "shirt_numbers_visible": ["list any visible shirt numbers with team and position"],
-  "physical_conditions": {{
-    "pitch_quality": "good/average/poor",
-    "weather_visible": "description or none visible",
-    "lighting": "daylight/floodlit/dusk"
-  }},
-  "repeated_mistakes": [
-    {{
-      "team": "team_0 or team_1",
-      "player_description": "position and colour",
-      "mistake": "specific mistake observed more than once",
-      "count": number,
-      "coaching_point": "how to fix this"
-    }}
-  ]
-}}
-
-Return ONLY valid JSON. No markdown. No explanation."""
-
-        response = model.generate_content([video_file, prompt])
-        result = _parse_json_response(response.text)
-        logger.info("Gemini event counting complete")
-        return result
-
-    except Exception as e:
-        logger.warning("Gemini event counting failed: %s", e)
-        return {}
 
 
 # ---------------------------------------------------------------------------
@@ -810,13 +691,10 @@ def generate_brain_report(job_id: str, video_path: str, result: dict) -> str:
         team_0_name = team_sep.get("team_0_colour_name", "Team A")
         team_1_name = team_sep.get("team_1_colour_name", "Team B")
 
-        # LAYER 1a — Gemini watches the clip
-        logger.info("[Brain L1a] Gemini watching clip for job %s", job_id)
+        # LAYER 1 — Gemini watches the clip (single combined call for tactics + events + psychology)
+        logger.info("[Brain L1] Gemini watching clip for job %s", job_id)
         gemini_obs = gemini_watch_clip(video_path, team_0_name, team_1_name)
-
-        # LAYER 1b — Gemini event counting and psychology
-        logger.info("[Brain L1b] Gemini counting events for job %s", job_id)
-        gemini_events = gemini_count_events(video_path, team_0_name, team_1_name)
+        gemini_events = gemini_obs  # Events are now included in the same response
 
         # Extract 8 key frames for audit
         logger.info("[Brain L2] Extracting key frames for audit")

@@ -329,9 +329,11 @@ class VideoAnnotator:
         output_path: str,
         camera_movement: list,
         team_ball_control: list,
-    ) -> str:
+    ) -> Optional[str]:
         """
         Produce fully annotated video.
+
+        Set SKIP_ANNOTATED_VIDEO=true to skip entirely (saves 2-3 min per clip).
 
         tracks structure (Abdullah Tarek format):
         {
@@ -349,6 +351,11 @@ class VideoAnnotator:
 
         Returns output_path on success.
         """
+        import os
+        if os.getenv('SKIP_ANNOTATED_VIDEO', 'false').lower() == 'true':
+            logger.info("SKIP_ANNOTATED_VIDEO=true — skipping annotated video generation")
+            return None
+
         cap = cv2.VideoCapture(video_path)
         if not cap.isOpened():
             raise RuntimeError(f"Cannot open video: {video_path}")

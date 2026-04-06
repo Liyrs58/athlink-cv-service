@@ -411,6 +411,10 @@ def run_tracking(
     """Run BoT-SORT object tracking on video frames with camera motion compensation."""
     model = _get_model()
 
+    # PERF: process only every SAMPLE_RATE-th strided frame for 5x speedup
+    SAMPLE_RATE = 5
+    effective_stride = frame_stride * SAMPLE_RATE
+
     active_tracks: Dict[int, Dict[str, Any]] = {}
     completed_tracks: List[Dict[str, Any]] = []
     recently_lost: Dict[int, Dict[str, Any]] = {}  # FIX 1: tracks lost in last 30 frames for ReID recovery
@@ -472,7 +476,7 @@ def run_tracking(
             break
 
         # FIX 2: override stride if previous frame had fast camera motion
-        if not force_next_frame and raw_frame_idx % frame_stride != 0:
+        if not force_next_frame and raw_frame_idx % effective_stride != 0:
             # Feed skipped frames to BoT-SORT silently to keep Kalman state current
             if prev_gray is not None and prev_gray.shape == detect_frame_gray.shape:
                 model.track(
@@ -1261,7 +1265,7 @@ def run_tracking(
             a = traj[i]
             b = traj[i + 1]
             gap = b["frameIndex"] - a["frameIndex"]
-            if 2 * frame_stride <= gap <= 4 * frame_stride:
+            if 2 * frame_stride <= gap <= 8 * effective_stride:
                 steps = gap // frame_stride
                 for s in range(1, steps):
                     t_frac = s / steps
