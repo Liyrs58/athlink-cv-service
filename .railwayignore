@@ -1,0 +1,12 @@
+MotionBERT/
+*.pt
+*.bin
+*.pth
+*.onnx
+uploads/
+temp/
+__pycache__/
+*.pyc
+.env
+models/
+checkpoints/
