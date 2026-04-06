@@ -13,6 +13,33 @@ from typing import Optional, Dict, List
 
 logger = logging.getLogger(__name__)
 
+from ultralytics import YOLO as _YOLO
+
+_ball_model = None
+_ball_model_type = None
+
+def get_ball_model():
+    """Load ball detection model once and cache it globally."""
+    global _ball_model, _ball_model_type
+    if _ball_model is not None:
+        return _ball_model, _ball_model_type
+    try:
+        _ball_model_path = os.environ.get("BALL_MODEL_PATH", "ball.pt")
+        if os.path.exists(_ball_model_path):
+            _ball_model = _YOLO(_ball_model_path)
+            _ball_model_type = 'ultralytics'
+            logger.info("Ball detector loaded from %s", _ball_model_path)
+        else:
+            _ball_model = _YOLO('yolov8s.pt')
+            _ball_model_type = 'ultralytics'
+            logger.info("Ball detector loaded: yolov8s fallback via ultralytics")
+    except Exception as e:
+        logger.error("Ball detector load failed: %s", e)
+        _ball_model = None
+        _ball_model_type = None
+    return _ball_model, _ball_model_type
+
+
 # Lazy-load torch to avoid crashing RunPod workers at import time
 torch = None
 
@@ -49,7 +76,7 @@ class BallTracker:
 
     def __init__(self):
         self.model = None
-        self.model_type = None
+        self.model_type: Optional[str] = None
         self._positions: Dict[int, dict] = {}   # frame_idx -> {x, y, conf, interpolated}
         self._last_pos: Optional[dict] = None
         self._last_det_frame: int = -1
@@ -57,18 +84,7 @@ class BallTracker:
 
     # ------------------------------------------------------------------
     def load_model(self):
-        try:
-            from ultralytics import YOLO
-            if os.path.exists(BALL_MODEL_PATH):
-                self.model = YOLO(BALL_MODEL_PATH)
-                logger.info("Ball detector loaded from %s", BALL_MODEL_PATH)
-            else:
-                self.model = YOLO('yolov8s.pt')
-                logger.info("Ball detector loaded: yolov8s fallback via ultralytics")
-            self.model_type = 'ultralytics'
-        except Exception as e:
-            logger.error("Ball detector load failed: %s", e)
-            self.model = None
+        self.model, self.model_type = get_ball_model()
 
     # ------------------------------------------------------------------
     def detect(self, frame: np.ndarray, frame_idx: int) -> Optional[dict]:
