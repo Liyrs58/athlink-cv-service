@@ -33,6 +33,7 @@ MAX_BALL_SIZE = 40          # pixels — reject larger detections (ball is 5-18p
 INTERPOLATE_MAX = 5         # frames to interpolate when ball lost
 POSSESSION_MAX_DIST = 2.0   # metres — max distance for possession
 POSSESSION_MIN_FRAMES = 3   # frames ball must be near player
+BALL_CONFIDENCE_THRESHOLD = 0.45  # minimum ball confidence for possession assignment
 
 
 # ---------------------------------------------------------------------------
@@ -216,6 +217,22 @@ class PossessionDetector:
             self._history.append(state)
             return state
 
+        # Gate on ball confidence — only assign possession when confidence >= 0.45
+        ball_conf = ball_pos.get("confidence", 0.0)
+        if ball_conf < BALL_CONFIDENCE_THRESHOLD:
+            # Ball confidence too low — don't update possession
+            state = {
+                "frame_idx": frame_idx,
+                "player_id": None,
+                "team_id": None,
+                "distance_metres": None,
+                "confidence": 0.0,
+                "frames_held": 0,
+                "insufficient_data": True,
+            }
+            self._history.append(state)
+            return state
+
         bx, by = ball_pos["x"], ball_pos["y"]
 
         # Find closest player
@@ -294,7 +311,7 @@ class PossessionDetector:
                 total += 1
 
         if total == 0:
-            return {0: 50.0, 1: 50.0}
+            return {"insufficient_data": True, "message": "Insufficient data"}
 
         return {k: round(v / total * 100, 1) for k, v in counts.items()}
 

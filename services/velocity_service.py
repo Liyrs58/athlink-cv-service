@@ -27,14 +27,15 @@ MAX_SPRINTS_PER_PLAYER = 3     # max realistic in 40s clip
 
 # Part 3b: noise floor
 MIN_DISPLACEMENT_M = 0.3  # per-frame displacement below this is noise
+MAX_FRAME_DISTANCE_M = 0.46  # cap per-frame distance (~11.5 m/s at 25fps)
 
 
 def get_centre(bbox):
     return ((bbox[0] + bbox[2]) / 2.0, (bbox[1] + bbox[3]) / 2.0)
 
 
-def _smooth_trajectory(positions: List[tuple]) -> List[tuple]:
-    """Apply 3-point moving average smoothing to trajectory positions."""
+def _smooth_trajectory_world(positions: List[tuple]) -> List[tuple]:
+    """Apply 3-point moving average smoothing to world coordinate positions."""
     if len(positions) < 3:
         return positions
     smoothed = [positions[0]]
@@ -250,11 +251,25 @@ def compute_player_velocity(track, calibration: Optional[Dict[str, Any]] = None,
             "high_intensity_runs": 0,
         }
 
-    # Part 3b: smooth trajectory before distance computation
-    positions = [get_centre(e["bbox"]) for e in valid_entries]
-    smoothed = _smooth_trajectory(positions)
+    # Part 3b: use world coordinates (from physics_corrector) for distance
+    # Extract world_x, world_y from trajectory entries set by physics_corrector
+    world_positions = []
+    for entry in valid_entries:
+        wx = entry.get("world_x")
+        wy = entry.get("world_y")
+        if wx is not None and wy is not None:
+            world_positions.append((float(wx), float(wy)))
+        else:
+            # Fallback: compute from pixel coords if world coords unavailable
+            cx, cy = get_centre(entry["bbox"])
+            wx_fb = (cx / 1920) * (105.0 * vis_frac)
+            wy_fb = (cy / 1080) * (68.0 * vis_frac)
+            world_positions.append((wx_fb, wy_fb))
 
-    # Compute raw frame-to-frame speeds and distances
+    # Smooth world coordinate positions
+    smoothed = _smooth_trajectory_world(world_positions)
+
+    # Compute raw frame-to-frame speeds and distances using world coordinates
     raw_speeds = []
     timestamps = []
     total_distance_m = 0.0
@@ -266,10 +281,13 @@ def compute_player_velocity(track, calibration: Optional[Dict[str, Any]] = None,
             timestamps.append(valid_entries[i]["timestampSeconds"])
             continue
 
+        # World coordinates are already in metres
         dx = smoothed[i][0] - smoothed[i-1][0]
         dy = smoothed[i][1] - smoothed[i-1][1]
-        dist_px = math.sqrt(dx*dx + dy*dy)
-        dist_m = dist_px / ppm
+        dist_m = math.sqrt(dx*dx + dy*dy)
+
+        # Cap per-frame distance at 0.46m (fastest footballer ever: ~11.5 m/s)
+        dist_m = min(dist_m, MAX_FRAME_DISTANCE_M)
 
         # Low homography confidence: apply a conservative distance discount
         is_approx = valid_entries[i].get("metric_quality") == "approximate"

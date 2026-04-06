@@ -211,18 +211,29 @@ def detect_scene_cut(prev_frame_gray, curr_frame_gray, threshold=45.0) -> bool:
     return mean_diff > threshold
 
 
+def is_pitch_frame(frame) -> bool:
+    """
+    Returns True if frame shows the football pitch (>25% green pixels).
+    Returns False for cutaway shots (crowd, bench, replay, close-up).
+
+    HSV green range: H 35-85, S 40-255, V 40-255
+    Threshold: 25% of frame pixels must be green.
+    """
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    lower = np.array([35, 40, 40])
+    upper = np.array([85, 255, 255])
+    mask = cv2.inRange(hsv, lower, upper)
+    green_pct = np.count_nonzero(mask) / mask.size
+    return green_pct > 0.25
+
+
 def is_valid_pitch_frame(frame_bgr, min_green_pct=0.25) -> bool:
     """
     Returns True only if frame contains enough green pitch to be a valid
     gameplay view. Bench shots, crowd shots, close-ups fail this test.
     min_green_pct=0.25 means at least 25% of frame must be pitch-green.
     """
-    hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
-    lower = np.array([30, 40, 40])
-    upper = np.array([90, 255, 255])
-    mask = cv2.inRange(hsv, lower, upper)
-    green_pct = mask.sum() / 255 / mask.size
-    return green_pct >= min_green_pct
+    return is_pitch_frame(frame_bgr)
 
 
 def _is_potential_official(frame_bgr, bbox) -> bool:
@@ -505,10 +516,10 @@ def run_tracking(
         frame_path = frames_dir / f"frame_{current_frame_idx:06d}.jpg"
         cv2.imwrite(str(frame_path), frame)
 
-        # FIX 1: Frame validity gate — check if frame contains valid pitch view
-        frame_is_valid = is_valid_pitch_frame(frame, min_green_pct=0.25)
-        if not frame_is_valid:
-            logger.info(f"Frame {current_frame_idx}: non-pitch frame, skipping")
+        # FIX 1: Frame validity gate — skip cutaway frames entirely
+        if not is_pitch_frame(frame):
+            frame_is_valid = False
+            logger.info(f"Frame {current_frame_idx}: cutaway frame (crowd/bench/replay), skipping")
             # Still detect scene cuts from grayscale even on invalid frames
             curr_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             scene_cut_flag = detect_scene_cut(prev_gray, curr_gray, threshold=45.0)

@@ -147,7 +147,18 @@ class VideoAnnotator:
             t0_pct = team_0_frames / total * 100
             t1_pct = team_1_frames / total * 100
         else:
-            t0_pct = t1_pct = 50.0
+            # Insufficient data — show message instead of 50/50
+            font_scale = min(1.0, rect_w / 550)
+            cv2.putText(
+                frame,
+                "Ball Control: Insufficient data",
+                (x1 + 10, y1 + 60),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                font_scale,
+                (0, 0, 0),
+                2,
+            )
+            return frame
 
         font_scale = min(1.0, rect_w / 550)
         cv2.putText(
@@ -312,7 +323,7 @@ class VideoAnnotator:
         t1 = np.sum(arr == 1)
         total = t0 + t1
         if total == 0:
-            return {0: 50.0, 1: 50.0}
+            return {"insufficient_data": True, "message": "Insufficient data"}
         return {
             0: round(t0 / total * 100, 1),
             1: round(t1 / total * 100, 1),
