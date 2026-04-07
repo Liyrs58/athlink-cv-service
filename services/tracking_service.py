@@ -518,20 +518,8 @@ def _run_tracking_impl(
         if not ret:
             break
 
-        # FIX 2: override stride if previous frame had fast camera motion
+        # Skip non-sampled frames entirely (no YOLO inference — pure speed gain)
         if not force_next_frame and raw_frame_idx % effective_stride != 0:
-            # Feed skipped frames to BoT-SORT silently to keep Kalman state current
-            if prev_gray is not None and prev_gray.shape == detect_frame_gray.shape:
-                model.track(
-                    detect_frame,
-                    tracker="tracker_config/botsort_football.yaml",
-                    persist=True,
-                    verbose=False,
-                    conf=0.20,
-                    iou=0.40,
-                    classes=player_classes,
-                    half=_use_half,
-                )
             raw_frame_idx += 1
             continue
 

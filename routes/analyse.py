@@ -210,6 +210,7 @@ def _run_analysis_pipeline(job_id: str, temp_path: str, skip_cleanup: bool = Fal
                 ball_tracker = BallTracker()
                 ball_tracker.load_model()
                 if ball_tracker.model is not None:
+                    BALL_SAMPLE_RATE = 5  # Only run YOLO on every 5th frame
                     cap = cv2.VideoCapture(temp_path)
                     fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
                     total_frames = 0
@@ -217,7 +218,8 @@ def _run_analysis_pipeline(job_id: str, temp_path: str, skip_cleanup: bool = Fal
                         ret, frame = cap.read()
                         if not ret:
                             break
-                        ball_tracker.detect(frame, total_frames)
+                        if total_frames % BALL_SAMPLE_RATE == 0:
+                            ball_tracker.detect(frame, total_frames)
                         total_frames += 1
                     cap.release()
 
