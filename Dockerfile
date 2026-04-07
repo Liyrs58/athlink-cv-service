@@ -21,7 +21,8 @@ COPY . .
 
 RUN mkdir -p /app/temp /app/memory/matches /app/static /app/weights
 
-# Pre-download football YOLO model at build time (avoids runtime download per job)
-RUN python -c "from model_downloader import download_football_model; download_football_model()"
+# Pre-download football YOLO model at build time (non-fatal — falls back to yolov8s at runtime)
+RUN python -c "from model_downloader import download_football_model; download_football_model()" || \
+    echo "WARNING: Football model download failed — will use fallback model at runtime"
 
 CMD ["python", "main.py"]
