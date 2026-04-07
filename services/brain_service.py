@@ -95,28 +95,29 @@ def _parse_json_response(text: str) -> dict:
 def gemini_watch_clip(video_path: str, team_0_name: str, team_1_name: str) -> dict:
     """Upload video to Gemini once and get tactical observations + event counts + psychology."""
     try:
-        from google import genai
+        import google.generativeai as genai
+        import time
 
         api_key = os.environ.get("GEMINI_API_KEY", "")
         if not api_key:
             raise RuntimeError("GEMINI_API_KEY not set")
 
-        client = genai.Client(api_key=api_key)
+        genai.configure(api_key=api_key)
 
         # Upload video file
-        import time
         logger.info("Uploading video to Gemini File API...")
-        with open(video_path, "rb") as vf:
-            video_file = client.files.upload(file=vf, config={"mime_type": "video/mp4"})
+        video_file = genai.upload_file(path=video_path)
         logger.info("Gemini upload complete: %s", video_file.name)
 
         # Wait for file to be processed
         while video_file.state.name == "PROCESSING":
             time.sleep(2)
-            video_file = client.files.get(name=video_file.name)
+            video_file = genai.get_file(video_file.name)
 
         if video_file.state.name == "FAILED":
             raise RuntimeError(f"Gemini file processing failed: {video_file.state.name}")
+
+        model = genai.GenerativeModel("gemini-2.0-flash-exp")
 
         prompt = f"""You are an elite football analyst with 20 years of experience coaching from grassroots Sunday league to professional academies. You understand every formation, every pressing system, every tactical concept in modern football.
 
@@ -250,10 +251,7 @@ Include these additional fields in the JSON:
 
 Return ONLY valid JSON. No markdown. No explanation. No apologies if something is hard to see — just describe what you can observe."""
 
-        response = client.models.generate_content(
-            model="gemini-2.0-flash",
-            contents=[video_file, prompt],
-        )
+        response = model.generate_content([video_file, prompt])
         result = _parse_json_response(response.text)
         logger.info("Gemini combined analysis complete")
         return result
