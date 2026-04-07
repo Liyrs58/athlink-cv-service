@@ -15,7 +15,13 @@ logger = logging.getLogger(__name__)
 MODEL_PATH = os.getenv("YOLO_MODEL_PATH", "yolo11n.pt")
 CONFIDENCE_THRESHOLD = float(os.getenv("YOLO_CONF", "0.25"))
 IOU_THRESHOLD = float(os.getenv("YOLO_IOU", "0.45"))
-TARGET_CLASSES = [0]
+TARGET_CLASSES = [0]  # COCO fallback: person class
+
+# Football model classes (keremberke/yolov8m-football-player-detection)
+FOOTBALL_PLAYER_CLASSES = [0, 1]  # player, goalkeeper
+FOOTBALL_REFEREE_CLASS = 2
+FOOTBALL_BALL_CLASS = 3
+_using_football_model = False
 
 _pending_rescue_bboxes: list = []
 
@@ -56,18 +62,30 @@ def _detect_device() -> str:
 
 
 def _get_model():
-    global _model, _use_half
+    global _model, _use_half, _using_football_model
     if _model is None:
         try:
             from ultralytics import YOLO
             device = _detect_device()
-            _model = YOLO(MODEL_PATH)
+
+            # Try football-specific model first
+            try:
+                from model_downloader import download_football_model, FOOTBALL_MODEL_PATH
+                download_football_model()
+                _model = YOLO(FOOTBALL_MODEL_PATH)
+                _using_football_model = True
+                logger.info("Loaded football-specific YOLO model: %s", FOOTBALL_MODEL_PATH)
+            except Exception as e:
+                logger.warning("Football model unavailable (%s), falling back to %s", e, MODEL_PATH)
+                _model = YOLO(MODEL_PATH)
+                _using_football_model = False
+
             _model.to(device)
             # FP16 half-precision on GPU for faster inference
             _use_half = device in ("cuda", "mps")
             logger.info(
-                "Loaded YOLO model for tracking: %s on %s (half=%s)",
-                MODEL_PATH, device, _use_half,
+                "YOLO model on %s (half=%s, football=%s)",
+                device, _use_half, _using_football_model,
             )
         except ImportError:
             raise RuntimeError("ultralytics package not found. Install with: pip install ultralytics")
@@ -440,6 +458,9 @@ def _run_tracking_impl(
     logger.info("Tracking started — single loop only")
     model = _get_model()
 
+    # Select class IDs based on which model is loaded
+    player_classes = FOOTBALL_PLAYER_CLASSES if _using_football_model else TARGET_CLASSES
+
     # Reset BoT-SORT tracker state so a previous job's persisted state
     # doesn't bleed into this run (the global model keeps tracker state
     # between calls when persist=True).
@@ -520,7 +541,7 @@ def _run_tracking_impl(
                     verbose=False,
                     conf=0.20,
                     iou=0.40,
-                    classes=TARGET_CLASSES,
+                    classes=player_classes,
                     half=_use_half,
                 )
             raw_frame_idx += 1
@@ -698,7 +719,7 @@ def _run_tracking_impl(
             verbose=False,
             conf=0.20,
             iou=0.40,
-            classes=TARGET_CLASSES,
+            classes=player_classes,
             half=_use_half,
         )
 
@@ -879,7 +900,7 @@ def _run_tracking_impl(
             frame_is_valid and 
             not scene_cut_flag and
             frames_since_rescue >= 10):
-            rescue_results = model(detect_frame, verbose=False, conf=0.10, classes=[0], half=_use_half)
+            rescue_results = model(detect_frame, verbose=False, conf=0.10, classes=player_classes, half=_use_half)
             if rescue_results[0].boxes is not None and len(rescue_results[0].boxes) > 0:
                 rescue_bboxes = rescue_results[0].boxes.xyxy.cpu().tolist()
                 rescue_confs = rescue_results[0].boxes.conf.cpu().tolist()
@@ -1038,7 +1059,8 @@ def _run_tracking_impl(
         # Fallback to YOLO if Roboflow failed
         if not ball_detected:
             try:
-                ball_results = model(frame, verbose=False, conf=0.15, classes=[32], half=_use_half)
+                ball_cls = [FOOTBALL_BALL_CLASS] if _using_football_model else [32]
+                ball_results = model(frame, verbose=False, conf=0.15, classes=ball_cls, half=_use_half)
                 if ball_results[0].boxes is not None and len(ball_results[0].boxes) > 0:
                     ball_boxes = ball_results[0].boxes.xyxy.cpu().tolist()
                     ball_confs = ball_results[0].boxes.conf.cpu().tolist()
