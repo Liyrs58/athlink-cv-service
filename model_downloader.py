@@ -22,7 +22,12 @@ def download_football_model():
     os.makedirs("weights", exist_ok=True)
     logger.info("Downloading football-specific YOLO model from HuggingFace...")
     try:
-        urllib.request.urlretrieve(FOOTBALL_MODEL_URL, FOOTBALL_MODEL_PATH)
+        token = os.getenv('HUGGINGFACE_TOKEN', '')
+        headers = {'Authorization': f'Bearer {token}'}
+        req = urllib.request.Request(FOOTBALL_MODEL_URL, headers=headers)
+        with urllib.request.urlopen(req) as response:
+            with open(FOOTBALL_MODEL_PATH, 'wb') as f:
+                f.write(response.read())
         logger.info("Football model downloaded to %s", FOOTBALL_MODEL_PATH)
     except Exception as e:
         logger.error("Failed to download football model: %s", e)
