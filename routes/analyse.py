@@ -179,12 +179,80 @@ def _run_on_runpod_wrapper(job_id: str, temp_path: str, skip_cleanup: bool = Fal
 
 
 def _run_analysis_pipeline(job_id: str, temp_path: str, skip_cleanup: bool = False, validate: bool = False, pre_confirmed_labels: dict = None, progress_path: str = None):
-    """Background task — runs the full analysis pipeline."""
+    """Background task — runs the full analysis pipeline with parallel execution."""
+    import threading
     try:
         # Pitch calibration
         calibration = get_frame_calibration(temp_path)
 
-        r = run_tracking(job_id=job_id, video_path=temp_path, frame_stride=2, progress_path=progress_path)
+        # ══════════════════════════════════════════════════════════
+        # PHASE 1 — Tracking + Ball detection in PARALLEL
+        # ══════════════════════════════════════════════════════════
+        tracking_result = [None]
+        tracking_error = [None]
+        ball_result = [None]  # will hold (ball_data, possession_data, pass_data, pass_detector_ref)
+        ball_error = [None]
+
+        def do_tracking():
+            try:
+                r = run_tracking(job_id=job_id, video_path=temp_path, frame_stride=2, progress_path=progress_path)
+                tracking_result[0] = r
+            except Exception as e:
+                tracking_error[0] = e
+                logger.error("Tracking failed: %s", e)
+
+        def do_ball_tracking():
+            try:
+                _ball_data = {"error": "Ball tracking unavailable"}
+                _poss_data = {}
+                _pass_data = {}
+                _pass_det = None
+                ball_tracker = BallTracker()
+                ball_tracker.load_model()
+                if ball_tracker.model is not None:
+                    cap = cv2.VideoCapture(temp_path)
+                    fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+                    total_frames = 0
+                    while True:
+                        ret, frame = cap.read()
+                        if not ret:
+                            break
+                        ball_tracker.detect(frame, total_frames)
+                        total_frames += 1
+                    cap.release()
+
+                    ball_positions = ball_tracker.get_positions()
+                    rate = ball_tracker.tracking_rate(total_frames)
+                    _ball_data = {
+                        "positions": {str(k): v for k, v in ball_positions.items()},
+                        "tracked_frames": len(ball_positions),
+                        "total_frames": total_frames,
+                        "tracking_rate": round(rate, 1),
+                    }
+                    logger.info("Ball tracked in %d/%d frames (%.1f%%)", len(ball_positions), total_frames, rate)
+
+                    # Store for possession computation (needs tracks — deferred)
+                    ball_result[0] = (_ball_data, ball_tracker, total_frames, fps)
+                else:
+                    ball_result[0] = (_ball_data, None, 0, 25.0)
+            except Exception as e:
+                ball_error[0] = e
+                logger.warning("Ball tracking failed: %s", e)
+                ball_result[0] = ({"error": f"Ball tracking failed: {e}"}, None, 0, 25.0)
+
+        logger.info("PHASE 1: Starting tracking + ball detection in parallel")
+        t1 = threading.Thread(target=do_tracking, name="tracking")
+        t2 = threading.Thread(target=do_ball_tracking, name="ball")
+        t1.start()
+        t2.start()
+        t1.join()
+        t2.join()
+        logger.info("PHASE 1 complete: tracking + ball detection done")
+
+        # Unpack tracking results
+        if tracking_error[0]:
+            raise tracking_error[0]
+        r = tracking_result[0]
         tracks = r.get("tracks", [])
         frame_metadata = r.get("frame_metadata", [])
 
@@ -204,79 +272,103 @@ def _run_analysis_pipeline(job_id: str, temp_path: str, skip_cleanup: bool = Fal
         calibration = correction_report["calibration"]
         corrections_applied = correction_report["corrections_applied"]
 
-        # ── Ball tracking ─────────────────────────────────────────
+        # ── Possession + pass detection (needs BOTH tracks and ball) ──
         ball_data = {"error": "Ball tracking unavailable"}
         possession_data = {}
         pass_data = {}
         pass_detector = None
-        try:
-            ball_tracker = BallTracker()
-            ball_tracker.load_model()
-            if ball_tracker.model is not None:
-                cap = cv2.VideoCapture(temp_path)
-                fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
-                total_frames = 0
-                while True:
-                    ret, frame = cap.read()
-                    if not ret:
-                        break
-                    ball_tracker.detect(frame, total_frames)
-                    total_frames += 1
-                cap.release()
+        if ball_result[0]:
+            ball_data, ball_tracker_obj, total_frames, fps = ball_result[0]
+            if ball_tracker_obj is not None and not ball_data.get("error"):
+                try:
+                    ppm = 1.0
+                    if calibration and calibration.get("pixels_per_metre"):
+                        ppm = max(calibration["pixels_per_metre"], 0.1)
+                    possession_det = PossessionDetector()
+                    pass_detector = PassDetector()
+                    for fi in range(total_frames):
+                        bp = ball_tracker_obj.get_position_at(fi)
+                        frame_players = []
+                        for t in tracks:
+                            if t.get("firstSeen", 0) <= fi <= t.get("lastSeen", 0):
+                                traj = t.get("trajectory", [])
+                                closest = min(traj, key=lambda e: abs(e["frameIndex"] - fi), default=None) if traj else None
+                                if closest and abs(closest["frameIndex"] - fi) <= 4:
+                                    bbox = closest.get("bbox", [])
+                                    if len(bbox) >= 4:
+                                        frame_players.append({
+                                            "track_id": t.get("trackId"),
+                                            "cx": (bbox[0] + bbox[2]) / 2.0,
+                                            "cy": (bbox[1] + bbox[3]) / 2.0,
+                                            "team_id": t.get("teamId", -1),
+                                        })
+                        poss = possession_det.update(bp, frame_players, fi, ppm)
+                        pass_detector.update(poss, bp, fi, fps, ppm)
+                    poss_pct = possession_det.get_team_possession_pct()
+                    possession_data = {
+                        "team_0_pct": poss_pct.get(0, 0.0),
+                        "team_1_pct": poss_pct.get(1, 0.0),
+                        "events": possession_det.get_possession_events(),
+                    }
+                    pass_data = {
+                        "total": len(pass_detector.get_passes()),
+                        "per_player": pass_detector.get_passes_per_player(),
+                        "events": pass_detector.get_passes(),
+                    }
+                except Exception as e:
+                    logger.warning("Possession/pass detection failed: %s", e)
 
-                ball_positions = ball_tracker.get_positions()
-                rate = ball_tracker.tracking_rate(total_frames)
-                ball_data = {
-                    "positions": {str(k): v for k, v in ball_positions.items()},
-                    "tracked_frames": len(ball_positions),
-                    "total_frames": total_frames,
-                    "tracking_rate": round(rate, 1),
-                }
-                logger.info("Ball tracked in %d/%d frames (%.1f%%)", len(ball_positions), total_frames, rate)
+        # Apply coach-confirmed labels from stream session
+        if pre_confirmed_labels:
+            for track in tracks:
+                tid = track.get("trackId")
+                if tid in pre_confirmed_labels:
+                    track["coach_label"] = pre_confirmed_labels[tid]
+                    track["coach_confirmed"] = True
 
-                # Possession + pass detection
-                ppm = 1.0
-                if calibration and calibration.get("pixels_per_metre"):
-                    ppm = max(calibration["pixels_per_metre"], 0.1)
+        # ══════════════════════════════════════════════════════════
+        # PHASE 2 — Velocity, Shape, Team separation in PARALLEL
+        # ══════════════════════════════════════════════════════════
+        velocity_result = [None]
+        shape_result = [None]
+        team_result = [None]
 
-                possession_det = PossessionDetector()
-                pass_detector = PassDetector()
+        def do_velocity():
+            try:
+                velocity_result[0] = compute_all_velocities(tracks, calibration=calibration, video_path=temp_path)
+            except Exception as e:
+                logger.error("Velocity failed: %s", e)
+                velocity_result[0] = []
 
-                for fi in range(total_frames):
-                    bp = ball_tracker.get_position_at(fi)
-                    # Build player list for this frame
-                    frame_players = []
-                    for t in tracks:
-                        if t.get("firstSeen", 0) <= fi <= t.get("lastSeen", 0):
-                            traj = t.get("trajectory", [])
-                            closest = min(traj, key=lambda e: abs(e["frameIndex"] - fi), default=None) if traj else None
-                            if closest and abs(closest["frameIndex"] - fi) <= 4:
-                                bbox = closest.get("bbox", [])
-                                if len(bbox) >= 4:
-                                    frame_players.append({
-                                        "track_id": t.get("trackId"),
-                                        "cx": (bbox[0] + bbox[2]) / 2.0,
-                                        "cy": (bbox[1] + bbox[3]) / 2.0,
-                                        "team_id": t.get("teamId", -1),
-                                    })
+        def do_shape():
+            try:
+                shape_result[0] = compute_shape_summary(tracks, frame_metadata, calibration=calibration) or {}
+            except Exception as e:
+                logger.error("Shape failed: %s", e)
+                shape_result[0] = {}
 
-                    poss = possession_det.update(bp, frame_players, fi, ppm)
-                    pass_detector.update(poss, bp, fi, fps, ppm)
+        def do_team():
+            try:
+                team_result[0] = cluster_teams(tracks, temp_path)
+            except Exception as e:
+                logger.error("Team separation failed: %s", e)
+                team_result[0] = {"status": "failed"}
 
-                poss_pct = possession_det.get_team_possession_pct()
-                possession_data = {
-                    "team_0_pct": poss_pct.get(0, 0.0),
-                    "team_1_pct": poss_pct.get(1, 0.0),
-                    "events": possession_det.get_possession_events(),
-                }
-                pass_data = {
-                    "total": len(pass_detector.get_passes()),
-                    "per_player": pass_detector.get_passes_per_player(),
-                    "events": pass_detector.get_passes(),
-                }
-        except Exception as e:
-            logger.warning("Ball tracking failed: %s", e)
-            ball_data = {"error": f"Ball tracking failed: {e}"}
+        logger.info("PHASE 2: Starting velocity + shape + team separation in parallel")
+        t3 = threading.Thread(target=do_velocity, name="velocity")
+        t4 = threading.Thread(target=do_shape, name="shape")
+        t5 = threading.Thread(target=do_team, name="team")
+        t3.start()
+        t4.start()
+        t5.start()
+        t3.join()
+        t4.join()
+        t5.join()
+        logger.info("PHASE 2 complete: all analysis done")
+
+        velocities = velocity_result[0]
+        shape_summary = shape_result[0]
+        team_sep = team_result[0]
 
         # ── Video annotation ────────────────────────────────────
         annotated_video_path = None
@@ -325,16 +417,7 @@ def _run_analysis_pipeline(job_id: str, temp_path: str, skip_cleanup: bool = Fal
             logger.error("Video annotation failed: %s", e)
             annotated_video_path = None
 
-        # Apply coach-confirmed labels from stream session
-        if pre_confirmed_labels:
-            for track in tracks:
-                tid = track.get("trackId")
-                if tid in pre_confirmed_labels:
-                    track["coach_label"] = pre_confirmed_labels[tid]
-                    track["coach_confirmed"] = True
-
-        # Team separation
-        team_sep = cluster_teams(tracks, temp_path)
+        vel_summary = get_team_velocity_summary(velocities) or {}
 
         frame_results = []
         for meta in frame_metadata:
@@ -353,9 +436,6 @@ def _run_analysis_pipeline(job_id: str, temp_path: str, skip_cleanup: bool = Fal
             frame_results.append({"frameIndex": frame_idx, "situation": result["situation"]})
 
         events = extract_situation_events(frame_results, fps=25.0, frame_stride=2)
-        velocities = compute_all_velocities(tracks, calibration=calibration, video_path=temp_path)
-        vel_summary = get_team_velocity_summary(velocities) or {}
-        shape_summary = compute_shape_summary(tracks, frame_metadata, calibration=calibration) or {}
 
         voronoi = compute_voronoi_control(tracks, frame_metadata, calibration)
         entropy = compute_team_entropy(tracks, frame_metadata, calibration)

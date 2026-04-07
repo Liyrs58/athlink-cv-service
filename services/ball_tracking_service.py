@@ -19,20 +19,15 @@ _ball_model = None
 _ball_model_type = None
 
 def get_ball_model():
-    """Load ball detection model once and cache it globally."""
+    """Load ball detection model from model_cache (pre-loaded at startup)."""
     global _ball_model, _ball_model_type
     if _ball_model is not None:
         return _ball_model, _ball_model_type
     try:
-        _ball_model_path = os.environ.get("BALL_MODEL_PATH", "ball.pt")
-        if os.path.exists(_ball_model_path):
-            _ball_model = _YOLO(_ball_model_path)
-            _ball_model_type = 'ultralytics'
-            logger.info("Ball detector loaded from %s", _ball_model_path)
-        else:
-            _ball_model = _YOLO('yolov8s.pt')
-            _ball_model_type = 'ultralytics'
-            logger.info("Ball detector loaded: yolov8s fallback via ultralytics")
+        from services.model_cache import get_ball_model as _cached_ball
+        _ball_model = _cached_ball()
+        _ball_model_type = 'ultralytics'
+        logger.info("Ball detector loaded from model_cache")
     except Exception as e:
         logger.error("Ball detector load failed: %s", e)
         _ball_model = None

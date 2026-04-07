@@ -65,27 +65,15 @@ def _get_model():
     global _model, _use_half, _using_football_model
     if _model is None:
         try:
-            from ultralytics import YOLO
+            from services.model_cache import get_tracking_model
             device = _detect_device()
-
-            # Try football-specific model first
-            try:
-                from model_downloader import download_football_model, FOOTBALL_MODEL_PATH
-                download_football_model()
-                _model = YOLO(FOOTBALL_MODEL_PATH)
-                _using_football_model = True
-                logger.info("Loaded football-specific YOLO model: %s", FOOTBALL_MODEL_PATH)
-            except Exception as e:
-                logger.warning("Football model unavailable (%s), falling back to %s", e, MODEL_PATH)
-                _model = YOLO(MODEL_PATH)
-                _using_football_model = False
-
+            _model = get_tracking_model()
+            _using_football_model = False  # model_cache uses yolov8s by default
             _model.to(device)
-            # FP16 half-precision on GPU for faster inference
             _use_half = device in ("cuda", "mps")
             logger.info(
-                "YOLO model on %s (half=%s, football=%s)",
-                device, _use_half, _using_football_model,
+                "YOLO model on %s (half=%s, from model_cache)",
+                device, _use_half,
             )
         except ImportError:
             raise RuntimeError("ultralytics package not found. Install with: pip install ultralytics")

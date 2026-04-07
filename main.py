@@ -64,7 +64,9 @@ TAGS_METADATA = [
 
 @asynccontextmanager
 async def lifespan(app):
-    """Initialize app — skip blocking clean_memory at startup."""
+    """Initialize app — preload ML models so jobs don't download them."""
+    from services.model_cache import preload_all_models
+    preload_all_models()
     yield
 
 app = FastAPI(
