@@ -286,11 +286,22 @@ def cluster_teams(tracks: List[dict], video_path: str) -> Dict:
             continue
 
         # Filter out tracks that spend most of their time near frame edges (touchline staff/crowd)
-        y_positions = [pt.get("y", 0.5) for pt in traj if isinstance(pt, dict)]
+        # Use bbox centre y, normalized to [0,1] by frame height (estimate from bbox scale)
+        y_positions = []
+        for pt in traj:
+            if isinstance(pt, dict):
+                bbox = pt.get("bbox", [])
+                if len(bbox) >= 4:
+                    cy = (bbox[1] + bbox[3]) / 2.0
+                    # Normalize: assume typical frame height ~1080 if we don't know exact
+                    y_positions.append(cy)
         if y_positions:
-            avg_y = sum(y_positions) / len(y_positions)
-            # Exclude tracks in top 8% or bottom 8% of frame (sideline/crowd area)
-            if avg_y < 0.08 or avg_y > 0.92:
+            # Use raw pixel avg — exclude if near very top or bottom of frame
+            avg_y_px = sum(y_positions) / len(y_positions)
+            # Estimate frame height from max bbox y seen
+            est_frame_h = max(max(y_positions) * 1.1, 720)
+            avg_y_norm = avg_y_px / est_frame_h
+            if avg_y_norm < 0.08 or avg_y_norm > 0.92:
                 track["teamId"] = -1
                 continue
 

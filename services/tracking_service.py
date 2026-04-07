@@ -786,11 +786,16 @@ def _run_tracking_impl(
                 # FIX 2: Detect if this detection is a potential official
                 is_official_detection = _is_potential_official(frame, bbox)
 
+                # Compute world coordinates for this detection
+                _wx, _wy = pixel_to_world(bbox, frame_w_px, frame_h_px, homography_H)
+
                 trajectory_entry = {
                     "frameIndex": current_frame_idx,
                     "timestampSeconds": timestamp,
                     "bbox": bbox,
                     "confidence": conf,
+                    "world_x": round(_wx, 2),
+                    "world_y": round(_wy, 2),
                 }
 
                 if track_id not in active_tracks:
@@ -1312,12 +1317,17 @@ def _run_tracking_impl(
                     ]
                     interp_fi = a["frameIndex"] + s * frame_stride
                     interp_ts = interp_fi / fps if fps > 0 else 0.0
-                    filled.append({
+                    # Interpolate world coords if both endpoints have them
+                    interp_entry = {
                         "frameIndex": interp_fi,
                         "timestampSeconds": interp_ts,
                         "bbox": interp_bbox,
                         "confidence": (a["confidence"] + b["confidence"]) / 2.0,
-                    })
+                    }
+                    if "world_x" in a and "world_x" in b:
+                        interp_entry["world_x"] = round(a["world_x"] + t_frac * (b["world_x"] - a["world_x"]), 2)
+                        interp_entry["world_y"] = round(a["world_y"] + t_frac * (b["world_y"] - a["world_y"]), 2)
+                    filled.append(interp_entry)
                     predicted_frames_count += 1
         filled.append(traj[-1])
         track["trajectory"] = filled
@@ -1390,6 +1400,18 @@ def _run_tracking_impl(
         track["id_switches"] = id_switches
         track["is_official"] = is_official
         track["confidence_score"] = (confirmed / traj_len) if traj_len > 0 else 0.0
+        # Set world_x/world_y on track dict from median trajectory position
+        wx_vals = [e["world_x"] for e in track["trajectory"] if "world_x" in e]
+        wy_vals = [e["world_y"] for e in track["trajectory"] if "world_y" in e]
+        if wx_vals:
+            wx_vals.sort()
+            wy_vals.sort()
+            track["world_x"] = wx_vals[len(wx_vals) // 2]
+            track["world_y"] = wy_vals[len(wy_vals) // 2]
+        else:
+            track["world_x"] = None
+            track["world_y"] = None
+
         # Clean up internal fields
         track.pop("_kalman_pred", None)
         track.pop("_cam_pred_bbox", None)
