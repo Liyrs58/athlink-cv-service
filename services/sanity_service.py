@@ -1,3 +1,6 @@
+"""Output validation and consistency checks.
+"""
+
 import logging
 from typing import Dict, Any, List, Optional
 

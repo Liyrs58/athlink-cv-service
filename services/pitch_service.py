@@ -1,3 +1,6 @@
+"""Pitch corner detection and homography calibration for coordinate mapping.
+"""
+
 import cv2
 import numpy as np
 import json
@@ -5,10 +8,74 @@ import logging
 from pathlib import Path
 from typing import Optional, Dict, Any, List, Tuple
 
+from services.homography_service import estimate_homography as _estimate_homography_broadcast
+from services.ball_physics_service import compute_ball_heights as _compute_ball_heights
+
 logger = logging.getLogger(__name__)
 
 PITCH_WIDTH = 105.0   # metres (standard football pitch length)
 PITCH_HEIGHT = 68.0   # metres (standard football pitch width)
+
+
+# ---------------------------------------------------------------------------
+# FIX 5 — Kalman smoothing of per-frame homography (kills "moonwalking" drift)
+# ---------------------------------------------------------------------------
+#
+# H is flattened to a 9-vector (normalised so H[2,2]=1). A constant-value
+# Kalman filter with Q=1e-4*I, R=1e-2*I low-passes camera calibration jitter
+# without lagging behind real camera motion.
+
+class _HomographyKalman:
+    """Smooths a stream of 3x3 homographies by Kalman-filtering the normalised 9-vector."""
+
+    def __init__(self, process_noise: float = 1e-4, measurement_noise: float = 1e-2):
+        try:
+            from filterpy.kalman import KalmanFilter  # lazy import — dep only needed for smoothing
+        except ImportError as e:
+            raise RuntimeError(
+                "filterpy not installed; `pip install filterpy` to enable homography smoothing"
+            ) from e
+        kf = KalmanFilter(dim_x=9, dim_z=9)
+        kf.F = np.eye(9)
+        kf.H = np.eye(9)
+        kf.Q = np.eye(9) * process_noise
+        kf.R = np.eye(9) * measurement_noise
+        kf.P *= 1.0
+        self._kf = kf
+        self._initialised = False
+
+    def update(self, H_raw: np.ndarray) -> np.ndarray:
+        """Returns the smoothed H (normalised)."""
+        if abs(H_raw[2, 2]) < 1e-9:
+            return H_raw
+        H_norm = H_raw / H_raw[2, 2]
+        z = H_norm.flatten().astype(np.float64)
+        if not self._initialised:
+            self._kf.x = z.copy()
+            self._initialised = True
+            return H_norm
+        self._kf.predict()
+        self._kf.update(z)
+        return self._kf.x.reshape(3, 3)
+
+
+def _smooth_homographies(frame_homographies: Dict[int, np.ndarray]) -> Dict[int, np.ndarray]:
+    """Apply Kalman smoothing to a frame_idx → H dict, preserving keys.
+
+    Degrades gracefully: if filterpy is unavailable, returns the input unchanged.
+    """
+    if not frame_homographies:
+        return frame_homographies
+    try:
+        kf = _HomographyKalman()
+    except RuntimeError as e:
+        logger.warning("Skipping homography Kalman smoothing: %s", e)
+        return frame_homographies
+
+    smoothed: Dict[int, np.ndarray] = {}
+    for fi in sorted(frame_homographies.keys()):
+        smoothed[fi] = kf.update(frame_homographies[fi])
+    return smoothed
 
 
 # ---------------------------------------------------------------------------
@@ -294,7 +361,23 @@ def map_pitch(
         if needs_rotation:
             frame = cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
 
-        H = _estimate_homography(frame)
+        # Tier 1: broadcast-grade calibration (PnLCalib → keypoint → green-fraction)
+        # Returns None-H when only green-fraction fallback would apply; in that
+        # case we try the primitive corner detector below.
+        H = None
+        try:
+            cal = _estimate_homography_broadcast(frame)
+            H_list = cal.get("homography") if isinstance(cal, dict) else None
+            if H_list is not None:
+                H = np.array(H_list, dtype=np.float64)
+        except Exception as e:
+            logger.debug("broadcast homography failed on frame %d: %s", current_frame_idx, e)
+            H = None
+
+        # Tier 2: fallback to primitive green-contour corners
+        if H is None:
+            H = _estimate_homography(frame)
+
         if H is not None:
             if validate_homography(H, frame_w, frame_h):
                 last_good_H = H
@@ -324,6 +407,13 @@ def map_pitch(
         logger.warning("No homography found for job %s — world coords unavailable", job_id)
     else:
         logger.info("Homography validated for job %s", job_id)
+
+    # FIX 5: Kalman-smooth the per-frame homographies so pixel→world projection
+    # doesn't jitter frame-to-frame. Kills the "moonwalking stationary player"
+    # artefact caused by noisy per-frame calibration.
+    if homography_found and frame_homographies:
+        frame_homographies = _smooth_homographies(frame_homographies)
+        logger.info("Kalman-smoothed %d homographies", len(frame_homographies))
 
     # ------------------------------------------------------------------
     # Transform player trajectories
@@ -370,6 +460,20 @@ def map_pitch(
         # Sort by frameIndex then interpolate gaps
         trajectory_2d.sort(key=lambda p: p["frameIndex"])
         trajectory_2d = _interpolate_trajectory(trajectory_2d)
+
+        # Calculate headings (degrees) based on movement
+        for i in range(len(trajectory_2d)):
+            if i < len(trajectory_2d) - 1:
+                p1 = trajectory_2d[i]
+                p2 = trajectory_2d[i + 1]
+                dx = p2["x"] - p1["x"]
+                dy = p2["y"] - p1["y"]
+                import math
+                # In pitch coords, y is down, so atan2(dy, dx) works for degrees
+                heading = math.degrees(math.atan2(dy, dx))
+                p1["heading"] = round(heading, 2)
+            elif i > 0:
+                p1["heading"] = trajectory_2d[i-1]["heading"]
 
         players.append({
             "trackId": track_id,
@@ -426,6 +530,14 @@ def map_pitch(
 
         # Sort by frameIndex
         ball_trajectory_2d.sort(key=lambda p: p["frameIndex"])
+
+        # Phase 2a: recover Z via parabolic physics fit over detected flight arcs.
+        # Hard-gated on calibration_valid so we never invent height from noisy coords.
+        z_by_frame = _compute_ball_heights(
+            ball_trajectory_2d, fps=fps, calibration_valid=calibration_valid
+        )
+        for pt in ball_trajectory_2d:
+            pt["z"] = float(z_by_frame.get(int(pt["frameIndex"]), 0.0))
 
         # Add ball entry to players list
         players.append({

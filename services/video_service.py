@@ -1,3 +1,6 @@
+"""Video file introspection: fps, duration, frame count.
+"""
+
 import os
 import cv2
 from pathlib import Path

@@ -1,3 +1,6 @@
+"""Voronoi diagram analysis for space control.
+"""
+
 import math
 from typing import List, Dict, Any, Tuple, Optional
 

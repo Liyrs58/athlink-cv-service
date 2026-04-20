@@ -1,3 +1,6 @@
+"""Video frame extraction and dark-frame filtering.
+"""
+
 import os
 import cv2
 import numpy as np

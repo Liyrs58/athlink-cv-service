@@ -1,3 +1,6 @@
+"""Job creation and status management.
+"""
+
 from typing import Dict, Any
 from models.analysis import AnalysisResponse, VideoMetadata
 from services.video_service import VideoService

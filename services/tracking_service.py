@@ -1,3 +1,6 @@
+"""YOLO11 + BoT-SORT player tracking across frames.
+"""
+
 import os
 import json
 import logging
@@ -12,15 +15,227 @@ from services.scene_classifier import SceneClassifier
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+
+# ---------------------------------------------------------------------------
+# FIX 2 — Pitch polygon rejection (removes crowd / bench / linesmen)
+# ---------------------------------------------------------------------------
+_PITCH_POLYGON = None  # lazy Shapely polygon in world coords, 3m margin
+
+def _get_pitch_polygon():
+    """Build a Shapely polygon for the pitch with 3m margin (lazy / optional dep)."""
+    global _PITCH_POLYGON
+    if _PITCH_POLYGON is not None:
+        return _PITCH_POLYGON
+    try:
+        from shapely.geometry import Polygon as _Poly
+    except ImportError:
+        logger.warning("shapely not installed; polygon-based rejection disabled")
+        return None
+    # 105 x 68 pitch in world coords, with 3m margin for touchline play
+    _PITCH_POLYGON = _Poly([(-3, -3), (108, -3), (108, 71), (-3, 71)])
+    return _PITCH_POLYGON
+
+
+def _foot_point(bbox) -> Tuple[float, float]:
+    """Return bottom-centre of bbox (foot-point in pixel space)."""
+    return ((bbox[0] + bbox[2]) / 2.0, float(bbox[3]))
+
+
+def _filter_to_pitch_polygon(
+    bboxes_confs: List[Tuple[List[float], float]],
+    H: Optional[np.ndarray],
+) -> List[Tuple[List[float], float]]:
+    """FIX 2: Drop detections whose foot point projects outside the pitch polygon.
+
+    bboxes_confs: list of (bbox, conf). H: pixel→world homography (or None).
+    Returns the kept subset. If H or Shapely unavailable, returns input unchanged
+    (caller should fall back to the green-mask-based filter).
+    """
+    if H is None or not bboxes_confs:
+        return bboxes_confs
+    poly = _get_pitch_polygon()
+    if poly is None:
+        return bboxes_confs
+    try:
+        from shapely.geometry import Point as _Point
+    except ImportError:
+        return bboxes_confs
+
+    pts_pix = np.array([_foot_point(b) for b, _ in bboxes_confs], dtype=np.float32)
+    pts_pix = pts_pix.reshape(-1, 1, 2)
+    try:
+        pts_world = cv2.perspectiveTransform(pts_pix, H).reshape(-1, 2)
+    except cv2.error:
+        return bboxes_confs
+
+    keep = []
+    for (bbox, conf), (wx, wy) in zip(bboxes_confs, pts_world):
+        if poly.contains(_Point(float(wx), float(wy))):
+            keep.append((bbox, conf))
+    return keep
+
+
+# ---------------------------------------------------------------------------
+# FIX 3 — Per-track team vote from torso-region HSV histograms
+# ---------------------------------------------------------------------------
+def _compute_torso_histogram(frame, bbox):
+    """Extract HSV histogram from the torso region only (20-60% vertical, 20-80% horizontal).
+
+    This isolates the jersey from shorts (which are often team-neutral),
+    arms (which blur colour), and background above the head.
+    """
+    x1, y1, x2, y2 = int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])
+    h_frame, w_frame = frame.shape[:2]
+    x1 = max(0, min(x1, w_frame - 1))
+    x2 = max(0, min(x2, w_frame - 1))
+    y1 = max(0, min(y1, h_frame - 1))
+    y2 = max(0, min(y2, h_frame - 1))
+    if (x2 - x1) < 10 or (y2 - y1) < 10:
+        return None
+    bw = x2 - x1
+    bh = y2 - y1
+    tx1 = x1 + int(bw * 0.20)
+    tx2 = x1 + int(bw * 0.80)
+    ty1 = y1 + int(bh * 0.20)
+    ty2 = y1 + int(bh * 0.60)
+    if tx2 <= tx1 or ty2 <= ty1:
+        return None
+    torso = frame[ty1:ty2, tx1:tx2]
+    if torso.size == 0:
+        return None
+    hsv = cv2.cvtColor(torso, cv2.COLOR_BGR2HSV)
+    hist = cv2.calcHist([hsv], [0, 1], None, [30, 32], [0, 180, 0, 256])
+    cv2.normalize(hist, hist, 0, 1, cv2.NORM_MINMAX)
+    return hist.flatten().astype(np.float32)
+
+
+def _cluster_teams_per_track(tracks: List[Dict[str, Any]], k: int = 3) -> None:
+    """FIX 3: Run k-means once across median-per-track torso histograms.
+
+    k=3 clusters: team A, team B, referee/officials. Each track gets ONE teamId
+    (0, 1, or 2) written in place. The two clusters with largest member count
+    are assigned to teams 0 and 1; the smallest cluster is tagged as officials
+    (teamId=2). Tracks without histograms get teamId=-1.
+    """
+    samples = []
+    valid_track_refs = []
+    for t in tracks:
+        hists = t.get("_torso_hists") or []
+        if not hists:
+            continue
+        median = np.median(np.stack(hists, axis=0), axis=0)
+        samples.append(median)
+        valid_track_refs.append(t)
+
+    if len(samples) < k:
+        for t in tracks:
+            t.setdefault("teamId", -1)
+        return
+
+    X = np.stack(samples, axis=0).astype(np.float32)
+    # cv2.kmeans handles the clustering with no sklearn dependency
+    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 20, 1e-3)
+    try:
+        _, labels, _centres = cv2.kmeans(
+            X, k, None, criteria, 5, cv2.KMEANS_PP_CENTERS
+        )
+    except cv2.error as e:
+        logger.warning("team k-means failed: %s", e)
+        for t in tracks:
+            t.setdefault("teamId", -1)
+        return
+
+    labels = labels.flatten().tolist()
+    # Rank clusters by size: largest two → team 0, 1; smallest → officials (2).
+    counts: Dict[int, int] = {}
+    for lab in labels:
+        counts[lab] = counts.get(lab, 0) + 1
+    sorted_labs = sorted(counts.keys(), key=lambda c: -counts[c])
+    label_to_team: Dict[int, int] = {}
+    if len(sorted_labs) >= 1:
+        label_to_team[sorted_labs[0]] = 0
+    if len(sorted_labs) >= 2:
+        label_to_team[sorted_labs[1]] = 1
+    for c in sorted_labs[2:]:
+        # Assign overflow clusters to nearest large team (0 or 1), not a 3rd team
+        label_to_team[c] = 1
+
+    for t, lab in zip(valid_track_refs, labels):
+        t["teamId"] = int(label_to_team.get(int(lab), 0))
+    # Any track without a histogram stays at -1
+    for t in tracks:
+        t.setdefault("teamId", -1)
+
+
+# ---------------------------------------------------------------------------
+# FIX 4 — Per-track Kalman smoothing of foot-point world coordinates
+# ---------------------------------------------------------------------------
+def _smooth_track_world_coords(tracks: List[Dict[str, Any]], fps: float) -> None:
+    """Apply a constant-velocity Kalman filter per track to the foot-point in
+    world coordinates. Writes smoothed world_x / world_y back into each trajectory
+    entry. Also gap-fills Kalman predictions across short gaps naturally.
+
+    State: [x, y, vx, vy].  dt = 1/fps.  Q = 0.5*I, R = 1.0*I.
+    """
+    if not tracks:
+        return
+    try:
+        from filterpy.kalman import KalmanFilter
+    except ImportError:
+        logger.warning("filterpy not installed; skipping per-track Kalman smoothing")
+        return
+
+    dt = 1.0 / max(fps, 1.0)
+    for track in tracks:
+        traj = track.get("trajectory") or []
+        xy = [
+            (e.get("world_x"), e.get("world_y"))
+            for e in traj
+        ]
+        if not any(wx is not None and wy is not None for wx, wy in xy):
+            continue
+
+        kf = KalmanFilter(dim_x=4, dim_z=2)
+        kf.F = np.array([
+            [1, 0, dt, 0],
+            [0, 1, 0, dt],
+            [0, 0, 1, 0],
+            [0, 0, 0, 1],
+        ], dtype=np.float64)
+        kf.H = np.array([[1, 0, 0, 0], [0, 1, 0, 0]], dtype=np.float64)
+        kf.Q = np.eye(4) * 0.5
+        kf.R = np.eye(2) * 1.0
+        kf.P *= 10.0
+        initialised = False
+
+        for entry, (wx, wy) in zip(traj, xy):
+            if wx is None or wy is None:
+                if initialised:
+                    kf.predict()
+                    entry["world_x"] = round(float(kf.x[0]), 2)
+                    entry["world_y"] = round(float(kf.x[1]), 2)
+                continue
+            if not initialised:
+                kf.x = np.array([float(wx), float(wy), 0.0, 0.0], dtype=np.float64)
+                initialised = True
+                # First sample — emit as-is; no filter lag yet
+                entry["world_x"] = round(float(wx), 2)
+                entry["world_y"] = round(float(wy), 2)
+                continue
+            kf.predict()
+            kf.update(np.array([float(wx), float(wy)], dtype=np.float64))
+            entry["world_x"] = round(float(kf.x[0]), 2)
+            entry["world_y"] = round(float(kf.x[1]), 2)
+
 MODEL_PATH = os.getenv("YOLO_MODEL_PATH", "yolo11n.pt")
 CONFIDENCE_THRESHOLD = float(os.getenv("YOLO_CONF", "0.25"))
 IOU_THRESHOLD = float(os.getenv("YOLO_IOU", "0.45"))
 TARGET_CLASSES = [0]  # COCO fallback: person class
 
-# Football model classes (keremberke/yolov8m-football-player-detection)
-FOOTBALL_PLAYER_CLASSES = [0, 1]  # player, goalkeeper
-FOOTBALL_REFEREE_CLASS = 2
-FOOTBALL_BALL_CLASS = 3
+# Roboflow sports model classes: {0: ball, 1: goalkeeper, 2: player, 3: referee}
+FOOTBALL_PLAYER_CLASSES = [1, 2]  # goalkeeper, player
+FOOTBALL_REFEREE_CLASS = 3
+FOOTBALL_BALL_CLASS = 0
 _using_football_model = False
 
 _pending_rescue_bboxes: list = []
@@ -68,7 +283,8 @@ def _get_model():
             from services.model_cache import get_tracking_model
             device = _detect_device()
             _model = get_tracking_model()
-            _using_football_model = False  # model_cache uses yolov8s by default
+            # Auto-detect: Roboflow sports model has classes {0:ball,1:goalkeeper,2:player,3:referee}
+            _using_football_model = hasattr(_model, 'names') and 'player' in _model.names.values()
             _model.to(device)
             _use_half = device in ("cuda", "mps")
             logger.info(
@@ -305,7 +521,7 @@ class BallKalmanTracker:
                 [[x],[y],[0],[0]], dtype=np.float32)
             self.initialized = True
         self.kf.predict()
-        corrected = self.kf.correct(measurement)
+        corrected = self.kf.correct(measurement).flatten()
         self.frames_since_detection = 0
         return float(corrected[0]), float(corrected[1])
 
@@ -316,7 +532,7 @@ class BallKalmanTracker:
             return None
         if self.frames_since_detection >= self.max_prediction_frames:
             return None
-        predicted = self.kf.predict()
+        predicted = self.kf.predict().flatten()
         self.frames_since_detection += 1
         x, y = float(predicted[0]), float(predicted[1])
         return x, y
@@ -454,9 +670,15 @@ def _run_tracking_impl(
     # between calls when persist=True).
     model.predictor = None
 
-    # PERF: process only every SAMPLE_RATE-th strided frame for 5x speedup
-    SAMPLE_RATE = 5
+    # Sampling multiplier on top of frame_stride. Default 1 = honour frame_stride
+    # literally. Set TRACKING_SAMPLE_RATE=5 in the environment to restore the
+    # legacy 5× speedup (trades track coverage for speed).
+    SAMPLE_RATE = max(1, int(os.getenv("TRACKING_SAMPLE_RATE", "1")))
     effective_stride = frame_stride * SAMPLE_RATE
+    logger.info(
+        "Tracking: frame_stride=%d, SAMPLE_RATE=%d, effective_stride=%d",
+        frame_stride, SAMPLE_RATE, effective_stride,
+    )
 
     active_tracks: Dict[int, Dict[str, Any]] = {}
     completed_tracks: List[Dict[str, Any]] = []
@@ -701,17 +923,34 @@ def _run_tracking_impl(
 
         current_active_ids: set = set()
         frame_track_entries: List[Dict[str, Any]] = []
-        TRACK_MATCHING_GATE = 80  # FIX 2: distance threshold for matching detections to tracks
+        # Distance gate for associating a detection to an existing track.
+        # Base 80px is correct for 1-frame gaps at ~8px/frame max player speed.
+        # Scale with effective_stride so the gate stays valid whatever the user
+        # picks for frame_stride / TRACKING_SAMPLE_RATE. Capped to keep the gate
+        # under half a frame width even on pathological strides.
+        TRACK_MATCHING_GATE = min(600, 80 * effective_stride)
 
         if bt_results[0].boxes is not None and bt_results[0].boxes.id is not None:
             bt_ids = bt_results[0].boxes.id.cpu().tolist()
             bboxes = bt_results[0].boxes.xyxy.cpu().tolist()
             confs = bt_results[0].boxes.conf.cpu().tolist()
 
-            # FootyVision: pitch boundary bystander removal
-            # Scale bboxes back to original coords for pitch filter
+            # FIX 2: Pitch polygon bystander removal.
+            # When a validated homography H is available we project each foot
+            # point through H and drop detections that land outside the 105×68m
+            # polygon (plus 3m margin). This discards crowd, bench, linesmen,
+            # photographers in one pass. Fall back to the green-mask filter
+            # when calibration hasn't been established yet.
             orig_bboxes = [[v / scale for v in b] if scale != 1.0 else b for b in bboxes]
-            pitch_filtered = _filter_to_pitch(frame, list(zip(orig_bboxes, confs)))
+            if homography_H is not None:
+                pitch_filtered = _filter_to_pitch_polygon(
+                    list(zip(orig_bboxes, confs)), homography_H
+                )
+                # If the polygon rejects everything (bad H), fall back
+                if not pitch_filtered:
+                    pitch_filtered = _filter_to_pitch(frame, list(zip(orig_bboxes, confs)))
+            else:
+                pitch_filtered = _filter_to_pitch(frame, list(zip(orig_bboxes, confs)))
             pitch_ok_set = set()
             for fb, fc in pitch_filtered:
                 pitch_ok_set.add((round(fb[0], 1), round(fb[1], 1),
@@ -852,7 +1091,7 @@ def _run_tracking_impl(
                     active_tracks[track_id]["_confirmed_detections"] += 1
                     active_tracks[track_id]["_official_votes"] += 1 if is_official_detection else 0
 
-                # ReID: update appearance histogram (EMA blend)
+                # ReID: update appearance histogram (EMA blend) — for stitching
                 hist = _compute_histogram(frame, bbox)
                 if hist is not None:
                     prev_hist = active_tracks[track_id].get("_histogram")
@@ -862,6 +1101,14 @@ def _run_tracking_impl(
                         blended = 0.3 * hist + 0.7 * prev_hist
                         cv2.normalize(blended, blended, 0, 1, cv2.NORM_MINMAX)
                         active_tracks[track_id]["_histogram"] = blended
+
+                # FIX 3: Sample torso histogram every 5 processed frames for the
+                # one-shot end-of-clip team clustering. We store a LIST (not EMA)
+                # so k-means can use the median sample per track.
+                if processed_count % 5 == 0:
+                    torso = _compute_torso_histogram(frame, bbox)
+                    if torso is not None:
+                        active_tracks[track_id].setdefault("_torso_hists", []).append(torso)
 
                 frame_track_entries.append({
                     "trackId": track_id,
@@ -1372,6 +1619,43 @@ def _run_tracking_impl(
 
     filtered = zone_filtered
     logger.info(f"After pitch zone filter: {len(filtered)} tracks (from {len(all_tracks)} total)")
+
+    # FIX 3 (v3): Dominant color team assignment — fast, no ML model needed.
+    # Cascade: Dominant Color (LAB) → SigLIP (if installed) → HSV histogram (legacy).
+    team_assigned = False
+    try:
+        from services.dominant_color_classifier import classify_teams_dominant_color
+        classify_teams_dominant_color(filtered, video_path)
+        t0 = sum(1 for t in filtered if t.get("teamId") == 0)
+        t1 = sum(1 for t in filtered if t.get("teamId") == 1)
+        if t0 >= 3 and t1 >= 3:
+            team_assigned = True
+            logger.info(f"Dominant color team classification: T0={t0}, T1={t1}")
+        else:
+            logger.warning(f"Dominant color produced imbalanced teams (T0={t0}, T1={t1}), trying SigLIP...")
+    except Exception as e:
+        logger.warning(f"Dominant color classifier failed ({e}), trying SigLIP...")
+
+    if not team_assigned:
+        try:
+            from services.team_classifier import classify_teams_siglip
+            classify_teams_siglip(filtered, video_path)
+            logger.info(f"SigLIP team classification assigned teamId to {len(filtered)} tracks")
+        except (ImportError, Exception) as e:
+            logger.warning(f"SigLIP unavailable ({e}), falling back to HSV k-means")
+            _cluster_teams_per_track(filtered, k=2)
+            logger.info(f"HSV team clustering assigned teamId to {len(filtered)} tracks")
+
+    # FIX 4: Per-track constant-velocity Kalman smoothing on foot-point world
+    # coords. Kills vibration from noisy bbox-bottom measurements and gap-fills
+    # short occlusions. Must run AFTER team clustering (independent) but BEFORE
+    # downstream stats (distance / top speed / sprints).
+    _smooth_track_world_coords(filtered, fps=fps)
+    logger.info(f"Kalman-smoothed world coords for {len(filtered)} tracks")
+
+    # Strip the raw torso-histogram list — large and not serialisable
+    for _t in filtered:
+        _t.pop("_torso_hists", None)
 
     # Clean up internal fields and compute quality metrics
     total_confirmed_detections = 0

@@ -1,3 +1,6 @@
+"""Pass, shot, tackle, clearance, and interception event detection.
+"""
+
 import json
 import logging
 import math

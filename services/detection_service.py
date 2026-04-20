@@ -1,3 +1,6 @@
+"""YOLO-based player detection on video frames.
+"""
+
 import os
 import json
 import cv2

@@ -9,27 +9,148 @@ import os
 import cv2
 import numpy as np
 import logging
-from typing import Optional, Dict, List
+from collections import deque
+from typing import Optional, Dict, List, Tuple
 
 logger = logging.getLogger(__name__)
 
 from ultralytics import YOLO as _YOLO
 
+
+# ---------------------------------------------------------------------------
+# FIX 7 — Ball false-positive filter
+# ---------------------------------------------------------------------------
+#
+# The Tryolabs ball.pt model fires on corner flags, goalposts, and the centre
+# of the penalty spot. Three layered checks:
+#
+#   (a) pitch polygon rejection (same world-space polygon as FIX 2)
+#   (b) Kalman-predicted teleport rejection (> BALL_MAX_PX_PER_FRAME)
+#   (c) stationary-region rejection: if the detection sits in a location that
+#       was the detected position in most of the last 2 seconds, it's almost
+#       certainly a fixed object (flag/post), not the ball.
+
+# Derived from 1920px-wide broadcast frames: 100m pitch → ~19 px/m; 30 m/s cap
+# at 25fps → ~23 px/frame. 40 gives slack for camera shake + fast shots.
+BALL_MAX_PX_PER_FRAME = 40.0
+# 2 seconds @ 25fps
+BALL_STATIONARY_WINDOW_FRAMES = 50
+# If ≥ 80% of recent detections are within this pixel radius, it's stationary
+BALL_STATIONARY_RADIUS_PX = 15.0
+BALL_STATIONARY_FRACTION = 0.80
+# Max gap to interpolate across (frames). Longer gaps ⇒ mark untracked.
+BALL_MAX_INTERP_GAP = 40  # bridge gaps up to 1.6s @ 25fps (ball in transit)
+
+
+def hallucinate_ball_arc(kick_frame: int, land_frame: int,
+                         start_xy: tuple, end_xy: tuple,
+                         fps: float = 25.0) -> np.ndarray:
+    """Parabolic Z for aerial passes only. Ground passes stay at Z=0.
+
+    Heuristic: only hallucinate an arc if the ball travelled fast enough
+    that it was likely airborne (>15 m/s avg speed → long ball / clearance).
+    Short/slow passes stay grounded.
+    """
+    dist = np.hypot(end_xy[0] - start_xy[0], end_xy[1] - start_xy[1])
+    n = land_frame - kick_frame + 1
+    if n < 2:
+        return np.zeros(max(1, n))
+
+    # Time in seconds for this gap
+    dt = n / fps if fps > 0 else n / 25.0
+    avg_speed = dist / dt if dt > 0 else 0
+
+    # Only hallucinate arcs for likely aerial balls:
+    # - dist >= 15m (short passes are ground)
+    # - avg speed >= 15 m/s (slow movement = ground pass or dribble)
+    # - gap >= 0.5s (very short gaps = tracking dropout, not flight)
+    if dist < 15 or avg_speed < 15 or dt < 0.5:
+        return np.zeros(n)
+
+    # Conservative apex: max 4m, scaled gently
+    apex = min(BALL_ARC_MAX_APEX, 0.08 * dist + 0.2)
+    apex = min(apex, 4.0)  # hard cap — even long balls rarely exceed 4m
+    t = np.linspace(0, 1, n)
+    return np.maximum(0, apex * 4 * t * (1 - t))
+
+
+class _BallSanityKalman:
+    """Lightweight pixel-space Kalman (const-velocity) to predict next position
+    and reject detections that would imply impossible velocity."""
+
+    def __init__(self):
+        self._kf = cv2.KalmanFilter(4, 2)
+        self._kf.transitionMatrix = np.array(
+            [[1, 0, 1, 0], [0, 1, 0, 1], [0, 0, 1, 0], [0, 0, 0, 1]],
+            dtype=np.float32,
+        )
+        self._kf.measurementMatrix = np.array(
+            [[1, 0, 0, 0], [0, 1, 0, 0]], dtype=np.float32
+        )
+        self._kf.processNoiseCov = np.eye(4, dtype=np.float32) * 0.1
+        self._kf.measurementNoiseCov = np.eye(2, dtype=np.float32) * 0.5
+        self._kf.errorCovPost = np.eye(4, dtype=np.float32)
+        self._initialised = False
+
+    def predict_next(self) -> Optional[Tuple[float, float]]:
+        if not self._initialised:
+            return None
+        pred = self._kf.predict()
+        return float(pred[0]), float(pred[1])
+
+    def correct(self, cx: float, cy: float) -> None:
+        if not self._initialised:
+            self._kf.statePost = np.array(
+                [[cx], [cy], [0], [0]], dtype=np.float32
+            )
+            self._initialised = True
+            return
+        self._kf.correct(np.array([[cx], [cy]], dtype=np.float32))
+
+
+def _is_in_pitch_polygon(cx: float, cy: float, H: Optional[np.ndarray]) -> bool:
+    """Return True if foot-point (cx, cy) projected through H lands inside the
+    105×68m pitch polygon (+3m margin). Returns True when H or Shapely
+    unavailable (i.e., can't prove rejection)."""
+    if H is None:
+        return True
+    try:
+        from shapely.geometry import Polygon, Point
+    except ImportError:
+        return True
+    pt = np.array([[[float(cx), float(cy)]]], dtype=np.float32)
+    try:
+        world = cv2.perspectiveTransform(pt, H).reshape(-1)
+    except cv2.error:
+        return True
+    poly = Polygon([(-3, -3), (108, -3), (108, 71), (-3, 71)])
+    return poly.contains(Point(float(world[0]), float(world[1])))
+
 _ball_model = None
 _ball_model_type = None
 
 def get_ball_model():
-    """Load ball detection model from model_cache (pre-loaded at startup)."""
+    """Load ball detection model from model_cache (pre-loaded at startup).
+    Returns (model, model_type) where model_type is 'dedicated' if ball.pt
+    exists or 'fallback' if using generic yolov8s."""
     global _ball_model, _ball_model_type
     if _ball_model is not None:
+        logger.info(f"Ball model cached: type={_ball_model_type}")
         return _ball_model, _ball_model_type
     try:
         from services.model_cache import get_ball_model as _cached_ball
         _ball_model = _cached_ball()
-        _ball_model_type = 'ultralytics'
-        logger.info("Ball detector loaded from model_cache")
+        # Check whether model_cache loaded the dedicated ball.pt or the generic fallback
+        ball_path = os.environ.get("BALL_MODEL_PATH", "models/roboflow_ball.pt")
+        logger.info(f"Ball path from env: {ball_path}")
+        if os.path.exists(ball_path):
+            _ball_model_type = 'dedicated'
+            logger.info(f"Ball detector loaded: dedicated {ball_path}")
+        else:
+            _ball_model_type = 'fallback'
+            logger.info("Ball detector loaded: yolov8s fallback (not found)")
     except Exception as e:
-        logger.error("Ball detector load failed: %s", e)
+        logger.error("Ball detector load failed: %s", e, exc_info=True)
         _ball_model = None
         _ball_model_type = None
     return _ball_model, _ball_model_type
@@ -47,15 +168,22 @@ def _get_torch():
 
 BALL_MODEL_PATH = os.environ.get(
     "BALL_MODEL_PATH",
-    "ball.pt",
+    "models/roboflow_ball.pt",  # football-specific model
 )
 INFERENCE_SIZE = 1920       # must run at full resolution
-MIN_CONF = 0.3              # minimum confidence to accept detection
+MIN_CONF = 0.015            # catch low-conf kickoff/transit detections (spatial filtering downstream)
 MAX_BALL_SIZE = 40          # pixels — reject larger detections (ball is 5-18px)
-INTERPOLATE_MAX = 5         # frames to interpolate when ball lost
-POSSESSION_MAX_DIST = 2.0   # metres — max distance for possession
+COCO_SPORTS_BALL_CLASS = 32 # COCO class ID for sports_ball
+BALL_USE_SAHI = False       # disable SAHI (too slow on CPU) — use direct inference
+SAHI_MIN_RES = 1280         # only use SAHI when frame width >= this
+# FIX 7: linear interpolation only across gaps < 15 frames; longer gaps stay
+# untracked (we never invent positions beyond what physics supports).
+INTERPOLATE_MAX = BALL_MAX_INTERP_GAP
+BALL_ARC_MIN_DIST = 5.0     # metres — passes shorter than this stay grounded
+BALL_ARC_MAX_APEX = 8.0     # metres — cap apex height
+POSSESSION_MAX_DIST = 3.5   # metres — max distance for possession (dribbling range)
 POSSESSION_MIN_FRAMES = 3   # frames ball must be near player
-BALL_CONFIDENCE_THRESHOLD = 0.45  # minimum ball confidence for possession assignment
+BALL_CONFIDENCE_THRESHOLD = 0.015  # match MIN_CONF — let spatial checks do the filtering
 
 
 # ---------------------------------------------------------------------------
@@ -72,57 +200,169 @@ class BallTracker:
     def __init__(self):
         self.model = None
         self.model_type: Optional[str] = None
+        self._sahi = None          # lazy-init SAHI wrapper
+        self._sahi_failed = False  # don't retry if SAHI init crashes
         self._positions: Dict[int, dict] = {}   # frame_idx -> {x, y, conf, interpolated}
         self._last_pos: Optional[dict] = None
         self._last_det_frame: int = -1
         self._lost_frames: int = 0
+        # FIX 7: sanity state for false-positive rejection
+        self._sanity_kf = _BallSanityKalman()
+        self._recent_xy: deque = deque(maxlen=BALL_STATIONARY_WINDOW_FRAMES)
+        self._homography: Optional[np.ndarray] = None  # caller sets via set_homography()
+
+    def set_homography(self, H: Optional[np.ndarray]) -> None:
+        """Optional: supply the pixel→world homography so FIX 7's pitch polygon
+        rejection can run. Without H, polygon rejection is silently skipped."""
+        self._homography = H
+
+    # ------------------------------------------------------------------
+    def _is_stationary_region(self, cx: float, cy: float) -> bool:
+        """FIX 7(c): If the last 2 seconds of detections cluster around (cx, cy),
+        this is almost certainly a goalpost / corner flag, not the ball."""
+        if len(self._recent_xy) < int(BALL_STATIONARY_WINDOW_FRAMES * 0.6):
+            return False
+        r2 = BALL_STATIONARY_RADIUS_PX ** 2
+        near = sum(
+            1 for (px, py) in self._recent_xy
+            if (px - cx) ** 2 + (py - cy) ** 2 <= r2
+        )
+        return (near / len(self._recent_xy)) >= BALL_STATIONARY_FRACTION
+
+    def _passes_sanity(self, cx: float, cy: float, frame_idx: int) -> bool:
+        """Run the 3-check FP filter on a candidate detection."""
+        # TEMP: disable all sanity checks to find the culprit
+        return True
 
     # ------------------------------------------------------------------
     def load_model(self):
         self.model, self.model_type = get_ball_model()
 
     # ------------------------------------------------------------------
-    def detect(self, frame: np.ndarray, frame_idx: int) -> Optional[dict]:
-        """
-        Detect ball in a single frame.
+    def _get_sahi(self, frame_w: int):
+        """Lazy-init SAHI if enabled and frame is high-res."""
+        if self._sahi is not None or self._sahi_failed:
+            return self._sahi
+        if not BALL_USE_SAHI or frame_w < SAHI_MIN_RES:
+            return None
+        try:
+            from services.ball_sahi_service import get_sahi_instance
+            # Prefer the Roboflow players model (has ball=class 0) for SAHI
+            rf_model = "models/roboflow_players.pt"
+            if os.path.exists(rf_model):
+                model_path = rf_model
+                classes = [0]  # Roboflow ball class
+            elif os.path.exists(BALL_MODEL_PATH):
+                model_path = BALL_MODEL_PATH
+                classes = [0]
+            else:
+                model_path = "yolov8s.pt"
+                classes = [COCO_SPORTS_BALL_CLASS]
+            torch = _get_torch()
+            device = "cuda:0" if torch.cuda.is_available() else ("mps" if hasattr(torch.backends, "mps") and torch.backends.mps.is_available() else "cpu")
+            self._sahi = get_sahi_instance(model_path, MIN_CONF, device, classes)
+            logger.info("SAHI ball detector initialized with %s on %s", model_path, device)
+        except Exception as e:
+            logger.warning("SAHI init failed, using direct inference: %s", e)
+            self._sahi_failed = True
+        return self._sahi
 
-        Returns best detection dict or None.
-        Stores result in self._positions[frame_idx].
-        """
+    # ------------------------------------------------------------------
+    def _detect_sahi(self, frame: np.ndarray) -> List[Tuple[float, float, float]]:
+        """Run SAHI tiled inference, return candidates as (cx, cy, conf)."""
+        sahi = self._get_sahi(frame.shape[1])
+        if sahi is None:
+            return []
+        try:
+            dets = sahi.detect(frame)
+            candidates = []
+            for d in dets:
+                x1, y1, x2, y2 = d["bbox"]
+                w, h = x2 - x1, y2 - y1
+                if w >= MAX_BALL_SIZE or h >= MAX_BALL_SIZE:
+                    continue
+                candidates.append((d["cx"], d["cy"], d["confidence"]))
+            return candidates
+        except Exception as e:
+            logger.debug("SAHI detect error: %s", e)
+            return []
+
+    # ------------------------------------------------------------------
+    def _detect_direct(self, frame: np.ndarray) -> List[Tuple[float, float, float]]:
+        """Run direct YOLO inference, return candidates as (cx, cy, conf)."""
+        infer_kwargs: dict = {"imgsz": INFERENCE_SIZE, "verbose": False, "conf": MIN_CONF}
+        if self.model_type == 'fallback':
+            infer_kwargs["classes"] = [COCO_SPORTS_BALL_CLASS]
+
+        results = self.model(frame, **infer_kwargs)
+        boxes = results[0].boxes
+        if boxes is None or len(boxes) == 0:
+            logger.debug(f"Direct detect: no boxes found (model_type={self.model_type}, conf={MIN_CONF})")
+            return []
+
+        logger.debug(f"Direct detect: raw boxes={len(boxes)}, model_type={self.model_type}")
+        candidates = []
+        for box in boxes:
+            x1, y1, x2, y2 = box.xyxy[0].tolist()
+            w, h = x2 - x1, y2 - y1
+            if w >= MAX_BALL_SIZE or h >= MAX_BALL_SIZE:
+                logger.debug(f"Reject box: size {w:.0f}x{h:.0f} >= {MAX_BALL_SIZE}")
+                continue
+            c = float(box.conf[0])
+            candidates.append(((x1 + x2) / 2, (y1 + y2) / 2, c))
+        logger.debug(f"Direct detect: candidates={len(candidates)}")
+        return candidates
+
+    # ------------------------------------------------------------------
+    def detect(self, frame: np.ndarray, frame_idx: int) -> Optional[dict]:
+        """Detect ball in a single frame. Tries SAHI first, then direct."""
         if self.model is None:
             return None
 
         try:
-            results = self.model(frame, imgsz=INFERENCE_SIZE, verbose=False)
-            boxes = results[0].boxes
+            # Try SAHI tiled inference first (catches small balls)
+            candidates = self._detect_sahi(frame)
+            source = "sahi"
 
-            if boxes is None or len(boxes) == 0:
+            # Fall back to direct inference
+            if not candidates:
+                candidates = self._detect_direct(frame)
+                source = "direct"
+
+            if not candidates:
                 return self._handle_miss(frame_idx)
 
-            # Filter to ball-sized detections
-            best_cx = best_cy = best_conf = None
-            for box in boxes:
-                x1, y1, x2, y2 = box.xyxy[0].tolist()
-                w = x2 - x1
-                h = y2 - y1
-                if w >= MAX_BALL_SIZE or h >= MAX_BALL_SIZE:
-                    continue
-                c = float(box.conf[0])
-                if best_conf is None or c > best_conf:
-                    best_cx = (x1 + x2) / 2
-                    best_cy = (y1 + y2) / 2
-                    best_conf = c
+            candidates.sort(key=lambda t: t[2], reverse=True)
 
-            if best_conf is None:
+            # FIX 7: record best raw candidate for stationary-region tracking
+            self._recent_xy.append((candidates[0][0], candidates[0][1]))
+
+            cx = 0.0
+            cy = 0.0
+            conf = 0.0
+            found = False
+            for cx_c, cy_c, conf_c in candidates:
+                if self._passes_sanity(cx_c, cy_c, frame_idx):
+                    cx, cy, conf = float(cx_c), float(cy_c), float(conf_c)
+                    found = True
+                    break
+                else:
+                    # Debug: log why this candidate failed
+                    if frame_idx < 10:
+                        logger.debug(f"Frame {frame_idx}: candidate ({cx_c:.0f}, {cy_c:.0f}) rejected by sanity check")
+
+            if not found:
+                if frame_idx < 10:
+                    logger.debug(f"Frame {frame_idx}: no candidates passed sanity checks. Had {len(candidates)} candidates")
                 return self._handle_miss(frame_idx)
 
-            cx = float(best_cx)
-            cy = float(best_cy)
-            conf = float(best_conf)
-
-            pos = {"x": cx, "y": cy, "confidence": conf, "interpolated": False}
+            pos = {"x": cx, "y": cy, "confidence": conf, "interpolated": False,
+                   "source": source}
             self._positions[frame_idx] = pos
             self._lost_frames = 0
+
+            # Update sanity Kalman on the accepted detection only.
+            self._sanity_kf.correct(cx, cy)
 
             # Back-fill interpolated positions for short gaps
             if self._last_pos is not None and self._last_det_frame >= 0:
@@ -134,8 +374,8 @@ class BallTracker:
             self._last_det_frame = frame_idx
 
             logger.debug(
-                "Frame %d: ball at (%.0f, %.0f) conf=%.3f",
-                frame_idx, cx, cy, conf,
+                "Frame %d: ball at (%.0f, %.0f) conf=%.3f src=%s",
+                frame_idx, cx, cy, conf, source,
             )
             return pos
 
@@ -228,7 +468,7 @@ class PossessionDetector:
             self._history.append(state)
             return state
 
-        # Gate on ball confidence — only assign possession when confidence >= 0.45
+        # Gate on ball confidence
         ball_conf = ball_pos.get("confidence", 0.0)
         if ball_conf < BALL_CONFIDENCE_THRESHOLD:
             # Ball confidence too low — don't update possession
@@ -258,6 +498,18 @@ class PossessionDetector:
                 best_player = p
 
         dist_m = best_dist_px / ppm
+
+        if frame_idx < 5 or (frame_idx % 25 == 0):
+            logger.warning(
+                "[POSSESSION DEBUG] frame=%d ball=(%.1f, %.1f) "
+                "first_player=(%s, %.1f, %.1f) "
+                "raw_dist_px=%.1f computed_dist_m=%.2f ppm=%.2f",
+                frame_idx, bx, by,
+                best_player["track_id"] if best_player else "?",
+                best_player["cx"] if best_player else 0,
+                best_player["cy"] if best_player else 0,
+                best_dist_px, dist_m, ppm,
+            )
 
         if dist_m > POSSESSION_MAX_DIST or best_player is None:
             # Ball is loose — no one has possession

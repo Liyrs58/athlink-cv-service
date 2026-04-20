@@ -230,11 +230,10 @@ def cluster_teams(tracks: List[dict], video_path: str) -> Dict:
     """
     Run the full team separation pipeline.
 
-    1. Open video, sample frames for each track
-    2. Extract jersey colours
-    3. K-means cluster into 2 teams
-    4. Assign team labels to tracks
-    5. Report team colours
+    Strategy:
+      1. If tracks already have teamId from tracking_service (SigLIP or HSV),
+         skip re-clustering and only compute colour names for reporting.
+      2. Otherwise, try SigLIP classifier first, then fall back to HSV k-means.
 
     Args:
         tracks: list of track dicts from run_tracking() — modified in place
@@ -251,18 +250,65 @@ def cluster_teams(tracks: List[dict], video_path: str) -> Dict:
             "team_1_colour_name": str,
         }
     """
+    # Check if tracks already have valid team assignments from tracking_service
+    t0_pre = sum(1 for t in tracks if t.get("teamId") == 0)
+    t1_pre = sum(1 for t in tracks if t.get("teamId") == 1)
+    already_assigned = (t0_pre >= 3 and t1_pre >= 3)
+
+    if not already_assigned:
+        # No valid pre-assignment — cascade: Dominant Color → SigLIP → HSV
+        logger.info("No pre-existing team assignment found. Running dominant color classifier...")
+        assigned = False
+        try:
+            from services.dominant_color_classifier import classify_teams_dominant_color
+            classify_teams_dominant_color(tracks, video_path)
+            t0 = sum(1 for t in tracks if t.get("teamId") == 0)
+            t1 = sum(1 for t in tracks if t.get("teamId") == 1)
+            if t0 >= 3 and t1 >= 3:
+                assigned = True
+                logger.info("Dominant color team classification complete (T0=%d, T1=%d).", t0, t1)
+        except Exception as e:
+            logger.warning("Dominant color classifier failed (%s)", e)
+
+        if not assigned:
+            try:
+                from services.team_classifier import classify_teams_siglip
+                classify_teams_siglip(tracks, video_path)
+                logger.info("SigLIP team classification complete.")
+            except (ImportError, Exception) as e:
+                logger.warning("SigLIP classifier failed (%s), falling back to HSV k-means", e)
+                _hsv_cluster_teams(tracks, video_path)
+    else:
+        logger.info("Tracks already have team assignments (T0=%d, T1=%d) — skipping re-clustering", t0_pre, t1_pre)
+
+    # Validate final assignment
+    if not validate_separation(tracks):
+        logger.warning("Team separation validation failed — fewer than 3 players in one team")
+        # Don't wipe existing assignments if they're partially useful
+        t0_count = sum(1 for t in tracks if t.get("teamId") == 0)
+        t1_count = sum(1 for t in tracks if t.get("teamId") == 1)
+        if t0_count == 0 and t1_count == 0:
+            _mark_all_unknown(tracks)
+            return _failed_result()
+
+    # ── Compute team colours for reporting (always runs) ──────────────
+    return _compute_team_colours(tracks, video_path)
+
+
+def _hsv_cluster_teams(tracks: List[dict], video_path: str) -> None:
+    """HSV-based k-means team clustering (fallback). Modifies tracks in-place."""
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         logger.error("Could not open video for team separation: %s", video_path)
         _mark_all_unknown(tracks)
-        return _failed_result()
+        return
 
     # Detect portrait orientation
     ret, sample = cap.read()
     if not ret or sample is None:
         cap.release()
         _mark_all_unknown(tracks)
-        return _failed_result()
+        return
     needs_rotation = sample.shape[0] > sample.shape[1]
     cap.release()
 
@@ -271,7 +317,6 @@ def cluster_teams(tracks: List[dict], video_path: str) -> Dict:
     confirmed_indices = []
 
     for track_idx, track in enumerate(tracks):
-        # Only cluster confirmed player tracks (not staff, not too short)
         if track.get("is_staff", False):
             track["teamId"] = -1
             continue
@@ -279,38 +324,13 @@ def cluster_teams(tracks: List[dict], video_path: str) -> Dict:
         if not isinstance(confirmed, (int, float)) or confirmed < 5:
             track["teamId"] = -1
             continue
-
         traj = track.get("trajectory", [])
         if len(traj) < 2:
             track["teamId"] = -1
             continue
-
-        # Filter out tracks that spend most of their time near frame edges (touchline staff/crowd)
-        # Use bbox centre y, normalized to [0,1] by frame height (estimate from bbox scale)
-        y_positions = []
-        for pt in traj:
-            if isinstance(pt, dict):
-                bbox = pt.get("bbox", [])
-                if len(bbox) >= 4:
-                    cy = (bbox[1] + bbox[3]) / 2.0
-                    # Normalize: assume typical frame height ~1080 if we don't know exact
-                    y_positions.append(cy)
-        if y_positions:
-            # Use raw pixel avg — exclude if near very top or bottom of frame
-            avg_y_px = sum(y_positions) / len(y_positions)
-            # Estimate frame height from max bbox y seen
-            est_frame_h = max(max(y_positions) * 1.1, 720)
-            avg_y_norm = avg_y_px / est_frame_h
-            if avg_y_norm < 0.08 or avg_y_norm > 0.92:
-                track["teamId"] = -1
-                continue
-
         confirmed_indices.append(track_idx)
-
-        # Sample up to SAMPLES_PER_TRACK evenly-spaced trajectory points
         step = max(1, len(traj) // SAMPLES_PER_TRACK)
         samples = traj[::step][:SAMPLES_PER_TRACK]
-
         for pt in samples:
             fi = pt["frameIndex"]
             if fi not in frame_requests:
@@ -319,48 +339,32 @@ def cluster_teams(tracks: List[dict], video_path: str) -> Dict:
 
     if not confirmed_indices or not frame_requests:
         _mark_all_unknown(tracks)
-        return _failed_result()
+        return
 
-    # ── Read frames and extract colours ──────────────────────────────────
-    # Sort frame indices so we can seek forward through the video
     sorted_frames = sorted(frame_requests.keys())
-
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         _mark_all_unknown(tracks)
-        return _failed_result()
+        return
 
-    feature_samples = {i: [] for i in confirmed_indices}  # track_idx → list of feature vectors
-    raw_hsv_samples = {i: [] for i in confirmed_indices}   # track_idx → list of raw HSV
-
+    feature_samples = {i: [] for i in confirmed_indices}
     current_frame_idx = -1
     for target_fi in sorted_frames:
-        # Seek to the target frame
         if target_fi > current_frame_idx + 1:
             cap.set(cv2.CAP_PROP_POS_FRAMES, target_fi)
-
         ret, frame = cap.read()
         if not ret or frame is None:
             continue
         current_frame_idx = target_fi
-
         if needs_rotation:
             frame = cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
-
-        # Extract colours for each track that has a bbox in this frame
         for track_idx, bbox in frame_requests[target_fi]:
             feat = extract_player_colour(frame, bbox)
             if feat is not None:
                 feature_samples[track_idx].append(feat)
-
-            raw = _extract_raw_hsv(frame, bbox)
-            if raw is not None:
-                raw_hsv_samples[track_idx].append(raw)
-
     cap.release()
 
-    # ── Compute median feature vector per track ──────────────────────────
-    feature_vectors = {}  # track_idx → np.array
+    feature_vectors = {}
     for track_idx in confirmed_indices:
         samples = feature_samples[track_idx]
         if not samples:
@@ -369,81 +373,72 @@ def cluster_teams(tracks: List[dict], video_path: str) -> Dict:
         feature_vectors[track_idx] = np.median(samples, axis=0)
 
     if len(feature_vectors) < 4:
-        logger.warning("Too few tracks with colour data (%d) — team separation failed",
-                       len(feature_vectors))
         _mark_all_unknown(tracks)
-        return _failed_result()
+        return
 
-    # ── K-means clustering ────────────────────────────────────────────────────
     clustering_indices = list(feature_vectors.keys())
     data = np.array([feature_vectors[i] for i in clustering_indices])
-
-    # Weight: hue most important, then saturation, then brightness
     weights = np.array([2.0, 1.5, 0.5])
     data_w = data * weights
 
-    n_tracks = len(clustering_indices)
-    if n_tracks >= 6:
-        # Use 3 clusters: two teams + referee/other
-        labels3, centroids3 = _kmeans(data_w, k=3)
+    labels, centroids_w = _kmeans(data_w, k=2)
+    for i, track_idx in enumerate(clustering_indices):
+        tracks[track_idx]["teamId"] = int(labels[i])
 
-        # Count cluster sizes
-        from collections import Counter
-        cluster_counts = Counter(labels3)
-
-        # The smallest cluster is referees/staff — mark as -1
-        smallest_cluster = min(cluster_counts, key=cluster_counts.get)
-
-        # The two largest clusters are the teams
-        team_clusters = [c for c in cluster_counts if c != smallest_cluster]
-        team_map = {team_clusters[0]: 0, team_clusters[1]: 1, smallest_cluster: -1}
-
-        for i, track_idx in enumerate(clustering_indices):
-            tracks[track_idx]["teamId"] = team_map[int(labels3[i])]
-
-        logger.info("3-cluster separation: cluster sizes %s, referee cluster=%d",
-                    dict(cluster_counts), smallest_cluster)
-    else:
-        # Too few tracks for 3-cluster, fall back to 2
-        labels, centroids_w = _kmeans(data_w, k=2)
-        for i, track_idx in enumerate(clustering_indices):
-            tracks[track_idx]["teamId"] = int(labels[i])
-
-    # Assign unclustered confirmed tracks to nearest centroid
-    clustered_set = set(clustering_indices)
-    for track_idx in confirmed_indices:
-        if track_idx in clustered_set:
-            continue
-        if track_idx not in feature_vectors:
-            tracks[track_idx]["teamId"] = -1
-            continue
-        feat_w = feature_vectors[track_idx] * weights
-        d0 = float(np.linalg.norm(feat_w - centroids_w[0]))
-        d1 = float(np.linalg.norm(feat_w - centroids_w[1]))
-        tracks[track_idx]["teamId"] = 0 if d0 <= d1 else 1
-
-    # Mark any remaining tracks without teamId
     for track in tracks:
         track.setdefault("teamId", -1)
 
-    # ── Validate separation ──────────────────────────────────────────────
-    if not validate_separation(tracks):
-        logger.warning("Team separation validation failed — fewer than 3 players in one team")
-        _mark_all_unknown(tracks)
-        return _failed_result()
 
-    # ── Compute team colours for reporting ────────────────────────────────
+def _compute_team_colours(tracks: List[dict], video_path: str) -> Dict:
+    """Extract team colour names from frames using HSV. Does NOT modify teamId."""
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        return _colour_result_from_counts(tracks)
+
+    ret, sample = cap.read()
+    if not ret:
+        cap.release()
+        return _colour_result_from_counts(tracks)
+    needs_rotation = sample.shape[0] > sample.shape[1]
+    cap.release()
+
+    # Collect raw HSV samples per team
     team_0_raw = []
     team_1_raw = []
-    for track_idx in clustering_indices:
-        tid = tracks[track_idx].get("teamId")
-        raws = raw_hsv_samples.get(track_idx, [])
-        if raws:
-            median_raw = np.median(raws, axis=0)
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        return _colour_result_from_counts(tracks)
+
+    # Sample middle trajectory point from each track
+    for track in tracks:
+        tid = track.get("teamId", -1)
+        if tid not in (0, 1):
+            continue
+        traj = track.get("trajectory", [])
+        if not traj:
+            continue
+        mid = traj[len(traj) // 2]
+        fi = mid.get("frameIndex")
+        bbox = mid.get("bbox")
+        if fi is None or bbox is None:
+            continue
+
+        cap.set(cv2.CAP_PROP_POS_FRAMES, fi)
+        ret, frame = cap.read()
+        if not ret:
+            continue
+        if needs_rotation:
+            frame = cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
+
+        raw = _extract_raw_hsv(frame, bbox)
+        if raw is not None:
             if tid == 0:
-                team_0_raw.append(median_raw)
-            elif tid == 1:
-                team_1_raw.append(median_raw)
+                team_0_raw.append(raw)
+            else:
+                team_1_raw.append(raw)
+
+    cap.release()
 
     t0_hsv = np.median(team_0_raw, axis=0).tolist() if team_0_raw else [0, 0, 0]
     t1_hsv = np.median(team_1_raw, axis=0).tolist() if team_1_raw else [0, 0, 0]
@@ -451,11 +446,9 @@ def cluster_teams(tracks: List[dict], video_path: str) -> Dict:
     t0_count = sum(1 for t in tracks if t.get("teamId") == 0)
     t1_count = sum(1 for t in tracks if t.get("teamId") == 1)
 
-    # Get base colour names first (before brightness prefixes)
     t0_base = hsv_to_colour_name(*t0_hsv)
     t1_base = hsv_to_colour_name(*t1_hsv)
 
-    # If both teams get the same base colour, differentiate by brightness before detailed naming
     if t0_base == t1_base:
         if t0_hsv[2] < t1_hsv[2]:
             t0_name = f"dark {t0_base}"
@@ -464,7 +457,6 @@ def cluster_teams(tracks: List[dict], video_path: str) -> Dict:
             t0_name = f"light {t0_base}"
             t1_name = f"dark {t1_base}"
     else:
-        # Different base colours — use detailed naming
         t0_name = _detailed_colour_name(*t0_hsv)
         t1_name = _detailed_colour_name(*t1_hsv)
 
@@ -475,14 +467,6 @@ def cluster_teams(tracks: List[dict], video_path: str) -> Dict:
         t1_count, t1_name, *t1_hsv,
     )
 
-    # Log team counts and detect imbalance
-    other_count = sum(1 for t in tracks if t.get("teamId") == -1)
-    logger.info("Team counts: team_0=%d, team_1=%d, unassigned=%d", t0_count, t1_count, other_count)
-    if t0_count > 0 and t1_count > 0:
-        ratio = max(t0_count, t1_count) / min(t0_count, t1_count)
-        if ratio > 2.5:
-            logger.warning("Team separation imbalanced (ratio=%.1f) — referee or staff may be misclustered", ratio)
-
     return {
         "status": "ok",
         "team_0_players": t0_count,
@@ -491,6 +475,21 @@ def cluster_teams(tracks: List[dict], video_path: str) -> Dict:
         "team_1_colour_hsv": [round(v, 1) for v in t1_hsv],
         "team_0_colour_name": t0_name,
         "team_1_colour_name": t1_name,
+    }
+
+
+def _colour_result_from_counts(tracks: List[dict]) -> Dict:
+    """Minimal result when video is unavailable for colour extraction."""
+    t0 = sum(1 for t in tracks if t.get("teamId") == 0)
+    t1 = sum(1 for t in tracks if t.get("teamId") == 1)
+    return {
+        "status": "ok" if (t0 >= 3 and t1 >= 3) else "partial",
+        "team_0_players": t0,
+        "team_1_players": t1,
+        "team_0_colour_hsv": [0, 0, 0],
+        "team_1_colour_hsv": [0, 0, 0],
+        "team_0_colour_name": "unknown",
+        "team_1_colour_name": "unknown",
     }
 
 

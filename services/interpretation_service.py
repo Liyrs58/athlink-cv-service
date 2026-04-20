@@ -1,3 +1,6 @@
+"""High-level interpretation of tactical data using Gemini.
+"""
+
 import os
 import json
 import math

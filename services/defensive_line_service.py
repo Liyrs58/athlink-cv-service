@@ -1,3 +1,6 @@
+"""Defensive line positioning and offside tracking.
+"""
+
 import json
 import logging
 import math

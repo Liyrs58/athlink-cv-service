@@ -1,3 +1,6 @@
+"""Session memory and state persistence across analyses.
+"""
+
 import json
 import os
 from datetime import datetime

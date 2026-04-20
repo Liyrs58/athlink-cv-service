@@ -1,3 +1,6 @@
+"""Player speed and acceleration calculations.
+"""
+
 import math
 import logging
 from typing import Optional, Dict, Any, List
@@ -14,20 +17,21 @@ def to_scalar(v):
     return v
 
 PIXELS_PER_METRE = 15.5
-SPRINT_MS = 5.5  # 19.8 km/h
+SPRINT_MS = 7.0  # FIX 6: sprint = >7 m/s sustained >1s (25.2 km/h)
 HIGH_INTENSITY_MS = 5.5
 WALKING_MS = 2.0
-MAX_REALISTIC_SPEED_MS = 10.0  # 36 km/h cap
+MAX_REALISTIC_SPEED_MS = 12.0  # FIX 6: 12 m/s cap (43.2 km/h — Mbappé territory)
 
 # Part 3c: improved sprint params
-SPRINT_COOLDOWN_BEFORE = 1.5   # must be below 4.0 m/s for 1.5s before sprint
+SPRINT_COOLDOWN_BEFORE = 1.0   # FIX 6: 1s pre-cooldown
 SPRINT_PRE_SPEED = 4.0
 SPRINT_POST_SPEED = 4.5
-MAX_SPRINTS_PER_PLAYER = 3     # max realistic in 40s clip
+SPRINT_MIN_DURATION = 1.0      # FIX 6: must sustain >7 m/s for ≥1s
+MAX_SPRINTS_PER_PLAYER = 5     # slightly more generous with higher threshold
 
 # Part 3b: noise floor
 MIN_DISPLACEMENT_M = 0.3  # per-frame displacement below this is noise
-MAX_FRAME_DISTANCE_M = 0.46  # cap per-frame distance (~11.5 m/s at 25fps)
+MAX_FRAME_DISTANCE_M = 0.48  # FIX 6: cap per-frame distance (12 m/s at 25fps)
 
 
 def get_centre(bbox):
@@ -286,7 +290,7 @@ def compute_player_velocity(track, calibration: Optional[Dict[str, Any]] = None,
         dy = smoothed[i][1] - smoothed[i-1][1]
         dist_m = math.sqrt(dx*dx + dy*dy)
 
-        # Cap per-frame distance at 0.46m (fastest footballer ever: ~11.5 m/s)
+        # FIX 6: cap per-frame distance at MAX_REALISTIC_SPEED_MS / fps
         dist_m = min(dist_m, MAX_FRAME_DISTANCE_M)
 
         # Low homography confidence: apply a conservative distance discount
@@ -331,7 +335,7 @@ def compute_player_velocity(track, calibration: Optional[Dict[str, Any]] = None,
             if in_sprint and sprint_start_idx is not None:
                 if speed < SPRINT_POST_SPEED:
                     duration = timestamps[i] - timestamps[sprint_start_idx]
-                    if duration >= 0.4:
+                    if duration >= SPRINT_MIN_DURATION:
                         peak = max(speeds[sprint_start_idx:i+1])
                         sprint_intervals.append({
                             "start": timestamps[sprint_start_idx],
@@ -382,7 +386,20 @@ def compute_player_velocity(track, calibration: Optional[Dict[str, Any]] = None,
         else:
             in_high = False
 
-    max_speed = max(speeds) if speeds else 0.0
+    # FIX 6: 1s rolling max for top speed (smooths out single-frame spikes)
+    max_speed = 0.0
+    if speeds and timestamps:
+        for i in range(len(speeds)):
+            t_end = timestamps[i]
+            window_max = speeds[i]
+            for j in range(i - 1, -1, -1):
+                if t_end - timestamps[j] > 1.0:
+                    break
+                if speeds[j] > window_max:
+                    window_max = speeds[j]
+            if window_max > max_speed:
+                max_speed = window_max
+    max_speed = min(max_speed, MAX_REALISTIC_SPEED_MS)
     avg_speed = sum(speeds) / len(speeds) if speeds else 0.0
 
     # Optical flow cross-check

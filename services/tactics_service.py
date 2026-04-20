@@ -1,3 +1,6 @@
+"""Tactical analysis orchestrator: formations, heatmaps, events.
+"""
+
 import json
 import logging
 import numpy as np

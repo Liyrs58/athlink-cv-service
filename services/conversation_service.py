@@ -1,3 +1,6 @@
+"""Gemini-powered Q&A interface for match data analysis.
+"""
+
 import os
 import json
 import logging

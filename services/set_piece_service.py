@@ -1,3 +1,6 @@
+"""Set piece detection: corners, throw-ins, free kicks.
+"""
+
 import json
 import logging
 import math

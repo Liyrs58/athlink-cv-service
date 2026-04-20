@@ -1,3 +1,6 @@
+"""Player distance heatmaps and spatial coverage per zone.
+"""
+
 import json
 import logging
 import numpy as np

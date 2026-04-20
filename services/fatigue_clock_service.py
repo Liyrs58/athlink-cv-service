@@ -1,3 +1,6 @@
+"""Player fatigue clock tracking based on distance and sprints.
+"""
+
 import math
 import cmath
 from typing import List, Dict, Any, Optional

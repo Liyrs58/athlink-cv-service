@@ -143,3 +143,11 @@ def main():
 
 if __name__ == "__main__":
     main()
+        
+        cap.release()
+        
+        print(f"Rendered {rendered_count} frames to {output_dir}")
+        print(f"Open directory to review: open {output_dir}")
+
+if __name__ == "__main__":
+    main()

@@ -1,9 +1,42 @@
+"""Aggregates tracking, pitch, and tactics data into mobile-friendly JSON.
+"""
+
 import json
 import os
 from pathlib import Path
 import cv2
 
 TEAM_COLORS = {0: "#0064FF", 1: "#FF3200"}
+
+
+def _fill_missing_arcs(ball_frames, fps, hallucinate_fn, np):
+    """Post-process: any gap between two grounded ball positions >5m apart
+    that has all-zero Z gets a hallucinated parabolic arc."""
+    i = 0
+    while i < len(ball_frames) - 1:
+        # Find next segment where Z is all zero
+        j = i + 1
+        while j < len(ball_frames) and ball_frames[j].get("pitchZ", 0) == 0:
+            j += 1
+        if j >= len(ball_frames):
+            j = len(ball_frames) - 1
+        a, b = ball_frames[i], ball_frames[j if j < len(ball_frames) else len(ball_frames) - 1]
+        fi_a, fi_b = a["frameIndex"], b["frameIndex"]
+        if fi_b - fi_a >= 3:
+            xy_a = (a["pitchX"], a["pitchY"])
+            xy_b = (b["pitchX"], b["pitchY"])
+            zs = hallucinate_fn(fi_a, fi_b, xy_a, xy_b, fps)
+            if zs.max() > 0:
+                # Map frame indices to ball_frames indices
+                fi_to_idx = {bf["frameIndex"]: k for k, bf in enumerate(ball_frames)}
+                for off, z_val in enumerate(zs):
+                    fi = fi_a + off
+                    if fi in fi_to_idx and z_val > 0:
+                        ball_frames[fi_to_idx[fi]]["pitchZ"] = round(float(z_val), 3)
+        i = j
+        if i == len(ball_frames) - 1:
+            break
+
 
 def build_export(job_id: str) -> dict:
     base = Path("temp") / job_id
@@ -52,14 +85,41 @@ def build_export(job_id: str) -> dict:
     }
 
     pitch_lookup = {}
+    ball_frames: list = []
     if pitch_data:
         for player in pitch_data.get("players", []):
+            # Ball entry lives under trackId=-1 with is_ball=True — extract separately.
+            if player.get("is_ball"):
+                for pt in player.get("trajectory2d", []):
+                    ball_frames.append({
+                        "frameIndex": int(pt["frameIndex"]),
+                        "pitchX": float(pt["x"]),
+                        "pitchY": float(pt["y"]),
+                        # Z in metres above pitch plane. Populated when pitch
+                        # calibration_valid=True and the point is inside a
+                        # detected flight arc; otherwise 0.
+                        "pitchZ": float(pt.get("z", 0.0)),
+                        "source": pt.get("source", "unknown"),
+                        "confidence": float(pt.get("confidence", 0.0)),
+                        "reliable": str(pt.get("reliable", "False")),
+                    })
+                continue
             tid = int(player["trackId"])
             for pt in player.get("trajectory2d", []):
                 key = (tid, int(pt["frameIndex"]))
                 pitch_lookup[key] = (float(pt["x"]), float(pt["y"]))
+    ball_frames.sort(key=lambda b: b["frameIndex"])
 
     fps = video_meta["fps"] if video_meta["fps"] > 0 else 30.0
+
+    # Hallucinate arcs for likely aerial passes only
+    if len(ball_frames) >= 2:
+        try:
+            from services.ball_tracking_service import hallucinate_ball_arc
+            import numpy as np
+            _fill_missing_arcs(ball_frames, fps, hallucinate_ball_arc, np)
+        except ImportError:
+            pass
     frame_map = {}
     for track in track_data.get("tracks", []):
         track_id = int(track["trackId"])
@@ -108,7 +168,8 @@ def build_export(job_id: str) -> dict:
 
     return {
         "jobId": job_id, "videoMeta": video_meta,
-        "teams": teams, "frames": frames, "tactics": tactics,
+        "teams": teams, "frames": frames, "ball": ball_frames,
+        "tactics": tactics,
         "spaceOccupation": space_occupation, "events": events,
     }
 

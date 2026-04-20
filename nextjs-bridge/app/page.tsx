@@ -3,6 +3,9 @@
 import { useEffect, useRef, useState, useCallback } from "react";
 import { motion, useInView } from "framer-motion";
 import { GlowingEffect } from "@/components/ui/glowing-effect";
+import { loadReplayData } from "../remotion/data/loader";
+import { Scene3D } from "@/components/Scene3D";
+import type { ReplayTable } from "../remotion/data/types";
 
 const APP_URL = "https://web-production-6b7ca.up.railway.app";
 
@@ -254,6 +257,30 @@ const IconSpeed = () => (
    MAIN PAGE
    ============================================================ */
 export default function Home() {
+  const [replayTable, setReplayTable] = useState<ReplayTable | null>(null);
+  const [frame, setFrame] = useState(0);
+
+  // Animate frame if replay is active
+  useEffect(() => {
+    if (!replayTable) return;
+    const interval = setInterval(() => {
+      setFrame((f) => (f + 1) % replayTable.frameCount);
+    }, 1000 / replayTable.fps);
+    return () => clearInterval(interval);
+  }, [replayTable]);
+
+  const handleAnalyseClick = async (e: React.MouseEvent) => {
+    e.preventDefault();
+    console.log("🚀 Initializing FC26 Sandbox...");
+    try {
+      const data = await loadReplayData();
+      setReplayTable(data);
+      console.log("✅ FC26 Simulation Loaded:", data.jobId);
+    } catch (err) {
+      console.error("Failed to load 3D data:", err);
+    }
+  };
+
   return (
     <main className="min-h-screen">
       {/* ===== NAVBAR ===== */}
@@ -262,7 +289,11 @@ export default function Home() {
           <span className="text-2xl font-bold tracking-wider text-[#00d4aa]">
             ATHLINK CV
           </span>
-          <a href={APP_URL} className="cta-button !py-2 !px-5 !text-sm">
+          <a 
+            href={APP_URL} 
+            onClick={handleAnalyseClick}
+            className="cta-button !py-2 !px-5 !text-sm"
+          >
             ANALYSE FOOTAGE →
           </a>
         </div>
@@ -291,14 +322,21 @@ export default function Home() {
               <span className="text-[#00d4aa] font-semibold">£30/month</span>.
               Upload a clip. Get a full coaching report in 90 seconds.
             </p>
-            <a href={APP_URL} className="cta-button">
+            <button 
+              onClick={handleAnalyseClick}
+              className="cta-button"
+            >
               START ANALYSING →
-            </a>
+            </button>
           </FadeInSection>
 
-          {/* Right — animated pitch */}
-          <FadeInSection delay={0.3} className="flex justify-center">
-            <AnimatedPitch />
+          {/* Right — 3D Scene or Fallback Pitch */}
+          <FadeInSection delay={0.3} className="flex justify-center w-full min-h-[400px]">
+            {replayTable ? (
+               <Scene3D table={replayTable} frame={frame} />
+            ) : (
+               <AnimatedPitch />
+            )}
           </FadeInSection>
         </div>
       </section>

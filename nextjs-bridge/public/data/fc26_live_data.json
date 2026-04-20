@@ -1,0 +1,36 @@
+{
+  "jobId": "fc26_live_simulation",
+  "videoMeta": {
+    "width": 1920,
+    "height": 1080,
+    "fps": 25,
+    "durationSeconds": 10,
+    "frameCount": 250
+  },
+  "teams": {
+    "team0": { "color": "#800000", "playerCount": 11 },
+    "team1": { "color": "#ffffff", "playerCount": 11 }
+  },
+  "frames": [
+    {
+      "frameIndex": 0,
+      "timestampSeconds": 0,
+      "players": [
+        { "trackId": 0, "teamId": 0, "pitchX": 52.5, "pitchY": 34, "heading": 0 },
+        { "trackId": 1, "teamId": 1, "pitchX": 60, "pitchY": 34, "heading": 180 }
+      ]
+    },
+    {
+      "frameIndex": 200,
+      "timestampSeconds": 8.0,
+      "players": [
+        { "trackId": 0, "teamId": 0, "pitchX": 53.5, "pitchY": 34, "heading": 0 },
+        { "trackId": 1, "teamId": 1, "pitchX": 61, "pitchY": 34, "heading": 180 }
+      ]
+    }
+  ],
+  "ball": [
+    { "frameIndex": 0, "pitchX": 52.7, "pitchY": 34, "pitchZ": 0, "confidence": 0.9, "reliable": "yes" },
+    { "frameIndex": 200, "pitchX": 53.7, "pitchY": 34, "pitchZ": 0, "confidence": 0.9, "reliable": "yes" }
+  ]
+}

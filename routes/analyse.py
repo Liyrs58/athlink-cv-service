@@ -209,6 +209,9 @@ def _run_analysis_pipeline(job_id: str, temp_path: str, skip_cleanup: bool = Fal
                 _pass_det = None
                 ball_tracker = BallTracker()
                 ball_tracker.load_model()
+                # FIX 7: supply homography for pitch-polygon rejection
+                if calibration.get('homography') is not None:
+                    ball_tracker.set_homography(calibration['homography'])
                 if ball_tracker.model is not None:
                     BALL_SAMPLE_RATE = 5  # Only run YOLO on every 5th frame
                     cap = cv2.VideoCapture(temp_path)
@@ -288,6 +291,9 @@ def _run_analysis_pipeline(job_id: str, temp_path: str, skip_cleanup: bool = Fal
                         ppm = max(calibration["pixels_per_metre"], 0.1)
                     possession_det = PossessionDetector()
                     pass_detector = PassDetector()
+                    logger.info("Starting possession loop: %d frames, ppm=%.2f", total_frames, ppm)
+                    _ptrace = open("/tmp/possession_trace.log", "w")
+                    _ptrace.write(f"ppm={ppm:.2f} total_frames={total_frames}\n\n")
                     for fi in range(total_frames):
                         bp = ball_tracker_obj.get_position_at(fi)
                         frame_players = []
@@ -306,6 +312,21 @@ def _run_analysis_pipeline(job_id: str, temp_path: str, skip_cleanup: bool = Fal
                                         })
                         poss = possession_det.update(bp, frame_players, fi, ppm)
                         pass_detector.update(poss, bp, fi, fps, ppm)
+                        # STEP1 DIAGNOSTIC — only for frames with ball
+                        if bp is not None:
+                            bx, by = bp["x"], bp["y"]
+                            bconf = bp.get("confidence", 0)
+                            interp = bp.get("interpolated", False)
+                            nearest_id = poss.get("player_id")
+                            nearest_team = poss.get("team_id")
+                            nearest_dist = poss.get("distance_metres")
+                            _ptrace.write(f"frame={fi} ball=({bx:.1f},{by:.1f}) conf={bconf:.3f} interp={interp}\n")
+                            for p in sorted(frame_players, key=lambda x: ((x['cx']-bx)**2+(x['cy']-by)**2)**0.5):
+                                d_px = ((p['cx']-bx)**2+(p['cy']-by)**2)**0.5
+                                d_m = d_px / ppm
+                                _ptrace.write(f"  track={p['track_id']:>3}  team={p['team_id']}  px=({p['cx']:.0f},{p['cy']:.0f})  dist_px={d_px:.1f}  dist_m={d_m:.2f}\n")
+                            _ptrace.write(f"  => POSSESSION: player={nearest_id} team={nearest_team} dist_m={nearest_dist}\n\n")
+                    _ptrace.close()
                     poss_pct = possession_det.get_team_possession_pct()
                     possession_data = {
                         "team_0_pct": poss_pct.get(0, 0.0),

@@ -1,0 +1,12 @@
+names:
+- ball
+nc: 1
+roboflow:
+  license: CC BY 4.0
+  project: football-ball-detection-rejhg
+  url: https://universe.roboflow.com/roboflow-jvuqo/football-ball-detection-rejhg/dataset/2
+  version: 2
+  workspace: roboflow-jvuqo
+test: ../test/images
+train: ../train/images
+val: ../valid/images

@@ -1,3 +1,6 @@
+"""Player trajectory analysis and movement patterns.
+"""
+
 import json
 import math
 import os

@@ -1,3 +1,6 @@
+"""Player performance report cards with aggregated stats.
+"""
+
 import json
 import logging
 import math

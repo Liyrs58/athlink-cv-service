@@ -1,17 +1,33 @@
+# ==================== CORE FRAMEWORK ====================
+# Web server and API
 fastapi==0.104.1
 uvicorn[standard]==0.24.0
 python-multipart==0.0.6
 pydantic>=2.10.0
 python-dotenv==1.0.0
+
+# ==================== VISION & TRACKING ====================
+# Computer vision and object detection
 opencv-python-headless>=4.9.0
-ultralytics>=8.1.0
+ultralytics>=8.1.0        # YOLOv8/11 for player detection
+yolov5>=7.0.0             # YOLOv5 legacy support
+boxmot>=10.0.0            # BoT-SORT tracking algorithm
+supervision>=0.26.0       # Detection handling + visualization
+
+# ==================== MATH & PHYSICS ====================
+# Numerical computing
 numpy==2.0.2
-supabase>=2.0.0
-pillow>=8.0.0
-reportlab>=4.0.0
-boxmot>=10.0.0
-yolov5>=7.0.0
-supervision>=0.26.0
-# numpy pinned for Railway compatibility
+pillow>=8.0.0             # Image processing
+reportlab>=4.0.0          # PDF/vector graphics generation
+
+# ==================== AI & APIS ====================
+# Generative AI and language models
+google-generativeai>=0.8.0  # Gemini API for tactical analysis
+
+# ==================== STORAGE ====================
+# Cloud storage and database
+supabase>=2.0.0           # Supabase client for file uploads
+
+# ==================== OPTIONAL / FUTURE ====================
+# Distributed GPU computing
 runpod
-google-generativeai>=0.8.0

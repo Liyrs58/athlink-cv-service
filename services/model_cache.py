@@ -1,3 +1,6 @@
+"""Lazy-load and cache YOLO and ball detection models at startup.
+"""
+
 import os
 import logging
 from ultralytics import YOLO
@@ -10,7 +13,7 @@ _ball_model = None
 def get_tracking_model():
     global _tracking_model
     if _tracking_model is None:
-        model_path = os.getenv('YOLO_MODEL_PATH', 'yolov8s.pt')
+        model_path = os.getenv('YOLO_MODEL_PATH', 'models/roboflow_players.pt')
         logger.info(f"Loading tracking model: {model_path}")
         _tracking_model = YOLO(model_path)
         logger.info("Tracking model loaded and cached")
@@ -19,7 +22,7 @@ def get_tracking_model():
 def get_ball_model():
     global _ball_model
     if _ball_model is None:
-        ball_path = os.environ.get("BALL_MODEL_PATH", "ball.pt")
+        ball_path = os.environ.get("BALL_MODEL_PATH", "models/roboflow_ball.pt")
         if os.path.exists(ball_path):
             logger.info(f"Loading ball model: {ball_path}")
             _ball_model = YOLO(ball_path)

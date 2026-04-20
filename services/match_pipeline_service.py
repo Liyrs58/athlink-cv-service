@@ -1,3 +1,6 @@
+"""Full end-to-end pipeline orchestration with checkpointing.
+"""
+
 import json
 import logging
 import os

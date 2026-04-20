@@ -1,3 +1,6 @@
+"""Comprehensive EPL-style analytics report generation.
+"""
+
 import json
 import logging
 from datetime import datetime, timezone

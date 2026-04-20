@@ -1,3 +1,6 @@
+"""Async job queue management for long-running analyses.
+"""
+
 import json
 import logging
 import os
@@ -40,7 +43,7 @@ def _save_job(job: dict):
         logger.warning("Failed to persist job %s: %s", job.get("jobId"), e)
 
 
-def _load_job_from_disk(job_id: str) -> dict | None:
+def _load_job_from_disk(job_id: str):
     path = _job_path(job_id)
     if not os.path.exists(path):
         return None

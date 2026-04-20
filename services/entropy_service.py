@@ -1,3 +1,6 @@
+"""Entropy-based metrics for field chaos and unpredictability.
+"""
+
 import math
 from typing import List, Dict, Any, Optional
 

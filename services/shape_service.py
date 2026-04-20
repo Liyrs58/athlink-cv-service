@@ -1,3 +1,6 @@
+"""Team shape and formation shape analysis.
+"""
+
 import math
 import logging
 

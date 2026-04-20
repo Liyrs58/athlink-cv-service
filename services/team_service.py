@@ -1,3 +1,6 @@
+"""Team color assignment via HSV histogram clustering.
+"""
+
 import cv2
 import numpy as np
 import logging

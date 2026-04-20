@@ -1,3 +1,6 @@
+"""Expected goals (xG) model from shot analysis.
+"""
+
 import json
 import logging
 import math

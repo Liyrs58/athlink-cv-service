@@ -1,3 +1,6 @@
+"""Counter-press metrics: intensity, recovery time, success rate.
+"""
+
 import json
 import logging
 import math

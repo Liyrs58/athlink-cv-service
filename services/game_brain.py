@@ -1,3 +1,6 @@
+"""Game state analysis and context interpretation.
+"""
+
 from typing import Dict, List, Any
 import math
 

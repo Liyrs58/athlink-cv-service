@@ -1,3 +1,6 @@
+"""Tactical formation detection (4-4-2, 3-5-2, etc.) via clustering.
+"""
+
 import json
 import logging
 import numpy as np
