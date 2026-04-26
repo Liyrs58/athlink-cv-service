@@ -295,7 +295,11 @@ class BallTracker:
             infer_kwargs["classes"] = [COCO_SPORTS_BALL_CLASS]
 
         results = self.model(frame, **infer_kwargs)
-        boxes = results[0].boxes
+        # results is a list of Results objects
+        if not results:
+            return []
+        res = results[0]
+        boxes = res.boxes
         if boxes is None or len(boxes) == 0:
             logger.debug(f"Direct detect: no boxes found (model_type={self.model_type}, conf={MIN_CONF})")
             return []

@@ -96,10 +96,12 @@ def submit_job(job_id: str, fn, *args, **kwargs):
             job["completedAt"] = time.time()
             job["result"] = _numpy_safe(result)
         except BaseException as e:
-            logger.error("Job %s failed: %s", job_id, e, exc_info=True)
+            import traceback
+            tb = traceback.format_exc()
+            logger.error("Job %s failed: %s\n%s", job_id, e, tb, exc_info=True)
             job["status"] = "failed"
             job["completedAt"] = time.time()
-            job["error"] = str(e)
+            job["error"] = f"{str(e)}\n{tb}"
         finally:
             _save_job(job)
 

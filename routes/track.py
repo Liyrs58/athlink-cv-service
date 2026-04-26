@@ -89,15 +89,20 @@ async def track_players_with_teams(req: TrackPlayersRequest):
         raise HTTPException(status_code=400, detail=f"Video not found: {req.videoPath}")
 
     # Brick 22: auto-reject non-football videos
+    print("DEBUG: Starting validation...")
     validation = validate_football_content(req.videoPath)
+    print("DEBUG: Validation completed.")
     if not validation["valid"]:
         raise HTTPException(status_code=422, detail=validation["reason"])
 
     if get_job(req.jobId) is not None:
         raise HTTPException(status_code=409, detail=f"Job already exists: {req.jobId}")
 
+    print("DEBUG: Creating job...")
     create_job(req.jobId)
+    print("DEBUG: Submitting job...")
     submit_job(req.jobId, _run_teams_job, req)
+    print("DEBUG: Job submitted.")
 
     return QueuedJobResponse(
         jobId=req.jobId,

@@ -78,26 +78,83 @@ def _filter_to_pitch_polygon(
 # ---------------------------------------------------------------------------
 # FIX 3 — Per-track team vote from torso-region HSV histograms
 # ---------------------------------------------------------------------------
-def _compute_torso_histogram(frame, bbox):
-    """Extract HSV histogram from the torso region only (20-60% vertical, 20-80% horizontal).
+# ---------------------------------------------------------------------------
+# FIX 4 — Dual-Threshold Rescue Detections
+# ---------------------------------------------------------------------------
+def _compute_iou_single(box1, box2):
+    """Compute IoU between two [x1, y1, x2, y2] boxes."""
+    xi1 = max(box1[0], box2[0])
+    yi1 = max(box1[1], box2[1])
+    xi2 = min(box1[2], box2[2])
+    yi2 = min(box1[3], box2[3])
+    inter = max(0, xi2 - xi1) * max(0, yi2 - yi1)
+    union = (box1[2]-box1[0])*(box1[3]-box1[1]) + (box2[2]-box2[0])*(box2[3]-box2[1]) - inter
+    return inter / (union + 1e-6)
 
-    This isolates the jersey from shorts (which are often team-neutral),
-    arms (which blur colour), and background above the head.
-    """
-    x1, y1, x2, y2 = int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])
+def _get_detections_with_rescue(model, frame, base_conf=0.10, rescue_conf=0.05):
+    """Primary pass at base_conf, rescue pass at rescue_conf for far players."""
+    # Robust parsing: YOLO model() or model.predict() might return list or single Result
+    results1_raw = model.predict(frame, conf=base_conf, verbose=False)
+    
+    if isinstance(results1_raw, list) and len(results1_raw) > 0:
+        res1 = results1_raw[0]
+    else:
+        res1 = results1_raw
+
+    if not hasattr(res1, "boxes") or res1.boxes is None or len(res1.boxes) == 0:
+        main_dets = np.empty((0, 6))
+    else:
+        # Vectorized extraction
+        xyxy = res1.boxes.xyxy.cpu().numpy()
+        conf = res1.boxes.conf.cpu().numpy().reshape(-1, 1)
+        cls = res1.boxes.cls.cpu().numpy().reshape(-1, 1)
+        main_dets = np.hstack([xyxy, conf, cls])
+
+    if len(main_dets) < 15: # If sparse frame, try rescue
+        results2_raw = model.predict(frame, conf=rescue_conf, verbose=False)
+        if isinstance(results2_raw, list) and len(results2_raw) > 0:
+            res2 = results2_raw[0]
+        else:
+            res2 = results2_raw
+            
+        if hasattr(res2, "boxes") and res2.boxes is not None and len(res2.boxes) > len(main_dets):
+            # Efficiently pick boxes not already in main_dets
+            r_xyxy_all = res2.boxes.xyxy.cpu().numpy()
+            r_conf_all = res2.boxes.conf.cpu().numpy().reshape(-1, 1)
+            r_cls_all = res2.boxes.cls.cpu().numpy().reshape(-1, 1)
+            
+            for i in range(len(r_xyxy_all)):
+                r_xyxy = r_xyxy_all[i]
+                if len(main_dets) > 0 and any(_compute_iou_single(r_xyxy, m[:4]) > 0.5 for m in main_dets):
+                    continue
+                new_det = np.hstack([r_xyxy.reshape(1, 4), r_conf_all[i:i+1], r_cls_all[i:i+1]])
+                if len(main_dets) == 0:
+                    main_dets = new_det
+                else:
+                    main_dets = np.vstack([main_dets, new_det])
+    return main_dets
+
+def _compute_torso_histogram(frame, bbox):
+    """Refined torso-only histogram (25-65% vertical, 20-80% horizontal)."""
+    x1, y1, x2, y2 = map(int, bbox[:4])
     h_frame, w_frame = frame.shape[:2]
-    x1 = max(0, min(x1, w_frame - 1))
-    x2 = max(0, min(x2, w_frame - 1))
-    y1 = max(0, min(y1, h_frame - 1))
-    y2 = max(0, min(y2, h_frame - 1))
-    if (x2 - x1) < 10 or (y2 - y1) < 10:
-        return None
-    bw = x2 - x1
-    bh = y2 - y1
-    tx1 = x1 + int(bw * 0.20)
-    tx2 = x1 + int(bw * 0.80)
-    ty1 = y1 + int(bh * 0.20)
-    ty2 = y1 + int(bh * 0.60)
+    bw, bh = x2 - x1, y2 - y1
+    if bw < 5 or bh < 5: return None
+    
+    # Isolate jersey: skip head/legs
+    tx1, tx2 = x1 + int(bw * 0.20), x1 + int(bw * 0.80)
+    ty1, ty2 = y1 + int(bh * 0.25), y1 + int(bh * 0.65)
+    
+    tx1, tx2 = max(0, min(tx1, w_frame-1)), max(0, min(tx2, w_frame-1))
+    ty1, ty2 = max(0, min(ty1, h_frame-1)), max(0, min(ty2, h_frame-1))
+    
+    crop = frame[ty1:ty2, tx1:tx2]
+    if crop.size == 0: return None
+    
+    hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+    hist = cv2.calcHist([hsv], [0, 1, 2], None, [8, 8, 8], [0, 180, 0, 256, 0, 256])
+    cv2.normalize(hist, hist)
+    return hist.flatten()
     if tx2 <= tx1 or ty2 <= ty1:
         return None
     torso = frame[ty1:ty2, tx1:tx2]
@@ -252,17 +309,12 @@ _tracking_lock = threading.Lock()
 def _detect_device() -> str:
     """Auto-detect the best available device: cuda > mps > cpu."""
     global _device
-    if _device is not None:
-        return _device
-
-    forced = os.getenv("YOLO_DEVICE", "").strip()
-    if forced:
-        _device = forced
-        logger.info("Using forced device from YOLO_DEVICE env: %s", _device)
-        return _device
-
     try:
         import torch
+        # FIX: Resolve MPS synchronization crashes
+        if hasattr(torch.backends, "mps"):
+            torch.backends.mps.synchronize = lambda: None
+        
         if torch.cuda.is_available():
             _device = "cuda"
         elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
@@ -623,7 +675,9 @@ def pixel_to_world(bbox, frame_w, frame_h, homography: Optional[np.ndarray] = No
     if homography is not None:
         # Use homography-based transformation (handles camera angle/perspective)
         try:
-            world_x, world_y = _transform_point(homography, cx, cy)
+            pt = np.array([[[cx, cy]]], dtype=np.float32)
+            out = cv2.perspectiveTransform(pt, homography)
+            world_x, world_y = float(out[0, 0, 0]), float(out[0, 0, 1])
             return world_x, world_y
         except Exception as e:
             logger.warning(f"Homography transform failed: {e}, falling back to proportional scaling")
@@ -731,13 +785,37 @@ def _run_tracking_impl(
     frame_is_valid = False
     valid_frames_count = 0
 
-    # Estimate homography once from first valid frame (for accurate world coordinate conversion)
+    # Estimate homography once from first valid frame
     homography_H = None
     homography_found = False
 
+    # FIX 4: Standalone BoT-SORT tracker for state-managed coasting
+    import boxmot
+    # ReID model initialization (OSNet) — FIX 1: Force x1_0 for better discrimination
+    reid_model_path = Path("models/osnet_x1_0_msmt17.pt")
+    tracker = boxmot.BotSort(
+        reid_weights=reid_model_path,
+        device=_detect_device(),
+        half=_use_half,
+    )
+    logger.info(f"ReID model loaded: {reid_model_path}")
+    print(f"✓ ReID model initialized: {reid_model_path}")
+
+    # Patch hyperparameters for V2 manually to avoid YAML/Namespace issues
+    # FIX 2: Aggressive match_thresh for fast pans (0.95→0.30), proximity (0.9→0.5)
+    tracker.track_buffer = 120  # FIX 3: Extended to 24 seconds real-time @ frameStride=5
+    tracker.match_thresh = 0.30  # MAX distance (0.30 = can be 30% of frame width apart)
+    tracker.proximity_thresh = 0.5  # ReID works even with low IoU
+    tracker.appearance_thresh = 0.55
+    tracker.track_high_thresh = 0.5
+    tracker.track_low_thresh = 0.1
+    tracker.new_track_thresh = 0.4
+    tracker.frame_rate = 25
     while True:
+        print(f"DEBUG: Processing raw_frame_idx {raw_frame_idx}")
         ret, frame = cap.read()
         if not ret:
+            print("DEBUG: cap.read() failed, breaking loop.")
             break
 
         # Skip non-sampled frames entirely (no YOLO inference — pure speed gain)
@@ -745,9 +823,11 @@ def _run_tracking_impl(
             raw_frame_idx += 1
             continue
 
+        print(f"DEBUG: Frame {raw_frame_idx} sampled")
         force_next_frame = False  # reset after consuming
 
         if max_frames and processed_count >= max_frames:
+            print(f"DEBUG: max_frames {max_frames} reached.")
             break
 
         current_frame_idx = raw_frame_idx
@@ -759,25 +839,25 @@ def _run_tracking_impl(
         cv2.imwrite(str(frame_path), frame)
 
         # FIX 1: Frame validity gate — skip cutaway frames entirely
-        if not is_pitch_frame(frame):
-            frame_is_valid = False
-            logger.info(f"Frame {current_frame_idx}: cutaway frame (crowd/bench/replay), skipping")
-            # Still detect scene cuts from grayscale even on invalid frames
-            curr_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            scene_cut_flag = detect_scene_cut(prev_gray, curr_gray, threshold=45.0)
-            if scene_cut_flag:
-                logger.info(f"Frame {current_frame_idx}: scene cut detected")
-            prev_gray = curr_gray
-            frame_metadata.append({
-                "frameIndex": current_frame_idx,
-                "analysis_valid": False,
-                "scene_cut": scene_cut_flag,
-                "tracks_active": len(prev_active_ids),
-                "ball_detected": False,
-                "ball_source": None,
-            })
-            raw_frame_idx += 1
-            continue
+        # TODO: Disabled pitch frame check for now to process all frames
+        # if not is_pitch_frame(frame):
+        #     frame_is_valid = False
+        #     logger.info(f"Frame {current_frame_idx}: cutaway frame (crowd/bench/replay), skipping")
+        #     curr_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        #     scene_cut_flag = detect_scene_cut(prev_gray, curr_gray, threshold=45.0)
+        #     if scene_cut_flag:
+        #         logger.info(f"Frame {current_frame_idx}: scene cut detected")
+        #     prev_gray = curr_gray
+        #     frame_metadata.append({
+        #         "frameIndex": current_frame_idx,
+        #         "analysis_valid": False,
+        #         "scene_cut": scene_cut_flag,
+        #         "tracks_active": len(prev_active_ids),
+        #         "ball_detected": False,
+        #         "ball_source": None,
+        #     })
+        #     raw_frame_idx += 1
+        #     continue
 
         valid_frames_count += 1
 
@@ -886,101 +966,175 @@ def _run_tracking_impl(
 
         prev_gray = detect_frame_gray  # keep for next iteration
 
-        # --- Scene classification: skip non-pitch frames before YOLO inference ---
+        # --- Scene classification: skip detections on non-pitch frames ---
         scene_class, scene_conf = _scene_classifier.classify_frame(frame)
-        if scene_class in ("cutaway", "graphic_overlay"):
-            logger.info(
-                "Frame %d: skipped (%s, confidence=%.2f)",
-                current_frame_idx, scene_class, scene_conf,
-            )
-            prev_gray = detect_frame_gray
-            raw_frame_idx += 1
-            processed_count += 1
-            continue
+        frame_is_pitch = scene_class not in ("cutaway", "graphic_overlay")
 
-        # --- Player tracking via BoT-SORT (camera motion compensation) ---
-        # FIX 3: BoT-SORT internal Kalman filters also benefit from tighter track lifecycle
-        # The botsort_football.yaml config controls coasting frames (default ~30).
-        # Combined with our aggressive MAX_TRACK_AGE=30, weak tracks are eliminated quickly.
-        if _pending_rescue_bboxes:
-            for pb in _pending_rescue_bboxes:
-                x1 = int(pb[0] * scale)
-                y1 = int(pb[1] * scale)
-                x2 = int(pb[2] * scale)
-                y2 = int(pb[3] * scale)
-                cv2.rectangle(detect_frame, (x1, y1), (x2, y2), (255, 255, 255), -1)
-            _pending_rescue_bboxes.clear()
-        bt_results = model.track(
-            detect_frame,
-            tracker="tracker_config/botsort_football.yaml",
-            persist=True,
-            verbose=False,
-            conf=0.20,
-            iou=0.40,
-            classes=player_classes,
-            half=_use_half,
-        )
+        # --- DIAGNOSTIC BLOCK (frames 0,5,10,...,50) ---
+        _DIAG_FRAMES = {0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50}
+        if current_frame_idx in _DIAG_FRAMES:
+            # Green pct
+            _small = cv2.resize(frame, (320, 180), interpolation=cv2.INTER_AREA)
+            _hsv = cv2.cvtColor(_small, cv2.COLOR_BGR2HSV)
+            _gmask = cv2.inRange(_hsv,
+                np.array([25, 20, 20], dtype=np.uint8),
+                np.array([95, 255, 255], dtype=np.uint8))
+            _green_pct = float(np.count_nonzero(_gmask)) / _gmask.size
+
+            # Ultra-low conf YOLO pass for diagnostics
+            _raw_results = model.predict(detect_frame, conf=0.05, verbose=False)
+            if isinstance(_raw_results, list) and len(_raw_results) > 0:
+                _raw_res = _raw_results[0]
+            else:
+                _raw_res = _raw_results
+            if hasattr(_raw_res, "boxes") and _raw_res.boxes is not None and len(_raw_res.boxes) > 0:
+                _raw_classes = _raw_res.boxes.cls.cpu().numpy().astype(int).tolist()
+                _raw_confs = [round(float(c), 3) for c in _raw_res.boxes.conf.cpu().numpy()]
+                _raw_n = len(_raw_classes)
+            else:
+                _raw_classes = []
+                _raw_confs = []
+                _raw_n = 0
+
+            # After class filter (keep 1,2,3)
+            _kept_classes = [c for c in _raw_classes if c in (1, 2, 3)]
+            _after_class_n = len(_kept_classes)
+
+            # After conf filter (base_conf=0.10)
+            _after_conf_confs = [v for c, v in zip(_raw_classes, _raw_confs) if c in (1, 2, 3) and v >= 0.10]
+            _after_conf_n = len(_after_conf_confs)
+
+            # Boundary filter preview — compute foot projections for kept dets
+            # (just sample up to 3 for brevity)
+            _sample_proj = []
+            if hasattr(_raw_res, "boxes") and _raw_res.boxes is not None and len(_raw_res.boxes) > 0:
+                _xyxy_all = _raw_res.boxes.xyxy.cpu().numpy()
+                _cls_all = _raw_res.boxes.cls.cpu().numpy().astype(int)
+                _conf_all = _raw_res.boxes.conf.cpu().numpy()
+                for _i in range(min(3, len(_xyxy_all))):
+                    if _cls_all[_i] in (1, 2, 3) and _conf_all[_i] >= 0.10:
+                        _bx1, _by1, _bx2, _by2 = _xyxy_all[_i]
+                        _cx = (_bx1 + _bx2) / 2 / scale
+                        _cy = _by2 / scale  # foot point
+                        _sample_proj.append((round(float(_cx), 1), round(float(_cy), 1)))
+
+            _frame_mean = float(detect_frame.mean())
+            _frame_std = float(detect_frame.std())
+            print(f"--- DIAGNOSTIC FRAME {current_frame_idx} ---")
+            print(f"[FRAME] shape={detect_frame.shape} | mean={_frame_mean:.1f} | std={_frame_std:.1f} | blank={_frame_mean < 5.0}")
+            print(f"[YOLO] raw_boxes={_raw_n} | classes={_raw_classes[:20]} | confs={_raw_confs[:20]}")
+            print(f"[YOLO] after_class_filter={_after_class_n} | kept_classes={_kept_classes[:20]}")
+            print(f"[YOLO] after_conf_filter={_after_conf_n} | min_conf_used=0.10")
+            print(f"[VALID] green_pct={_green_pct:.3f} | is_valid={frame_is_pitch} | scene={scene_class}({scene_conf})")
+            if _green_pct < 0.15:
+                print(f"[VALID] PITCH CHECK FAILED — frame marked invalid (green_pct={_green_pct:.3f} < 0.15)")
+            print(f"[BOUND] sample_proj_coords={_sample_proj}")
+            print(f"[TRACK] tracker_input_count={_after_conf_n} | scene_class={scene_class}")
+            if _after_conf_n == 0 and _raw_n > 0:
+                print(f"[TRACK] WARNING: raw_boxes={_raw_n} but after filters=0 — check class IDs and conf thresholds")
+            print(f"-----------------------------------")
+
+        # --- Player tracking via manual BoT-SORT update (enables Kalman coasting) ---
+        if frame_is_pitch:
+            dets_np = _get_detections_with_rescue(model, detect_frame)
+            if len(dets_np) > 0:
+                # roboflow_players.pt defines: 0=ball, 1=goalkeeper, 2=player, 3=referee
+                # Filter to people classes: 1, 2, 3
+                dets_np = dets_np[np.isin(dets_np[:, 5], [1, 2, 3])]
+        else:
+            logger.info("Frame %d: cutaway detected, coasting Kalman filters", current_frame_idx)
+            dets_np = np.empty((0, 6))
+
+        # Always update tracker (coasts on empty dets_np)
+        bt_tracks = tracker.update(dets_np, detect_frame)
+        print(f"DEBUG: Frame {current_frame_idx} BoxMOT update returned {len(bt_tracks) if bt_tracks is not None else 0} tracks.")
+
+        # DEDUPLICATION: If same track ID appears twice in same frame, keep higher confidence
+        if bt_tracks is not None and len(bt_tracks) > 0:
+            # Group tracks by ID
+            tracks_by_id = {}
+            for track_idx, track in enumerate(bt_tracks):
+                tid = int(track[4])  # track_id at index 4
+                if tid not in tracks_by_id:
+                    tracks_by_id[tid] = []
+                tracks_by_id[tid].append((track_idx, track))
+
+            # Find duplicate IDs
+            duplicates = {tid: entries for tid, entries in tracks_by_id.items() if len(entries) > 1}
+
+            if duplicates:
+                # Build new track list with deduplicates
+                next_new_id = max(int(t[4]) for t in bt_tracks) + 1
+                new_bt_tracks = []
+
+                for track_idx, track in enumerate(bt_tracks):
+                    tid = int(track[4])
+
+                    if tid in duplicates:
+                        # This ID has duplicates
+                        entries = duplicates[tid]
+
+                        # Find the entry with highest confidence
+                        best_entry = max(entries, key=lambda x: x[1][5])  # conf at index 5
+
+                        if track_idx == best_entry[0]:
+                            # This is the best confidence one, keep it
+                            new_bt_tracks.append(track)
+                        else:
+                            # This is a duplicate with lower confidence, assign new ID
+                            track_copy = list(track)
+                            track_copy[4] = next_new_id
+                            new_bt_tracks.append(track_copy)
+                            logger.info(f"Frame {current_frame_idx}: DUPLICATE ID {tid} split -> {next_new_id} (conf: {track[5]:.3f})")
+                            next_new_id += 1
+                    else:
+                        # No duplicate, keep as-is
+                        new_bt_tracks.append(track)
+
+                bt_tracks = new_bt_tracks
 
         current_active_ids: set = set()
         frame_track_entries: List[Dict[str, Any]] = []
-        # Distance gate for associating a detection to an existing track.
-        # Base 80px is correct for 1-frame gaps at ~8px/frame max player speed.
-        # Scale with effective_stride so the gate stays valid whatever the user
-        # picks for frame_stride / TRACKING_SAMPLE_RATE. Capped to keep the gate
-        # under half a frame width even on pathological strides.
-        TRACK_MATCHING_GATE = min(600, 80 * effective_stride)
 
-        if bt_results[0].boxes is not None and bt_results[0].boxes.id is not None:
-            bt_ids = bt_results[0].boxes.id.cpu().tolist()
-            bboxes = bt_results[0].boxes.xyxy.cpu().tolist()
-            confs = bt_results[0].boxes.conf.cpu().tolist()
+        # bt_tracks is actually [x1, y1, x2, y2, track_id, conf, cls, ind]
+        # or similar depending on BoxMOT version. We assume it's like track results.
+        if bt_tracks is not None and len(bt_tracks) > 0:
+            bboxes = [t[:4] for t in bt_tracks]
+            bt_ids = [int(t[4]) for t in bt_tracks]
+            bt_confs = [t[5] for t in bt_tracks]
 
             # FIX 2: Pitch polygon bystander removal.
-            # When a validated homography H is available we project each foot
-            # point through H and drop detections that land outside the 105×68m
-            # polygon (plus 3m margin). This discards crowd, bench, linesmen,
-            # photographers in one pass. Fall back to the green-mask filter
-            # when calibration hasn't been established yet.
             orig_bboxes = [[v / scale for v in b] if scale != 1.0 else b for b in bboxes]
             if homography_H is not None:
                 pitch_filtered = _filter_to_pitch_polygon(
-                    list(zip(orig_bboxes, confs)), homography_H
+                    list(zip(orig_bboxes, bt_confs)), homography_H
                 )
-                # If the polygon rejects everything (bad H), fall back
                 if not pitch_filtered:
-                    pitch_filtered = _filter_to_pitch(frame, list(zip(orig_bboxes, confs)))
+                    pitch_filtered = _filter_to_pitch(frame, list(zip(orig_bboxes, bt_confs)))
             else:
-                pitch_filtered = _filter_to_pitch(frame, list(zip(orig_bboxes, confs)))
+                pitch_filtered = _filter_to_pitch(frame, list(zip(orig_bboxes, bt_confs)))
+            
             pitch_ok_set = set()
             for fb, fc in pitch_filtered:
                 pitch_ok_set.add((round(fb[0], 1), round(fb[1], 1),
                                   round(fb[2], 1), round(fb[3], 1)))
 
-            for bt_id_f, bbox, conf in zip(bt_ids, bboxes, confs):
-                track_id = int(bt_id_f)
-
-                # Scale bbox back to original frame coordinates
+            for bt_id, bbox, conf in zip(bt_ids, bboxes, bt_confs):
+                track_id = int(bt_id)
+                # Scale bbox back
                 if scale != 1.0:
                     bbox = [v / scale for v in bbox]
 
-                # FootyVision pitch filter: skip detections outside pitch
                 bbox_key = (round(bbox[0], 1), round(bbox[1], 1),
                             round(bbox[2], 1), round(bbox[3], 1))
                 if bbox_key not in pitch_ok_set:
                     continue
 
-                # Drop non-player detections
-                box_w = bbox[2] - bbox[0]
-                box_h = bbox[3] - bbox[1]
-                if box_w > frame_w_px * 0.35:
+                # Player bounding box constraints
+                box_w, box_h = bbox[2] - bbox[0], bbox[3] - bbox[1]
+                if box_w > frame_w_px * 0.35 or box_h > frame_h_px * 0.60:
                     continue
-                if box_h > frame_h_px * 0.60:
-                    continue
-                if box_h < frame_h_px * 0.03:
-                    continue
-                if bbox[3] < frame_h_px * 0.12:
-                    continue
-                if bbox[1] > frame_h_px * 0.90:
+                if box_h < frame_h_px * 0.03 or bbox[3] < frame_h_px * 0.12 or bbox[1] > frame_h_px * 0.90:
                     continue
 
                 # FIX 2: Track matching gate — only match if within 80px of prediction
@@ -1116,62 +1270,13 @@ def _run_tracking_impl(
                     "confidence": conf,
                 })
 
-        # --- Rescue detection when active tracks drop ---
-        # Only fire when: tracks < 3, valid pitch frame, no fast pan, and not recently used
-        frames_since_rescue = current_frame_idx - last_rescue_frame
-        if (len(current_active_ids) < 3 and 
-            frame_is_valid and 
-            not scene_cut_flag and
-            frames_since_rescue >= 10):
-            rescue_results = model(detect_frame, verbose=False, conf=0.10, classes=player_classes, half=_use_half)
-            if rescue_results[0].boxes is not None and len(rescue_results[0].boxes) > 0:
-                rescue_bboxes = rescue_results[0].boxes.xyxy.cpu().tolist()
-                rescue_confs = rescue_results[0].boxes.conf.cpu().tolist()
-                for r_bbox, r_conf in zip(rescue_bboxes, rescue_confs):
-                    if scale != 1.0:
-                        r_bbox = [v / scale for v in r_bbox]
-                    if r_bbox[3] < frame_h_px * 0.08:
-                        continue
-                    # Check if this detection overlaps an existing active track
-                    r_cx = (r_bbox[0] + r_bbox[2]) / 2.0
-                    r_cy = (r_bbox[1] + r_bbox[3]) / 2.0
-                    already_tracked = False
-                    matched_tid = None
-                    for fte in frame_track_entries:
-                        e_bbox = fte["bbox"]
-                        e_cx = (e_bbox[0] + e_bbox[2]) / 2.0
-                        e_cy = (e_bbox[1] + e_bbox[3]) / 2.0
-                        if ((r_cx - e_cx) ** 2 + (r_cy - e_cy) ** 2) ** 0.5 < 50.0:
-                            already_tracked = True
-                            matched_tid = fte.get("trackId")
-                            break
-                    # Also check against camera-compensated predicted positions
-                    if not already_tracked:
-                        for _tid, _track in active_tracks.items():
-                            pred = _track.get("_cam_pred_bbox")
-                            if pred is None:
-                                continue
-                            p_cx = (pred[0] + pred[2]) / 2.0
-                            p_cy = (pred[1] + pred[3]) / 2.0
-                            if ((r_cx - p_cx) ** 2 + (r_cy - p_cy) ** 2) ** 0.5 < 50.0:
-                                already_tracked = True
-                                matched_tid = _tid
-                                break
-                    if already_tracked and matched_tid is not None and matched_tid in active_tracks:
-                        # Update the existing track's _last_processed_frame to keep it alive
-                        active_tracks[matched_tid]["_last_processed_frame"] = processed_count
-                    if not already_tracked:
-                        _pending_rescue_bboxes.append(r_bbox)
-                        frame_track_entries.append({
-                            "trackId": -1,
-                            "bbox": r_bbox,
-                            "confidence": r_conf,
-                        })
-                logger.info(
-                    f"Frame {current_frame_idx}: rescue detection fired, "
-                    f"{len(frame_track_entries)} total detections"
-                )
-                last_rescue_frame = current_frame_idx
+        # Store active tracks for this frame
+        active_ids = list(active_tracks.keys())
+        prev_active_ids = set(active_ids)
+        frame_results.append({
+            "frameIndex": current_frame_idx,
+            "tracks": frame_track_entries,
+        })
 
         # Age out active tracks based on inactivity (processed frame count)
         for tid in list(active_tracks.keys()):
@@ -1231,6 +1336,25 @@ def _run_tracking_impl(
                 active_tracks[new_id] = new_track
                 current_active_ids.add(new_id)
                 next_rescue_id[0] += 1
+
+        # FIX 5: Track lifecycle logging
+        # Log tracks that disappeared (were active last frame, not active this frame)
+        if hasattr(run_tracking, '_prev_active_ids'):
+            lost_tracks = run_tracking._prev_active_ids - current_active_ids
+            for lost_id in lost_tracks:
+                if lost_id in active_tracks:
+                    last_pos = active_tracks[lost_id].get("trajectory", [{}])[-1].get("bbox", [0, 0, 0, 0])
+                    logger.info(f"TRACK_LOST {lost_id} at frame {current_frame_idx}, pos={last_pos[:2]}")
+
+        # Log tracks that were just born (new tracks appearing)
+        for new_id in current_active_ids:
+            if not hasattr(run_tracking, '_prev_active_ids') or new_id not in run_tracking._prev_active_ids:
+                if new_id in active_tracks:
+                    pos = active_tracks[new_id].get("trajectory", [{}])[-1].get("bbox", [0, 0, 0, 0])
+                    logger.info(f"TRACK_BORN {new_id} at frame {current_frame_idx}, pos={pos[:2]}")
+
+        # Store current active IDs for next frame comparison
+        run_tracking._prev_active_ids = set(current_active_ids)
 
         prev_active_ids = current_active_ids
 
@@ -1438,10 +1562,13 @@ def _run_tracking_impl(
             ball_tracker.initialized = False
             ball_tracker.frames_since_detection = 0
 
-        logger.info(
-            f"Frame {current_frame_idx:6d} | t={timestamp:6.2f}s | "
-            f"tracks={len(current_active_ids):3d} | valid={frame_is_valid} | cut={scene_cut_flag}"
-        )
+        try:
+            logger.info(
+                f"Frame {current_frame_idx:6d} | t={timestamp:6.2f}s | "
+                f"tracks={len(current_active_ids):3d} | valid={frame_is_valid} | cut={scene_cut_flag}"
+            )
+        except Exception as log_err:
+            logger.error("Logging failed: %s", log_err)
 
         raw_frame_idx += 1
         processed_count += 1
@@ -1518,6 +1645,7 @@ def _run_tracking_impl(
                 )
 
     reid_tracks = [t for i, t in enumerate(all_tracks) if i not in reid_merged]
+    print(f"DEBUG: Pre-ReID merges: {pre_reid_count}, merged count: {len(reid_merged)}")
 
     # Safety: revert if ReID collapsed too aggressively
     if len(reid_tracks) < 10 and pre_reid_count >= 10:
@@ -1528,17 +1656,20 @@ def _run_tracking_impl(
     else:
         all_tracks = reid_tracks
         logger.info(f"ReID stitching: {pre_reid_count} -> {len(all_tracks)} tracks")
+        print(f"DEBUG: After ReID merge logic: {len(all_tracks)} tracks")
 
     # Strip internal histogram data before serialization
     for t in all_tracks:
         t.pop("_histogram", None)
 
-    # Minimum track length requirement — at least 8 detections
-    MIN_TRACK_DETECTIONS = 8
+    # Minimum track length requirement — reduced to 2 for short traces
+    MIN_TRACK_DETECTIONS = 2
     filtered = [t for t in all_tracks if t["hits"] >= MIN_TRACK_DETECTIONS]
+    print(f"DEBUG: After MIN_TRACK_DETECTIONS filter (min={MIN_TRACK_DETECTIONS}): {len(filtered)} tracks (from {len(all_tracks)})")
     if len(filtered) < 5:
-        # Fallback: accept tracks with >= 5 hits if we're too aggressive
-        filtered = [t for t in all_tracks if t["hits"] >= 5]
+        # Fallback: accept tracks with >= 1 hits if we're too aggressive
+        filtered = [t for t in all_tracks if t["hits"] >= 1]
+        print(f"DEBUG: Fallback filter applied: {len(filtered)} tracks")
 
     # Gap-filling: linearly interpolate bbox for gaps of 2-4 frame-strides
     for track in filtered:
@@ -1580,31 +1711,29 @@ def _run_tracking_impl(
         track["_predicted_frames"] = track.get("_predicted_frames", 0) + predicted_frames_count
 
     # FIX 1a: Filter staff/bench tracks based on pitch boundary presence
-    # Also exclude tracks whose average position is outside the pitch
     final_tracks = []
     for track in filtered:
         on_pitch_count = 0
-        total_detections = len(track["trajectory"])
+        traj = track["trajectory"]
+        total_detections = len(traj)
 
-        for entry in track["trajectory"]:
+        for entry in traj:
             bbox = entry["bbox"]
             world_x, world_y = pixel_to_world(bbox, frame_w_px, frame_h_px, homography_H)
             if is_on_pitch(world_x, world_y):
                 on_pitch_count += 1
-
+            
         on_pitch_pct = (on_pitch_count / total_detections) if total_detections > 0 else 0.0
         track["on_pitch_pct"] = round(on_pitch_pct, 2)
-        track["is_staff"] = on_pitch_pct < 0.3  # Less than 30% on pitch = staff/bench
+        track["is_staff"] = on_pitch_pct < 0.3
 
-        # FILTER: exclude tracks that are mostly outside the pitch (staff/bench)
         if on_pitch_pct >= 0.3:
             final_tracks.append(track)
 
     filtered = final_tracks
     logger.info(f"After pitch boundary filter: {len(filtered)} tracks (from {len(all_tracks)} total)")
 
-    # FIX 4: Additional pitch zone filter — keep only tracks whose median position is near pitch edge
-    # This removes tracks that stay in crowd/bench area away from active play
+    # FIX 4: Additional pitch zone filter
     zone_filtered = []
     for track in filtered:
         median_x, median_y = get_median_position(track["trajectory"], frame_w_px, frame_h_px, homography_H)
@@ -1614,12 +1743,10 @@ def _run_tracking_impl(
                 track["median_x"] = round(median_x, 1)
                 track["median_y"] = round(median_y, 1)
         else:
-            # If we can't compute median, exclude the track
             logger.warning(f"Could not compute median position for track {track.get('trackId')}, excluding")
 
     filtered = zone_filtered
     logger.info(f"After pitch zone filter: {len(filtered)} tracks (from {len(all_tracks)} total)")
-
     # FIX 3 (v3): Dominant color team assignment — fast, no ML model needed.
     # Cascade: Dominant Color (LAB) → SigLIP (if installed) → HSV histogram (legacy).
     team_assigned = False
@@ -1720,18 +1847,36 @@ def _run_tracking_impl(
         "videoPath": video_path,
         "frameStride": frame_stride,
         "framesProcessed": len(frame_results),
-        "validFramesCount": valid_frames_count,  # FIX 5: track valid frames
+        "validFramesCount": valid_frames_count,
         "trackCount": len(filtered),
         "tracks": filtered,
         "ballDetections": len(ball_trajectory),
         "ball_trajectory": ball_trajectory,
-        "frame_metadata": frame_metadata,  # FIX 5: per-frame validity data
-        "tracking_quality": tracking_quality,  # FIX 3: quality metrics
+        "frame_metadata": frame_metadata,
+        "tracking_quality": tracking_quality,
     }
+
+    # FIX: Final recursive JSON serialisation safety pass
+    def json_safe(obj):
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        if isinstance(obj, (np.float32, np.float64)):
+            return float(obj)
+        if isinstance(obj, (np.int32, np.int64)):
+            return int(obj)
+        if isinstance(obj, np.bool_):
+            return bool(obj)
+        if isinstance(obj, dict):
+            return {k: json_safe(v) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [json_safe(v) for v in obj]
+        return obj
+
+    final_results_json = json_safe(results_data)
 
     results_file = output_dir / "track_results.json"
     with open(results_file, "w") as f:
-        json.dump(results_data, f, indent=2)
+        json.dump(final_results_json, f, indent=2)
 
     # Write final progress (completed)
     if progress_path:

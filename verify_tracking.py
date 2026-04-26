@@ -54,20 +54,24 @@ def main():
     if args.render:
         print(f"\nRendering tracked frames...")
 
-        # Build frame lookup from track trajectories
+        # Build frame lookup from track trajectories (now includes team info)
         frame_lookup = {}
         for track in data['tracks']:
+            team_id = track.get('teamId', -1)
             for point in track['trajectory']:
                 fi = point['frameIndex']
                 if fi not in frame_lookup:
                     frame_lookup[fi] = []
-                frame_lookup[fi].append((track['trackId'], point['bbox']))
-        
+                frame_lookup[fi].append((track['trackId'], point['bbox'], team_id))
+
         if not frame_lookup:
             print("No frames with tracks found to render.")
             return
-        
-        # Color palette (9 BGR colors)
+
+        # Team colors (BGR): Team 0 = Dark Red, Team 1 = Blue, Unknown = Gray
+        team_colors = {0: (128, 0, 0), 1: (0, 0, 255), -1: (128, 128, 128)}
+
+        # Fallback color palette (9 BGR colors) for non-team-based rendering
         colors = [
             (255, 0, 0),    # Red
             (0, 255, 0),    # Green
@@ -111,20 +115,25 @@ def main():
             timestamp = frame_idx / fps if fps > 0 else 0.0
             
             # Draw tracks
-            for track_id, bbox in frame_lookup[frame_idx]:
-                color = colors[(track_id - 1) % len(colors)]
-                
+            for track_id, bbox, team_id in frame_lookup[frame_idx]:
+                # Use team color if available, else fallback to ID-based color
+                color = team_colors.get(team_id, colors[(track_id - 1) % len(colors)])
+
                 # Convert bbox [x1, y1, x2, y2] to rectangle
                 x1, y1, x2, y2 = [int(v) for v in bbox]
                 cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-                
-                # Draw label
+
+                # Draw label with track ID inside the box
                 label = f"T{track_id}"
                 label_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)[0]
+
+                # Draw label background
                 label_y1 = max(y1 - 25, 0)
                 label_y2 = max(y1 - 5, 0)
                 cv2.rectangle(frame, (x1, label_y1), (x1 + label_size[0], label_y2), color, -1)
-                cv2.putText(frame, label, (x1, y1 - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1, cv2.LINE_AA)
+
+                # Draw label text in white
+                cv2.putText(frame, label, (x1, y1 - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
             
             # Draw frame info
             info_text = f"frame {frame_idx} | t={timestamp:.2f}s"
@@ -135,14 +144,6 @@ def main():
             output_path = output_dir / output_filename
             cv2.imwrite(str(output_path), frame)
             rendered_count += 1
-        
-        cap.release()
-        
-        print(f"Rendered {rendered_count} frames to {output_dir}")
-        print(f"Open directory to review: open {output_dir}")
-
-if __name__ == "__main__":
-    main()
         
         cap.release()
         
