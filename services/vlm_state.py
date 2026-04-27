@@ -71,16 +71,13 @@ class PlayerRegistry:
                         alpha=0.7  # keep 70% old, 30% new
                     )
             else:
-                # New track — try to match to existing slot first
+                # Registration phase: every new BoT-SORT ID = new permanent slot
+                # Do NOT try to match — build the full roster first
                 crop = self._crop(frame, t)
                 if crop is None:
                     continue
                 hist = self._color_hist(crop)
-                matched_slot = self._find_slot(hist, exclude_tids=set(self.botsort_to_slot.values()))
-                if matched_slot is not None:
-                    self.botsort_to_slot[tid] = matched_slot
-                elif self.next_slot <= self.max_players:
-                    # New player — create new slot
+                if self.next_slot <= self.max_players:
                     slot_id = self.next_slot
                     self.next_slot += 1
                     self.slots[slot_id] = {
@@ -144,7 +141,7 @@ class PlayerRegistry:
                     used_slots.add(slot_id)
 
     def _find_slot(self, hist: np.ndarray, exclude_slots: set = None,
-                   exclude_tids: set = None, threshold: float = 0.55) -> Optional[int]:
+                   threshold: float = 0.55) -> Optional[int]:
         """Find best matching slot by cosine similarity."""
         exclude_slots = exclude_slots or set()
         best_score = threshold
