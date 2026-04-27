@@ -14,16 +14,9 @@ except (ImportError, AttributeError):
     try:
         from boxmot.trackers.botsort.botsort import BotSort
     except ImportError:
-        print("[WARNING] BotSort import failed - tracker may not work")
+        print("[ERROR] BotSort import failed")
         BotSort = None
 
-# Handle relative imports for both local and Colab environments
-try:
-    from services.vlm_state import VLMStateMachine, GameState
-except (ImportError, ModuleNotFoundError):
-    # Colab fallback: import from same directory
-    sys.path.insert(0, os.path.dirname(__file__))
-    from vlm_state import VLMStateMachine, GameState
 
 class TrackerCore:
     def __init__(self, yolo_path, reid_path, device="cpu"):
@@ -59,13 +52,9 @@ class TrackerCore:
             track_high_thresh=0.6,     # confirmed detections only
             track_low_thresh=0.1,
             new_track_thresh=0.7,      # prevent phantom tracks
-            cmc_method="ecc",          # camera motion compensation (broadcast pans)
+            cmc_method="ecc",          # camera motion compensation
             frame_rate=25,
         )
-
-        # VLM state machine for game state detection
-        self.vlm_sm = VLMStateMachine(device=device)
-        self.id_override_map = {}  # Maps new_tid -> old_tid after resume
 
         self.frame_idx = 0
         self.results = []
@@ -93,11 +82,7 @@ class TrackerCore:
         return self.tracker.update(dets, frame)
 
     def process_frame(self, frame, video_frame, dets, save=True):
-        """Track and optionally save results, with VLM state filtering."""
-        # Analyze game state every 50 frames
-        state = self.vlm_sm.analyze(frame, video_frame)
-
-        # Normal tracking (VLM state detection only, no freezing for now)
+        """Track and optionally save results."""
         tracks = self.track(frame, dets)
 
         if save:
@@ -106,25 +91,17 @@ class TrackerCore:
                 if len(t) < 8:
                     continue
                 x1, y1, x2, y2, tid, conf, cls, _ = t
-
-                # Apply ID override if resuming from pause
-                final_tid = int(tid)
-                if final_tid in self.id_override_map:
-                    final_tid = self.id_override_map[final_tid]
-
                 players.append({
-                    "trackId": final_tid,
+                    "trackId": int(tid),
                     "bbox": [float(x1), float(y1), float(x2), float(y2)],
                     "confidence": float(conf),
-                    "class": int(cls),
-                    "gameState": state.value
+                    "class": int(cls)
                 })
             self.results.append({
                 "frameIndex": int(video_frame),
                 "players": players,
                 "detection_count": len(dets),
-                "track_count": len(tracks),
-                "gameState": state.value
+                "track_count": len(tracks)
             })
 
         return len(tracks) if len(tracks) > 0 else 0
@@ -148,9 +125,6 @@ def run_tracking(video_path, job_id, frame_stride=5, max_frames=None, device="cp
         raise FileNotFoundError(f"Video not found: {video_path}")
 
     # Resolve model paths (Colab: /content/, local: ./models/)
-    import os
-
-    # Try /content/ first (Colab)
     if os.path.exists("/content/roboflow_players.pt"):
         yolo_path = "/content/roboflow_players.pt"
         reid_path = "/content/athlink-cv-service/models/osnet_x1_0_msmt17.pt"
