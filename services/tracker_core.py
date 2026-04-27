@@ -5,7 +5,16 @@ from pathlib import Path
 from ultralytics import YOLO
 import boxmot
 import torch
-from services.vlm_state import VLMStateMachine, GameState
+import sys
+import os
+
+# Handle relative imports for both local and Colab environments
+try:
+    from services.vlm_state import VLMStateMachine, GameState
+except (ImportError, ModuleNotFoundError):
+    # Colab fallback: import from same directory
+    sys.path.insert(0, os.path.dirname(__file__))
+    from vlm_state import VLMStateMachine, GameState
 
 class TrackerCore:
     def __init__(self, yolo_path, reid_path, device="cpu"):
