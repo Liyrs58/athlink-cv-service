@@ -102,10 +102,16 @@ class TrackerCore:
         prev_state = self.vlm.state
         state = self.vlm.analyze(frame, video_frame)
 
-        # PLAY → BENCH: snapshot roster ONCE on transition
+        # Continuously save roster during PLAY so we have the latest snapshot
+        # before any cut happens
+        last_tracks = getattr(self, '_last_tracks', [])
+        if prev_state == GameState.PLAY and len(last_tracks) >= 10:
+            self.vlm.roster.snapshot(frame, last_tracks, video_frame)
+
+        # PLAY → BENCH: log the transition
         if state == GameState.BENCH_SHOT and prev_state == GameState.PLAY:
-            last_tracks = getattr(self, '_last_tracks', [])
-            self.vlm.on_cut_start(frame, last_tracks, video_frame)
+            self.vlm.pending_remap = True
+            print(f"[VLM] Cut detected at frame {video_frame}, roster has {len(self.vlm.roster.roster)} players")
 
         # Run tracker
         tracks = self.track(frame, dets)
@@ -113,9 +119,8 @@ class TrackerCore:
         # BENCH → PLAY: remap new IDs back to old roster ONCE on transition
         if state == GameState.PLAY and prev_state == GameState.BENCH_SHOT:
             self.id_remap = self.vlm.on_cut_end(frame, tracks, video_frame)
-        elif state == GameState.PLAY and self.vlm.frame_counter % 25 == 0:
-            # Clear remap after ~1 second of stable play
-            self.id_remap = {}
+        elif state == GameState.PLAY and self.vlm.frame_counter % 50 == 0:
+            self.id_remap = {}  # clear remap after ~2s of stable play
 
         self._last_tracks = tracks
 
