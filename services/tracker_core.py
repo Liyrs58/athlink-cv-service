@@ -98,42 +98,24 @@ class TrackerCore:
 
     def process_frame(self, frame, video_frame, dets, save=True):
         """
-        Track with VLM-assisted post-cut ID recovery.
+        Track + permanent player ID assignment via PlayerRegistry.
 
-        Pipeline per frame:
-        1. Detect game state (PLAY / BENCH_SHOT) via green-field heuristic
-        2. During PLAY: continuously update kit-color roster so we always have
-           the latest player appearances saved
-        3. On PLAY→BENCH: mark pending remap, roster is already fresh
-        4. Run BoT-SORT tracker
-        5. On BENCH→PLAY: match new BoT-SORT IDs to saved roster via kit color,
-           remap IDs so players keep the same numbers post-cut
-        6. Apply remap to output
+        Pipeline:
+        1. Detect game state (PLAY / BENCH_SHOT)
+        2. Run BoT-SORT
+        3. During PLAY: registry maps every BoT-SORT tid → permanent slot ID
+           - First 30 frames: builds roster
+           - After 30 frames: matches new tids to existing slots by kit color
+        4. Output uses permanent slot IDs — stable across pans/cuts
         """
-        prev_state = self.vlm.state
         state = self.vlm.analyze(frame, video_frame)
 
-        # Step 2: keep roster fresh during play (only when ≥10 tracks visible)
-        if prev_state == GameState.PLAY and len(self._last_tracks) >= 10:
-            self.vlm.roster.snapshot(frame, self._last_tracks, video_frame)
-
-        # Step 3: mark pending remap on cut
-        if state == GameState.BENCH_SHOT and prev_state == GameState.PLAY:
-            self.vlm.pending_remap = True
-            print(f"[VLM] Cut at frame {video_frame} | roster: {len(self.vlm.roster.roster)} players")
-
-        # Step 4: run tracker
+        # Run BoT-SORT tracker
         tracks = self.track(frame, dets)
 
-        # Step 5: remap on return to play
-        if state == GameState.PLAY and prev_state == GameState.BENCH_SHOT:
-            self.id_remap = self.vlm.on_cut_end(frame, tracks, video_frame)
-
-        # Clear remap after 50 frames of stable play
-        if state == GameState.PLAY and self.vlm.frame_counter % 50 == 0:
-            self.id_remap = {}
-
-        self._last_tracks = tracks
+        # Get permanent ID remap from registry (only during play)
+        if state == GameState.PLAY and len(tracks) > 0:
+            self.id_remap = self.vlm.get_id_remap(frame, tracks, video_frame)
 
         if save:
             players = []
@@ -141,6 +123,7 @@ class TrackerCore:
                 if len(t) < 8:
                     continue
                 x1, y1, x2, y2, tid, conf, cls, _ = t
+                # Use permanent slot ID — fallback to botsort tid if unmatched
                 final_tid = self.id_remap.get(int(tid), int(tid))
                 players.append({
                     "trackId": final_tid,
