@@ -9,14 +9,18 @@ import torch
 class TrackerCore:
     def __init__(self, yolo_path, reid_path, device="cpu"):
         self.device = device
+        # YOLO wants "cuda", boxmot wants "0" — normalise both
+        yolo_device = "cuda" if device in ("0", "cuda") else "cpu"
+        boxmot_device = "0" if device in ("0", "cuda") else "cpu"
+
         # Detection – YOLO only every N frames
         self.yolo = YOLO(yolo_path)
-        self.yolo.to(device)
+        self.yolo.to(yolo_device)
 
         # Tracking – runs EVERY frame
         self.tracker = boxmot.BotSort(
             reid_weights=Path(reid_path),
-            device=device,
+            device=boxmot_device,
             half=False,
             track_buffer=150,          # survive 6s bench shots
             match_thresh=0.85,         # distance = 1-IoU, so IoU ≥ 0.15
