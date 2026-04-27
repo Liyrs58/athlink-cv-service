@@ -146,7 +146,7 @@ def run_tracking(video_path, job_id, frame_stride=5, max_frames=None, device="cp
     # Try /content/ first (Colab)
     if os.path.exists("/content/roboflow_players.pt"):
         yolo_path = "/content/roboflow_players.pt"
-        reid_path = "/content/models/osnet_x1_0_msmt17.pt" if os.path.exists("/content/models/osnet_x1_0_msmt17.pt") else "/content/athlink-cv-service/models/osnet_x1_0_msmt17.pt"
+        reid_path = "/content/athlink-cv-service/models/osnet_x1_0_msmt17.pt"
     else:
         # Local: use relative paths
         yolo_path = "models/roboflow_players.pt"
