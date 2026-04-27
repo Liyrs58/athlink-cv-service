@@ -19,6 +19,14 @@ except (ImportError, ModuleNotFoundError):
 class TrackerCore:
     def __init__(self, yolo_path, reid_path, device="cpu"):
         self.device = device
+
+        # Resolve paths absolutely
+        yolo_path = os.path.abspath(yolo_path)
+        reid_path = os.path.abspath(reid_path)
+
+        print(f"[TrackerCore] YOLO: {yolo_path} (exists: {os.path.exists(yolo_path)})")
+        print(f"[TrackerCore] ReID: {reid_path} (exists: {os.path.exists(reid_path)})")
+
         # YOLO wants "cuda", boxmot wants "0" — normalise both
         yolo_device = "cuda" if device in ("0", "cuda") else "cpu"
         boxmot_device = "0" if device in ("0", "cuda") else "cpu"
