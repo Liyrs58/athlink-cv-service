@@ -45,15 +45,19 @@ class TrackerCore:
             reid_weights=Path(reid_path),
             device=boxmot_device,
             half=True,
-            track_buffer=300,          # survive bench shots
-            match_thresh=0.30,         # broadcast sports: loose IoU matching
+            track_buffer=60,           # match max_age
+            match_thresh=0.25,         # tighter IoU for first association
             proximity_thresh=0.5,
-            appearance_thresh=0.25,    # ReID bridges motion gaps
-            track_high_thresh=0.6,     # confirmed detections only
+            appearance_thresh=0.15,    # relaxed: allow more ReID matches
+            track_high_thresh=0.6,
             track_low_thresh=0.1,
-            new_track_thresh=0.7,      # prevent phantom tracks
-            cmc_method="ecc",          # camera motion compensation
+            new_track_thresh=0.65,     # slightly lower
+            cmc_method="ecc",
             frame_rate=25,
+            per_class=True,            # track teams separately
+            asso_func="ciou",          # better for fast motion
+            max_age=60,                # 2s occlusion survival
+            det_thresh=0.25,           # catch distant players
         )
 
         self.frame_idx = 0
