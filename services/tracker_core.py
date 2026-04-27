@@ -97,21 +97,8 @@ class TrackerCore:
         # Analyze game state every 50 frames
         state = self.vlm_sm.analyze(frame, video_frame)
 
-        # If bench shot or paused, freeze active tracks
-        if state in (GameState.BENCH_SHOT, GameState.PAUSED, GameState.INJURY):
-            if self.vlm_sm.prev_state == GameState.PLAY:
-                # Transitioning to pause — freeze current tracks
-                current_tracks = self.tracker.tracks
-                self.vlm_sm.freeze_tracks(current_tracks, video_frame)
-            # Skip tracker update during pause
-            tracks = self.vlm_sm.frozen_tracks.values() if self.vlm_sm.frozen_tracks else []
-        elif state == GameState.PLAY and self.vlm_sm.prev_state in (GameState.BENCH_SHOT, GameState.PAUSED, GameState.INJURY):
-            # Resuming from pause — match visible players to frozen roster
-            tracks = self.track(frame, dets)
-            self.id_override_map = self.vlm_sm.resume_tracks(tracks, video_frame)
-        else:
-            # Normal tracking
-            tracks = self.track(frame, dets)
+        # Normal tracking (VLM state detection only, no freezing for now)
+        tracks = self.track(frame, dets)
 
         if save:
             players = []

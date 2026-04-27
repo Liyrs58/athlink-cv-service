@@ -30,9 +30,21 @@ class VLMStateMachine:
             self.md = self.md.to(device)
             self.vlm_available = True
             print("[VLM] Moondream loaded successfully")
-        except Exception as e:
-            print(f"[VLM] Failed to load Moondream: {e}. Using fallback heuristics.")
-            self.vlm_available = False
+        except ImportError:
+            # Try alternative import
+            try:
+                import moondream
+                self.md = moondream.Moondream.from_pretrained(
+                    "vikhyatk/moondream2",
+                    revision="2025-01-09",
+                    torch_dtype=torch.float16 if device == "cuda" else torch.float32,
+                )
+                self.md = self.md.to(device)
+                self.vlm_available = True
+                print("[VLM] Moondream loaded (alt import)")
+            except Exception as e:
+                print(f"[VLM] Failed to load Moondream: {e}. Using fallback heuristics.")
+                self.vlm_available = False
 
     def analyze(self, frame, video_frame: int) -> GameState:
         """
