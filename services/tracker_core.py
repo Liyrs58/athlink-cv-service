@@ -5,6 +5,7 @@ from pathlib import Path
 from ultralytics import YOLO
 import boxmot
 import torch
+from services.vlm_state import VLMStateMachine, GameState
 
 class TrackerCore:
     def __init__(self, yolo_path, reid_path, device="cpu"):
@@ -21,17 +22,21 @@ class TrackerCore:
         self.tracker = boxmot.BotSort(
             reid_weights=Path(reid_path),
             device=boxmot_device,
-            half=False,
-            track_buffer=150,          # survive 6s bench shots
-            match_thresh=0.85,         # distance = 1-IoU, so IoU ≥ 0.15
+            half=True,
+            track_buffer=300,          # survive bench shots
+            match_thresh=0.30,         # broadcast sports: loose IoU matching
             proximity_thresh=0.5,
             appearance_thresh=0.25,    # ReID bridges motion gaps
-            track_high_thresh=0.03,    # ALL detections become high‑conf
-            track_low_thresh=0.01,
-            new_track_thresh=0.03,     # any detection can spawn a new track
-            cmc_method="ecc",          # boxmot v12: gmc_method → cmc_method
+            track_high_thresh=0.6,     # confirmed detections only
+            track_low_thresh=0.1,
+            new_track_thresh=0.7,      # prevent phantom tracks
+            cmc_method="sparseOptFlow", # camera motion compensation (broadcast pans)
             frame_rate=25,
         )
+
+        # VLM state machine for game state detection
+        self.vlm_sm = VLMStateMachine(device=device)
+        self.id_override_map = {}  # Maps new_tid -> old_tid after resume
 
         self.frame_idx = 0
         self.results = []
@@ -59,8 +64,25 @@ class TrackerCore:
         return self.tracker.update(dets, frame)
 
     def process_frame(self, frame, video_frame, dets, save=True):
-        """Track and optionally save results."""
-        tracks = self.track(frame, dets)
+        """Track and optionally save results, with VLM state filtering."""
+        # Analyze game state every 50 frames
+        state = self.vlm_sm.analyze(frame, video_frame)
+
+        # If bench shot or paused, freeze active tracks
+        if state in (GameState.BENCH_SHOT, GameState.PAUSED, GameState.INJURY):
+            if self.vlm_sm.prev_state == GameState.PLAY:
+                # Transitioning to pause — freeze current tracks
+                current_tracks = self.tracker.tracks
+                self.vlm_sm.freeze_tracks(current_tracks, video_frame)
+            # Skip tracker update during pause
+            tracks = self.vlm_sm.frozen_tracks.values() if self.vlm_sm.frozen_tracks else []
+        elif state == GameState.PLAY and self.vlm_sm.prev_state in (GameState.BENCH_SHOT, GameState.PAUSED, GameState.INJURY):
+            # Resuming from pause — match visible players to frozen roster
+            tracks = self.track(frame, dets)
+            self.id_override_map = self.vlm_sm.resume_tracks(tracks, video_frame)
+        else:
+            # Normal tracking
+            tracks = self.track(frame, dets)
 
         if save:
             players = []
@@ -68,17 +90,25 @@ class TrackerCore:
                 if len(t) < 8:
                     continue
                 x1, y1, x2, y2, tid, conf, cls, _ = t
+
+                # Apply ID override if resuming from pause
+                final_tid = int(tid)
+                if final_tid in self.id_override_map:
+                    final_tid = self.id_override_map[final_tid]
+
                 players.append({
-                    "trackId": int(tid),
+                    "trackId": final_tid,
                     "bbox": [float(x1), float(y1), float(x2), float(y2)],
                     "confidence": float(conf),
-                    "class": int(cls)
+                    "class": int(cls),
+                    "gameState": state.value
                 })
             self.results.append({
                 "frameIndex": int(video_frame),
                 "players": players,
                 "detection_count": len(dets),
-                "track_count": len(tracks)
+                "track_count": len(tracks),
+                "gameState": state.value
             })
 
         return len(tracks) if len(tracks) > 0 else 0
