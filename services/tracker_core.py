@@ -59,7 +59,7 @@ class TrackerCore:
             track_high_thresh=0.6,     # confirmed detections only
             track_low_thresh=0.1,
             new_track_thresh=0.7,      # prevent phantom tracks
-            cmc_method="sparseOptFlow", # camera motion compensation (broadcast pans)
+            cmc_method="ecc",          # camera motion compensation (broadcast pans)
             frame_rate=25,
         )
 
