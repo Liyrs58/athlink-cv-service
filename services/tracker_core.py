@@ -99,22 +99,22 @@ class TrackerCore:
     def process_frame(self, frame, video_frame, dets, save=True):
         """Track with VLM cut detection + kit-color ReID remap."""
         # VLM: detect game state every 10 frames
+        prev_state = self.vlm.state
         state = self.vlm.analyze(frame, video_frame)
 
-        # PLAY → BENCH: snapshot roster before cut
-        if state == GameState.BENCH_SHOT and self.vlm.prev_state == GameState.PLAY:
+        # PLAY → BENCH: snapshot roster ONCE on transition
+        if state == GameState.BENCH_SHOT and prev_state == GameState.PLAY:
             last_tracks = getattr(self, '_last_tracks', [])
             self.vlm.on_cut_start(frame, last_tracks, video_frame)
 
         # Run tracker
         tracks = self.track(frame, dets)
 
-        # BENCH → PLAY: remap new IDs back to old roster
-        if state == GameState.PLAY and self.vlm.prev_state == GameState.BENCH_SHOT:
+        # BENCH → PLAY: remap new IDs back to old roster ONCE on transition
+        if state == GameState.PLAY and prev_state == GameState.BENCH_SHOT:
             self.id_remap = self.vlm.on_cut_end(frame, tracks, video_frame)
-
-        # Clear remap after 1 second (25 frames) of play
-        if state == GameState.PLAY and self.vlm.prev_state == GameState.PLAY:
+        elif state == GameState.PLAY and self.vlm.frame_counter % 25 == 0:
+            # Clear remap after ~1 second of stable play
             self.id_remap = {}
 
         self._last_tracks = tracks
