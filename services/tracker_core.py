@@ -17,6 +17,13 @@ except (ImportError, AttributeError):
         print("[ERROR] BotSort import failed")
         BotSort = None
 
+# VLM state machine import
+try:
+    from services.vlm_state import VLMStateMachine, GameState
+except (ImportError, ModuleNotFoundError):
+    sys.path.insert(0, os.path.dirname(__file__))
+    from vlm_state import VLMStateMachine, GameState
+
 
 class TrackerCore:
     def __init__(self, yolo_path, reid_path, device="cpu"):
@@ -45,20 +52,24 @@ class TrackerCore:
             reid_weights=Path(reid_path),
             device=boxmot_device,
             half=True,
-            track_buffer=60,           # match max_age
-            match_thresh=0.25,         # tighter IoU for first association
+            track_buffer=60,
+            match_thresh=0.25,
             proximity_thresh=0.5,
-            appearance_thresh=0.15,    # relaxed: allow more ReID matches
+            appearance_thresh=0.15,
             track_high_thresh=0.6,
             track_low_thresh=0.1,
-            new_track_thresh=0.65,     # slightly lower
+            new_track_thresh=0.65,
             cmc_method="ecc",
             frame_rate=25,
-            per_class=True,            # track teams separately
-            asso_func="ciou",          # better for fast motion
-            max_age=60,                # 2s occlusion survival
-            det_thresh=0.25,           # catch distant players
+            per_class=True,
+            asso_func="ciou",
+            max_age=60,
+            det_thresh=0.25,
         )
+
+        # VLM state machine for cut detection + kit-color ReID remap
+        self.vlm = VLMStateMachine(device=device)
+        self.id_remap = {}  # new_tid -> old_tid, active for 1 frame after cut
 
         self.frame_idx = 0
         self.results = []
@@ -86,8 +97,27 @@ class TrackerCore:
         return self.tracker.update(dets, frame)
 
     def process_frame(self, frame, video_frame, dets, save=True):
-        """Track and optionally save results."""
+        """Track with VLM cut detection + kit-color ReID remap."""
+        # VLM: detect game state every 10 frames
+        state = self.vlm.analyze(frame, video_frame)
+
+        # PLAY → BENCH: snapshot roster before cut
+        if state == GameState.BENCH_SHOT and self.vlm.prev_state == GameState.PLAY:
+            last_tracks = getattr(self, '_last_tracks', [])
+            self.vlm.on_cut_start(frame, last_tracks, video_frame)
+
+        # Run tracker
         tracks = self.track(frame, dets)
+
+        # BENCH → PLAY: remap new IDs back to old roster
+        if state == GameState.PLAY and self.vlm.prev_state == GameState.BENCH_SHOT:
+            self.id_remap = self.vlm.on_cut_end(frame, tracks, video_frame)
+
+        # Clear remap after 1 second (25 frames) of play
+        if state == GameState.PLAY and self.vlm.prev_state == GameState.PLAY:
+            self.id_remap = {}
+
+        self._last_tracks = tracks
 
         if save:
             players = []
@@ -95,17 +125,21 @@ class TrackerCore:
                 if len(t) < 8:
                     continue
                 x1, y1, x2, y2, tid, conf, cls, _ = t
+                # Apply remap: restore old ID if this track was matched post-cut
+                final_tid = self.id_remap.get(int(tid), int(tid))
                 players.append({
-                    "trackId": int(tid),
+                    "trackId": final_tid,
                     "bbox": [float(x1), float(y1), float(x2), float(y2)],
                     "confidence": float(conf),
-                    "class": int(cls)
+                    "class": int(cls),
+                    "gameState": state.value,
                 })
             self.results.append({
                 "frameIndex": int(video_frame),
                 "players": players,
                 "detection_count": len(dets),
-                "track_count": len(tracks)
+                "track_count": len(tracks),
+                "gameState": state.value,
             })
 
         return len(tracks) if len(tracks) > 0 else 0
