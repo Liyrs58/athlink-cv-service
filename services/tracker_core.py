@@ -29,22 +29,18 @@ class TrackerCore:
     def __init__(self, yolo_path, reid_path, device="cpu"):
         self.device = device
 
-        # Resolve paths absolutely
         yolo_path = os.path.abspath(yolo_path)
         reid_path = os.path.abspath(reid_path)
 
         print(f"[TrackerCore] YOLO: {yolo_path} (exists: {os.path.exists(yolo_path)})")
         print(f"[TrackerCore] ReID: {reid_path} (exists: {os.path.exists(reid_path)})")
 
-        # YOLO wants "cuda", boxmot wants "0" — normalise both
         yolo_device = "cuda" if device in ("0", "cuda") else "cpu"
         boxmot_device = "0" if device in ("0", "cuda") else "cpu"
 
-        # Detection – YOLO only every N frames
         self.yolo = YOLO(yolo_path)
         self.yolo.to(yolo_device)
 
-        # Tracking – runs EVERY frame
         if BotSort is None:
             raise RuntimeError("BotSort not available")
 
@@ -52,24 +48,29 @@ class TrackerCore:
             reid_weights=Path(reid_path),
             device=boxmot_device,
             half=True,
-            track_buffer=60,
-            match_thresh=0.25,
+            # --- Core association ---
+            match_thresh=0.7,          # IoU ≥ 0.30 required (1 - 0.7 = 0.30)
+            asso_func="iou",           # simple IoU — ciou fragments on pan
+            per_class=False,           # single pool — per_class=True was doubling IDs
+            # --- Track lifecycle ---
+            track_high_thresh=0.5,     # confident detections
+            track_low_thresh=0.1,      # BYTE low-conf recovery
+            new_track_thresh=0.6,      # spawn threshold
+            track_buffer=90,           # 3.6s @ 25fps — survive pans
+            max_age=90,                # match track_buffer
+            det_thresh=0.3,
+            # --- ReID ---
+            appearance_thresh=0.25,    # allow ReID to bridge motion gaps
             proximity_thresh=0.5,
-            appearance_thresh=0.15,
-            track_high_thresh=0.6,
-            track_low_thresh=0.1,
-            new_track_thresh=0.65,
-            cmc_method="ecc",
+            # --- Camera motion ---
+            cmc_method="ecc",          # compensates camera pans
             frame_rate=25,
-            per_class=True,
-            asso_func="ciou",
-            max_age=60,
-            det_thresh=0.25,
         )
 
-        # VLM state machine for cut detection + kit-color ReID remap
+        # VLM: kit-color roster for post-cut ID remapping
         self.vlm = VLMStateMachine(device=device)
-        self.id_remap = {}  # new_tid -> old_tid, active for 1 frame after cut
+        self.id_remap = {}
+        self._last_tracks = []
 
         self.frame_idx = 0
         self.results = []
@@ -84,7 +85,7 @@ class TrackerCore:
         dets = []
         for box in boxes:
             cls = int(box.cls.item())
-            if cls in [1, 2, 3]:   # player classes (0 = ball)
+            if cls in [1, 2, 3]:
                 dets.append([
                     float(box.xyxy[0][0]), float(box.xyxy[0][1]),
                     float(box.xyxy[0][2]), float(box.xyxy[0][3]),
@@ -93,34 +94,44 @@ class TrackerCore:
         return np.array(dets, dtype=float) if dets else np.empty((0, 6))
 
     def track(self, frame, dets):
-        """BoT‑SORT update – always call, even with empty dets."""
         return self.tracker.update(dets, frame)
 
     def process_frame(self, frame, video_frame, dets, save=True):
-        """Track with VLM cut detection + kit-color ReID remap."""
-        # VLM: detect game state every 10 frames
+        """
+        Track with VLM-assisted post-cut ID recovery.
+
+        Pipeline per frame:
+        1. Detect game state (PLAY / BENCH_SHOT) via green-field heuristic
+        2. During PLAY: continuously update kit-color roster so we always have
+           the latest player appearances saved
+        3. On PLAY→BENCH: mark pending remap, roster is already fresh
+        4. Run BoT-SORT tracker
+        5. On BENCH→PLAY: match new BoT-SORT IDs to saved roster via kit color,
+           remap IDs so players keep the same numbers post-cut
+        6. Apply remap to output
+        """
         prev_state = self.vlm.state
         state = self.vlm.analyze(frame, video_frame)
 
-        # Continuously save roster during PLAY so we have the latest snapshot
-        # before any cut happens
-        last_tracks = getattr(self, '_last_tracks', [])
-        if prev_state == GameState.PLAY and len(last_tracks) >= 10:
-            self.vlm.roster.snapshot(frame, last_tracks, video_frame)
+        # Step 2: keep roster fresh during play (only when ≥10 tracks visible)
+        if prev_state == GameState.PLAY and len(self._last_tracks) >= 10:
+            self.vlm.roster.snapshot(frame, self._last_tracks, video_frame)
 
-        # PLAY → BENCH: log the transition
+        # Step 3: mark pending remap on cut
         if state == GameState.BENCH_SHOT and prev_state == GameState.PLAY:
             self.vlm.pending_remap = True
-            print(f"[VLM] Cut detected at frame {video_frame}, roster has {len(self.vlm.roster.roster)} players")
+            print(f"[VLM] Cut at frame {video_frame} | roster: {len(self.vlm.roster.roster)} players")
 
-        # Run tracker
+        # Step 4: run tracker
         tracks = self.track(frame, dets)
 
-        # BENCH → PLAY: remap new IDs back to old roster ONCE on transition
+        # Step 5: remap on return to play
         if state == GameState.PLAY and prev_state == GameState.BENCH_SHOT:
             self.id_remap = self.vlm.on_cut_end(frame, tracks, video_frame)
-        elif state == GameState.PLAY and self.vlm.frame_counter % 50 == 0:
-            self.id_remap = {}  # clear remap after ~2s of stable play
+
+        # Clear remap after 50 frames of stable play
+        if state == GameState.PLAY and self.vlm.frame_counter % 50 == 0:
+            self.id_remap = {}
 
         self._last_tracks = tracks
 
@@ -130,7 +141,6 @@ class TrackerCore:
                 if len(t) < 8:
                     continue
                 x1, y1, x2, y2, tid, conf, cls, _ = t
-                # Apply remap: restore old ID if this track was matched post-cut
                 final_tid = self.id_remap.get(int(tid), int(tid))
                 players.append({
                     "trackId": final_tid,
@@ -162,25 +172,19 @@ class TrackerCore:
         return path
 
 
-def run_tracking(video_path, job_id, frame_stride=5, max_frames=None, device="cpu"):
+def run_tracking(video_path, job_id, frame_stride=1, max_frames=None, device="cpu"):
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
         raise FileNotFoundError(f"Video not found: {video_path}")
 
-    # Resolve model paths (Colab: /content/, local: ./models/)
     if os.path.exists("/content/roboflow_players.pt"):
         yolo_path = "/content/roboflow_players.pt"
         reid_path = "/content/athlink-cv-service/models/osnet_x1_0_msmt17.pt"
     else:
-        # Local: use relative paths
         yolo_path = "models/roboflow_players.pt"
         reid_path = "models/osnet_x1_0_msmt17.pt"
 
-    tracker = TrackerCore(
-        yolo_path=yolo_path,
-        reid_path=reid_path,
-        device=device,
-    )
+    tracker = TrackerCore(yolo_path=yolo_path, reid_path=reid_path, device=device)
 
     video_frame = 0
     processed = 0
@@ -190,7 +194,6 @@ def run_tracking(video_path, job_id, frame_stride=5, max_frames=None, device="cp
         if not ret:
             break
 
-        # YOLO only on stride frames
         if video_frame % frame_stride == 0:
             dets = tracker.detect(frame)
             save_this = True
@@ -198,7 +201,6 @@ def run_tracking(video_path, job_id, frame_stride=5, max_frames=None, device="cp
             dets = np.empty((0, 6))
             save_this = False
 
-        # Track EVERY frame (Kalman coasting keeps IDs during pans)
         n_tracks = tracker.process_frame(frame, video_frame, dets, save=save_this)
 
         if save_this:
@@ -226,8 +228,7 @@ if __name__ == "__main__":
     run_tracking(
         video_path="/Users/rudra/Downloads/1b16c594_villa_psg_40s_new.mp4",
         job_id="spawn_test",
-        frame_stride=10,
-        max_frames=None,
+        frame_stride=1,
         device=device,
     )
     print(f"Total time: {time.time()-t0:.1f}s")
