@@ -3,10 +3,19 @@ import numpy as np
 import cv2
 from pathlib import Path
 from ultralytics import YOLO
-import boxmot
 import torch
 import sys
 import os
+
+# BotSort import with fallback
+try:
+    from boxmot import BotSort
+except (ImportError, AttributeError):
+    try:
+        from boxmot.trackers.botsort.botsort import BotSort
+    except ImportError:
+        print("[WARNING] BotSort import failed - tracker may not work")
+        BotSort = None
 
 # Handle relative imports for both local and Colab environments
 try:
@@ -36,7 +45,10 @@ class TrackerCore:
         self.yolo.to(yolo_device)
 
         # Tracking – runs EVERY frame
-        self.tracker = boxmot.BotSort(
+        if BotSort is None:
+            raise RuntimeError("BotSort not available")
+
+        self.tracker = BotSort(
             reid_weights=Path(reid_path),
             device=boxmot_device,
             half=True,
