@@ -141,8 +141,8 @@ def run_tracking(video_path, job_id, frame_stride=5, max_frames=None, device="cp
         raise FileNotFoundError(f"Video not found: {video_path}")
 
     tracker = TrackerCore(
-        yolo_path="models/roboflow_players.pt",
-        reid_path="models/osnet_x0_25_msmt17.pt",   # fast CPU model
+        yolo_path="models/yolov8n-pose.pt",
+        reid_path="models/osnet_x1_0_msmt17.pt",   # better ReID model
         device=device,
     )
 
