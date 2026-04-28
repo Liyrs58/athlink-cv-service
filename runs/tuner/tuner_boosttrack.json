@@ -1,0 +1,40 @@
+{
+  "tracker": "boosttrack",
+  "results": [
+    {
+      "params": "max_age=30  (1.2s)",
+      "max_age": 30,
+      "unique_ids": 22,
+      "avg_track_length": 52.18181818181818,
+      "avg_active": 11.48
+    },
+    {
+      "params": "max_age=50  (2.0s)",
+      "max_age": 50,
+      "unique_ids": 22,
+      "avg_track_length": 52.18181818181818,
+      "avg_active": 11.48
+    },
+    {
+      "params": "max_age=75  (3.0s)  \u2190 recommended",
+      "max_age": 75,
+      "unique_ids": 22,
+      "avg_track_length": 52.18181818181818,
+      "avg_active": 11.48
+    },
+    {
+      "params": "max_age=100 (4.0s)",
+      "max_age": 100,
+      "unique_ids": 22,
+      "avg_track_length": 52.18181818181818,
+      "avg_active": 11.48
+    }
+  ],
+  "best": {
+    "params": "max_age=30  (1.2s)",
+    "max_age": 30,
+    "unique_ids": 22,
+    "avg_track_length": 52.18181818181818,
+    "avg_active": 11.48
+  }
+}

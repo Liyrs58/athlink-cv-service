@@ -53,6 +53,17 @@ class ProductionTracker:
         self.track_to_player = {}
         self.bootstrap_frames = 0
 
+        # Import IdentityCore for frame lifecycle
+        try:
+            from services.identity_core import IdentityCore
+        except (ImportError, ModuleNotFoundError):
+            import sys
+            import os
+            sys.path.insert(0, os.path.dirname(__file__))
+            from identity_core import IdentityCore
+
+        self.identity = IdentityCore(max_players=22)
+
     def _load_reid_model(self):
         try:
             from torchvision.models import resnet50
@@ -230,9 +241,13 @@ class ProductionTracker:
         return track_to_player
 
     def process_frame(self, frame, frame_id):
+        # BEGIN FRAME: reset per-frame state
+        self.identity.begin_frame(frame_id)
+
         dets = self.detect(frame)
 
         if len(dets) == 0:
+            self.identity.end_frame(frame_id)
             return {}
 
         compute_reid = (frame_id - self.last_reid_frame) >= 3
@@ -252,12 +267,16 @@ class ProductionTracker:
             valid_dets = self.last_dets
 
         if embeddings is None or len(embeddings) == 0:
+            self.identity.end_frame(frame_id)
             return {}
 
         similarity = self.compute_similarity_matrix(embeddings, self.players)
         assignments = self.hungarian_match(similarity)
         assignments = self.uncertainty_lock(similarity, assignments, frame_id)
         track_to_player = self.update_players(assignments, embeddings, valid_dets, frame_id)
+
+        # END FRAME: update slot states
+        self.identity.end_frame(frame_id)
 
         if frame_id % 30 == 0:
             active = sum(1 for p in self.players if p.last_seen >= 0)

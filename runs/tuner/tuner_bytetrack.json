@@ -1,0 +1,40 @@
+{
+  "tracker": "bytetrack",
+  "results": [
+    {
+      "params": "max_age=30  (1.2s)",
+      "max_age": 30,
+      "unique_ids": 21,
+      "avg_track_length": 60.523809523809526,
+      "avg_active": 12.71
+    },
+    {
+      "params": "max_age=50  (2.0s)",
+      "max_age": 50,
+      "unique_ids": 21,
+      "avg_track_length": 60.523809523809526,
+      "avg_active": 12.71
+    },
+    {
+      "params": "max_age=75  (3.0s)  \u2190 recommended",
+      "max_age": 75,
+      "unique_ids": 21,
+      "avg_track_length": 60.523809523809526,
+      "avg_active": 12.71
+    },
+    {
+      "params": "max_age=100 (4.0s)",
+      "max_age": 100,
+      "unique_ids": 21,
+      "avg_track_length": 60.523809523809526,
+      "avg_active": 12.71
+    }
+  ],
+  "best": {
+    "params": "max_age=30  (1.2s)",
+    "max_age": 30,
+    "unique_ids": 21,
+    "avg_track_length": 60.523809523809526,
+    "avg_active": 12.71
+  }
+}

@@ -76,6 +76,8 @@ class IdentityCore:
         self.is_frozen = False
         self._frames_seen = 0
         self._reg_frames = 30
+        self._current_frame = -1
+        self._assigned_this_frame = 0
 
     # ======================================================================
     # Public API
@@ -97,6 +99,31 @@ class IdentityCore:
 
         self._resolve_duplicates()
         return dict(self.track_to_slot)
+
+    def begin_frame(self, frame_id: int):
+        """Reset per-frame state. Call at start of each frame."""
+        self._current_frame = frame_id
+        self._assigned_this_frame = 0
+        # CRITICAL: reset active_tid for ALL slots so they're available for rematching
+        for p in self.players.values():
+            p.active_tid = None
+
+    def end_frame(self, frame_id: int):
+        """Update slot states after assignment. Call at end of each frame."""
+        for p in self.players.values():
+            if p.active_tid is None:
+                # Slot not seen this frame
+                age = frame_id - p.last_seen if p.last_seen >= 0 else 999
+                if age <= 150:
+                    p.state = PlayerState.DORMANT
+                else:
+                    p.state = PlayerState.DORMANT  # Keep as dormant, don't delete
+
+    def state_counts(self) -> Tuple[int, int, int]:
+        """Return (active, dormant, lost) counts for logging."""
+        active = sum(1 for p in self.players.values() if p.state == PlayerState.ACTIVE)
+        dormant = sum(1 for p in self.players.values() if p.state == PlayerState.DORMANT)
+        return active, dormant, 0
 
     def freeze_on_bench(self, frame_id: int):
         """Called on bench/non-play: mark all active → dormant."""

@@ -1,0 +1,13 @@
+[
+  {
+    "tracker": "BoT-SORT + OSNet",
+    "name": "botsort",
+    "unique_ids": 30,
+    "avg_active_tracks": 12.418,
+    "avg_track_length_frames": 206.96666666666667,
+    "avg_fps": 1.7094457740864106,
+    "avg_detections": 12.456,
+    "output": "runs/botsort/output.mp4",
+    "note": "Re-ID features are critical for remembering players out of frame"
+  }
+]
