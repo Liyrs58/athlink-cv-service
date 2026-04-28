@@ -132,10 +132,20 @@ class TrackerCore:
                 if len(t) < 8:
                     continue
                 x1, y1, x2, y2, tid, conf, cls, _ = t
-                # Use permanent slot ID — fallback to botsort tid if unmatched
-                final_tid = self.id_remap.get(int(tid), int(tid))
+                tid_int = int(tid)
+                final_tid = self.id_remap.get(tid_int, None)
+
+                # Tracks not in registry = referee or unclassified, skip them
+                if final_tid is None:
+                    continue
+
+                # Get team from registry slot
+                slot = self.vlm.registry.slots.get(final_tid, {})
+                team = slot.get("team", "UNK")
+
                 players.append({
                     "trackId": final_tid,
+                    "team": team,
                     "bbox": [float(x1), float(y1), float(x2), float(y2)],
                     "confidence": float(conf),
                     "class": int(cls),
