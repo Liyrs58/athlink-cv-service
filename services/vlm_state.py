@@ -1,7 +1,34 @@
 import cv2
 import numpy as np
 from enum import Enum
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
+
+
+def _hungarian(cost: np.ndarray):
+    """
+    Greedy approximation of Hungarian algorithm for small matrices.
+    Returns (row_indices, col_indices) of optimal assignment.
+    """
+    n_rows, n_cols = cost.shape
+    row_idx, col_idx = [], []
+    used_rows, used_cols = set(), set()
+
+    # Flatten and sort by cost ascending
+    indices = []
+    for i in range(n_rows):
+        for j in range(n_cols):
+            indices.append((cost[i, j], i, j))
+    indices.sort()
+
+    for c, r, col in indices:
+        if r in used_rows or col in used_cols:
+            continue
+        row_idx.append(r)
+        col_idx.append(col)
+        used_rows.add(r)
+        used_cols.add(col)
+
+    return np.array(row_idx), np.array(col_idx)
 
 
 class GameState(Enum):
@@ -9,86 +36,43 @@ class GameState(Enum):
     BENCH_SHOT = "bench_shot"
 
 
-def _detect_team(hist: np.ndarray) -> str:
-    """
-    Classify kit into team A, team B, or referee based on dominant hue bin.
-
-    HSV hue bins (36-bin, each bin = 5 degrees):
-      - Bin 0-2   (~0-10°):  red/maroon  → team_A  (Aston Villa claret)
-      - Bin 3-6   (~15-30°): orange      → other
-      - Bin 7-10  (~35-50°): yellow      → referee
-      - Bin 14-20 (~70-100°):green       → pitch (should not appear in torso crop)
-      - Bin 24-30 (~120-150°):blue/navy  → team_B  (PSG dark blue)
-      - Bin 0-1 + low sat   : white/grey → referee or GK
-
-    Returns: "A", "B", "REF", or "UNK"
-    """
-    hue = hist[:36]        # first 36 values = hue bins
-    sat = hist[36:]        # last 16 values = saturation bins
-
-    low_sat = float(sat[:4].sum())   # low saturation = white/grey/black
-    total = float(hue.sum()) + 1e-6
-
-    # Dominant hue bin
-    dominant_bin = int(np.argmax(hue))
-    dominant_strength = float(hue[dominant_bin]) / total
-
-    # Black/dark kit: very low saturation overall
-    if low_sat / (total + low_sat) > 0.6:
-        return "REF"  # black kit = referee
-
-    # Yellow: bins 7-10 (35-50°)
-    yellow = float(hue[7:11].sum()) / total
-    if yellow > 0.35:
-        return "REF"
-
-    # Red/claret: bins 0-3 and 33-36 (wraps around)
-    red = float(hue[0:4].sum() + hue[33:36].sum()) / total
-    if red > 0.25:
-        return "A"
-
-    # Blue/navy/dark blue: bins 22-30 (110-150°)
-    blue = float(hue[22:31].sum()) / total
-    if blue > 0.20:
-        return "B"
-
-    # White/light grey (high brightness, low sat) — could be GK or away kit
-    if low_sat / (total + low_sat) > 0.35:
-        return "UNK"
-
-    return "UNK"
-
-
 class PlayerRegistry:
     """
-    Permanent player roster.
+    Permanent player roster for broadcast football tracking.
 
-    Registration phase (first 30 PLAY frames): every new BoT-SORT ID gets
-    its own slot. Referees are excluded.
+    Phase 1 — Registration (first 30 PLAY frames):
+      Every BoT-SORT track gets its own slot. ALL tracks registered (no filtering).
+      Appearance histograms are accumulated over multiple frames for stability.
 
-    After freeze: new BoT-SORT IDs are matched to existing slots by:
-      1. Kit color histogram (cosine similarity ≥ 0.45)
-      2. Team consistency (A slot never matches B detection)
-      3. One slot per active track (strict exclusion)
+    Phase 2 — Freeze:
+      Team labels are assigned by clustering all slot histograms into 2 groups
+      (using cosine distance). This is far more reliable than single-frame hue
+      thresholds.
 
-    This gives stable P1–P22 labels across pans and cuts.
+    Phase 3 — Matching (ongoing):
+      New BoT-SORT IDs are matched to slots using:
+        1. Cosine similarity of HSV histograms
+        2. Team constraint (A slot ≠ B detection)
+        3. Strict one-slot-per-track exclusion
+      After bench→play transitions, Hungarian algorithm finds optimal assignment
+      across all new tracks and available slots.
     """
 
     def __init__(self, max_players=30):
         self.max_players = max_players
-        self.slots: Dict[int, dict] = {}              # slot_id → data
-        self.botsort_to_slot: Dict[int, int] = {}     # botsort_tid → slot_id
+        self.slots: Dict[int, dict] = {}
+        self.botsort_to_slot: Dict[int, int] = {}
         self.next_slot = 1
         self.is_frozen = False
         self._frames_seen = 0
         self._registration_frames = 30
+        self._post_bench = False  # use Hungarian for first match after bench
 
     # ------------------------------------------------------------------
-    # Public API
+    # Public
     # ------------------------------------------------------------------
 
     def update(self, frame: np.ndarray, tracks: List, video_frame: int) -> Dict[int, int]:
-        """Called every PLAY frame. Returns {botsort_tid: permanent_slot_id}."""
         if len(tracks) == 0:
             return dict(self.botsort_to_slot)
 
@@ -97,96 +81,29 @@ class PlayerRegistry:
         if not self.is_frozen:
             self._register(frame, tracks, video_frame)
             if self._frames_seen >= self._registration_frames:
-                self.is_frozen = True
-                print(f"[Registry] Frozen with {len(self.slots)} slots "
-                      f"(teams: A={sum(1 for s in self.slots.values() if s['team']=='A')}, "
-                      f"B={sum(1 for s in self.slots.values() if s['team']=='B')}, "
-                      f"UNK={sum(1 for s in self.slots.values() if s['team'] not in ('A','B'))})")
+                self._freeze()
         else:
-            self._match(frame, tracks, video_frame)
+            if self._post_bench:
+                self._match_hungarian(frame, tracks, video_frame)
+                self._post_bench = False
+            else:
+                self._match(frame, tracks, video_frame)
 
         return dict(self.botsort_to_slot)
 
     def flush_stale_mappings(self, active_tids: set):
-        """Remove mappings for dead BoT-SORT IDs. Called after bench→play."""
         stale = [tid for tid in self.botsort_to_slot if tid not in active_tids]
         for tid in stale:
             del self.botsort_to_slot[tid]
         if stale:
-            print(f"[Registry] Flushed {len(stale)} stale mappings, "
-                  f"{len(self.botsort_to_slot)} live mappings remain")
+            print(f"[Registry] Flushed {len(stale)} stale, {len(self.botsort_to_slot)} remain")
+        self._post_bench = True  # next match uses Hungarian
 
     # ------------------------------------------------------------------
-    # Registration phase
+    # Registration — no filtering, register everything
     # ------------------------------------------------------------------
 
     def _register(self, frame: np.ndarray, tracks: List, video_frame: int):
-        """
-        Build roster. Each new BoT-SORT ID → new slot.
-        Referees (black/yellow kit) are skipped entirely.
-        """
-        for t in tracks:
-            if len(t) < 5:
-                continue
-            tid = int(t[4])
-
-            if tid in self.botsort_to_slot:
-                # Update existing slot appearance
-                slot_id = self.botsort_to_slot[tid]
-                crop = self._crop(frame, t)
-                if crop is not None:
-                    self.slots[slot_id]["hist"] = self._blend_hist(
-                        self.slots[slot_id]["hist"],
-                        self._color_hist(crop),
-                        alpha=0.7
-                    )
-            else:
-                crop = self._crop(frame, t)
-                if crop is None:
-                    continue
-                hist = self._color_hist(crop)
-                team = _detect_team(hist)
-
-                # Skip referees — they must not consume a player slot
-                if team == "REF":
-                    continue
-
-                if self.next_slot <= self.max_players:
-                    slot_id = self.next_slot
-                    self.next_slot += 1
-                    self.slots[slot_id] = {
-                        "hist": hist,
-                        "team": team,
-                        "first_seen": video_frame,
-                        "last_bbox": [float(t[0]), float(t[1]), float(t[2]), float(t[3])],
-                        "last_seen": video_frame,
-                    }
-                    self.botsort_to_slot[tid] = slot_id
-
-    # ------------------------------------------------------------------
-    # Matching phase (post-freeze)
-    # ------------------------------------------------------------------
-
-    def _match(self, frame: np.ndarray, tracks: List, video_frame: int):
-        """
-        After freeze: map every active BoT-SORT track to a permanent slot.
-
-        Rules:
-        - Known tid → keep its slot, update appearance
-        - Unknown tid → find best slot by color + team, exclude already-used slots
-        - Referees → skip (no slot assigned)
-        - One slot per active track (strict)
-        """
-        # Slots already claimed by known tracks this frame
-        used_slots: set = set()
-        for t in tracks:
-            if len(t) < 5:
-                continue
-            tid = int(t[4])
-            if tid in self.botsort_to_slot:
-                used_slots.add(self.botsort_to_slot[tid])
-
-        # Process all tracks
         for t in tracks:
             if len(t) < 5:
                 continue
@@ -196,46 +113,252 @@ class PlayerRegistry:
             if crop is None:
                 continue
             hist = self._color_hist(crop)
-            team = _detect_team(hist)
 
-            # Skip referees
-            if team == "REF":
+            if tid in self.botsort_to_slot:
+                slot_id = self.botsort_to_slot[tid]
+                self.slots[slot_id]["hist"] = self._blend_hist(
+                    self.slots[slot_id]["hist"], hist, alpha=0.7
+                )
+                self.slots[slot_id]["n_updates"] += 1
+            else:
+                if self.next_slot <= self.max_players:
+                    slot_id = self.next_slot
+                    self.next_slot += 1
+                    self.slots[slot_id] = {
+                        "hist": hist,
+                        "team": "UNK",
+                        "first_seen": video_frame,
+                        "last_seen": video_frame,
+                        "last_bbox": [float(t[0]), float(t[1]), float(t[2]), float(t[3])],
+                        "n_updates": 1,
+                    }
+                    self.botsort_to_slot[tid] = slot_id
+
+    # ------------------------------------------------------------------
+    # Freeze — cluster slots into 2 teams
+    # ------------------------------------------------------------------
+
+    def _freeze(self):
+        self.is_frozen = True
+        self._assign_teams()
+        team_a = sum(1 for s in self.slots.values() if s["team"] == "A")
+        team_b = sum(1 for s in self.slots.values() if s["team"] == "B")
+        ref = sum(1 for s in self.slots.values() if s["team"] == "REF")
+        print(f"[Registry] Frozen: {len(self.slots)} slots | "
+              f"A={team_a} B={team_b} REF={ref}")
+
+    def _assign_teams(self):
+        """
+        Cluster slots into 2 teams using K-means on HSV histograms.
+        Slots with very few updates (≤2) or very different from both
+        clusters are marked REF.
+        """
+        slot_ids = list(self.slots.keys())
+        if len(slot_ids) < 4:
+            return
+
+        hists = np.array([self.slots[sid]["hist"] for sid in slot_ids])
+
+        # K-means with 2 clusters (team A and team B)
+        # Initialize with the two most dissimilar histograms
+        n = len(hists)
+        dist_matrix = np.zeros((n, n))
+        for i in range(n):
+            for j in range(i + 1, n):
+                d = 1.0 - float(np.dot(hists[i], hists[j]))
+                dist_matrix[i, j] = d
+                dist_matrix[j, i] = d
+
+        # Find most dissimilar pair
+        idx = np.unravel_index(np.argmax(dist_matrix), dist_matrix.shape)
+        c0, c1 = hists[idx[0]].copy(), hists[idx[1]].copy()
+
+        # 5 iterations of K-means
+        labels = np.zeros(n, dtype=int)
+        for _ in range(5):
+            for i in range(n):
+                d0 = 1.0 - float(np.dot(hists[i], c0))
+                d1 = 1.0 - float(np.dot(hists[i], c1))
+                labels[i] = 0 if d0 < d1 else 1
+
+            # Update centroids
+            mask0 = labels == 0
+            mask1 = labels == 1
+            if mask0.sum() > 0:
+                c0 = hists[mask0].mean(axis=0)
+                norm = np.linalg.norm(c0)
+                if norm > 0:
+                    c0 /= norm
+            if mask1.sum() > 0:
+                c1 = hists[mask1].mean(axis=0)
+                norm = np.linalg.norm(c1)
+                if norm > 0:
+                    c1 /= norm
+
+        # Assign teams; outliers (low similarity to both centroids) = REF
+        for i, sid in enumerate(slot_ids):
+            sim0 = float(np.dot(hists[i], c0))
+            sim1 = float(np.dot(hists[i], c1))
+            best_sim = max(sim0, sim1)
+
+            # Low update count or poor fit to either cluster = likely referee
+            if self.slots[sid]["n_updates"] <= 2 or best_sim < 0.5:
+                self.slots[sid]["team"] = "REF"
+            elif labels[i] == 0:
+                self.slots[sid]["team"] = "A"
+            else:
+                self.slots[sid]["team"] = "B"
+
+    # ------------------------------------------------------------------
+    # Matching — greedy (normal play)
+    # ------------------------------------------------------------------
+
+    def _match(self, frame: np.ndarray, tracks: List, video_frame: int):
+        # Build reverse map: slot → tid (for active tracks only)
+        slot_to_tid: Dict[int, int] = {}
+        for t in tracks:
+            if len(t) < 5:
                 continue
+            tid = int(t[4])
+            if tid in self.botsort_to_slot:
+                slot_id = self.botsort_to_slot[tid]
+                slot_to_tid[slot_id] = tid
+
+        used_slots = set(slot_to_tid.keys())
+
+        for t in tracks:
+            if len(t) < 5:
+                continue
+            tid = int(t[4])
+
+            crop = self._crop(frame, t)
+            if crop is None:
+                continue
+            hist = self._color_hist(crop)
 
             if tid in self.botsort_to_slot:
                 slot_id = self.botsort_to_slot[tid]
                 slot = self.slots[slot_id]
-
-                # Team consistency check: if team flipped, force re-match
-                if slot["team"] in ("A", "B") and team in ("A", "B") and slot["team"] != team:
-                    # Team mismatch — this BoT-SORT ID got swapped to wrong player
-                    # Remove stale mapping and re-match below
-                    del self.botsort_to_slot[tid]
-                    used_slots.discard(slot_id)
-                else:
-                    # Good — update appearance
-                    slot["hist"] = self._blend_hist(slot["hist"], hist, alpha=0.85)
-                    slot["last_bbox"] = [float(t[0]), float(t[1]), float(t[2]), float(t[3])]
-                    slot["last_seen"] = video_frame
-                    continue
-
-            # Unknown or just de-mapped tid — find best slot
-            matched_slot = self._find_slot(hist, team, exclude_slots=used_slots, threshold=0.45)
-            if matched_slot is not None:
-                self.botsort_to_slot[tid] = matched_slot
-                used_slots.add(matched_slot)
-                self.slots[matched_slot]["last_seen"] = video_frame
+                # Update appearance
+                slot["hist"] = self._blend_hist(slot["hist"], hist, alpha=0.85)
+                slot["last_bbox"] = [float(t[0]), float(t[1]), float(t[2]), float(t[3])]
+                slot["last_seen"] = video_frame
+            else:
+                # New BoT-SORT ID — find best available slot
+                team = self._detect_team_from_hist(hist)
+                matched = self._find_slot(hist, team, exclude_slots=used_slots, threshold=0.45)
+                if matched is not None:
+                    self.botsort_to_slot[tid] = matched
+                    used_slots.add(matched)
+                    self.slots[matched]["last_seen"] = video_frame
 
     # ------------------------------------------------------------------
-    # Slot search
+    # Matching — Hungarian (after bench→play transition)
+    # ------------------------------------------------------------------
+
+    def _match_hungarian(self, frame: np.ndarray, tracks: List, video_frame: int):
+        """
+        Optimal assignment of all new tracks to all available slots.
+        Uses Hungarian algorithm on cosine distance matrix.
+        """
+        # Separate known and unknown tracks
+        unknown_tracks = []
+        used_slots = set()
+
+        for t in tracks:
+            if len(t) < 5:
+                continue
+            tid = int(t[4])
+            if tid in self.botsort_to_slot:
+                used_slots.add(self.botsort_to_slot[tid])
+                # Update appearance
+                crop = self._crop(frame, t)
+                if crop is not None:
+                    slot_id = self.botsort_to_slot[tid]
+                    hist = self._color_hist(crop)
+                    self.slots[slot_id]["hist"] = self._blend_hist(
+                        self.slots[slot_id]["hist"], hist, alpha=0.85
+                    )
+                    self.slots[slot_id]["last_seen"] = video_frame
+            else:
+                crop = self._crop(frame, t)
+                if crop is not None:
+                    hist = self._color_hist(crop)
+                    unknown_tracks.append((t, tid, hist))
+
+        if not unknown_tracks:
+            return
+
+        # Available slots (not currently used)
+        available = [(sid, data) for sid, data in self.slots.items()
+                     if sid not in used_slots and data["team"] != "REF"]
+
+        if not available:
+            return
+
+        # Build cost matrix: rows = unknown tracks, cols = available slots
+        n_tracks = len(unknown_tracks)
+        n_slots = len(available)
+        cost = np.ones((n_tracks, n_slots), dtype=float)  # 1.0 = max distance
+
+        for i, (t, tid, hist) in enumerate(unknown_tracks):
+            det_team = self._detect_team_from_hist(hist)
+            for j, (sid, data) in enumerate(available):
+                # Team gate
+                slot_team = data["team"]
+                if slot_team in ("A", "B") and det_team in ("A", "B") and slot_team != det_team:
+                    cost[i, j] = 1.0  # blocked
+                    continue
+                sim = float(np.dot(hist, data["hist"]))
+                cost[i, j] = 1.0 - sim
+
+        # Hungarian assignment
+        row_idx, col_idx = _hungarian(cost)
+
+        matched_count = 0
+        for r, c in zip(row_idx, col_idx):
+            if cost[r, c] < 0.55:  # similarity > 0.45
+                t, tid, hist = unknown_tracks[r]
+                sid = available[c][0]
+                self.botsort_to_slot[tid] = sid
+                used_slots.add(sid)
+                self.slots[sid]["last_seen"] = video_frame
+                matched_count += 1
+
+        print(f"[Registry] Hungarian: matched {matched_count}/{n_tracks} "
+              f"tracks to {n_slots} available slots")
+
+    # ------------------------------------------------------------------
+    # Team detection from accumulated histogram
+    # ------------------------------------------------------------------
+
+    def _detect_team_from_hist(self, hist: np.ndarray) -> str:
+        """
+        Quick team detection by comparing to cluster centroids.
+        Falls back to UNK if no clear match.
+        """
+        if not self.is_frozen:
+            return "UNK"
+
+        # Compare to all slots, find most similar, inherit its team
+        best_sim = 0.0
+        best_team = "UNK"
+        for data in self.slots.values():
+            if data["team"] == "REF":
+                continue
+            sim = float(np.dot(hist, data["hist"]))
+            if sim > best_sim:
+                best_sim = sim
+                best_team = data["team"]
+
+        return best_team if best_sim > 0.5 else "UNK"
+
+    # ------------------------------------------------------------------
+    # Slot search (greedy)
     # ------------------------------------------------------------------
 
     def _find_slot(self, hist: np.ndarray, team: str,
                    exclude_slots: set = None, threshold: float = 0.45) -> Optional[int]:
-        """
-        Best matching slot by cosine similarity + team filter.
-        A slot of team A never matches a detection of team B, and vice versa.
-        """
         exclude_slots = exclude_slots or set()
         best_score = threshold
         best_slot = None
@@ -243,9 +366,10 @@ class PlayerRegistry:
         for slot_id, data in self.slots.items():
             if slot_id in exclude_slots:
                 continue
+            if data["team"] == "REF":
+                continue
 
-            # Team gate: reject cross-team matches
-            slot_team = data.get("team", "UNK")
+            slot_team = data["team"]
             if slot_team in ("A", "B") and team in ("A", "B") and slot_team != team:
                 continue
 
@@ -261,14 +385,12 @@ class PlayerRegistry:
     # ------------------------------------------------------------------
 
     def _crop(self, frame: np.ndarray, t) -> Optional[np.ndarray]:
-        """Crop torso region (middle 50% vertically) from player bbox."""
         x1, y1, x2, y2 = int(t[0]), int(t[1]), int(t[2]), int(t[3])
         x1, y1 = max(0, x1), max(0, y1)
         x2, y2 = min(frame.shape[1], x2), min(frame.shape[0], y2)
         if x2 <= x1 + 5 or y2 <= y1 + 5:
             return None
         h = y2 - y1
-        # Take middle 50%: skip top 25% (head) and bottom 25% (legs/feet)
         y_start = y1 + h // 4
         y_end = y2 - h // 4
         if y_end <= y_start + 3:
@@ -277,7 +399,6 @@ class PlayerRegistry:
         return crop if crop.size > 0 else None
 
     def _color_hist(self, crop: np.ndarray) -> np.ndarray:
-        """Normalized HSV color histogram: 36 hue + 16 saturation bins."""
         hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
         h = cv2.calcHist([hsv], [0], None, [36], [0, 180]).flatten()
         s = cv2.calcHist([hsv], [1], None, [16], [0, 256]).flatten()
@@ -286,7 +407,6 @@ class PlayerRegistry:
         return hist / norm if norm > 0 else hist
 
     def _blend_hist(self, old: np.ndarray, new: np.ndarray, alpha: float) -> np.ndarray:
-        """Exponential moving average histogram blend."""
         blended = alpha * old + (1 - alpha) * new
         norm = np.linalg.norm(blended)
         return blended / norm if norm > 0 else blended
@@ -295,10 +415,6 @@ class PlayerRegistry:
 class VLMStateMachine:
     """
     Game state detection + permanent player registry.
-
-    - PLAY: tracker runs, registry maps BoT-SORT IDs → permanent slots
-    - BENCH_SHOT: tracker skipped (tracks not fed empty dets)
-    - bench→play: stale mappings flushed, new IDs re-matched
     """
 
     def __init__(self, device="cuda"):
@@ -311,7 +427,6 @@ class VLMStateMachine:
         print("[VLM] State machine + permanent player registry ready")
 
     def analyze(self, frame: np.ndarray, video_frame: int) -> GameState:
-        """Classify frame state every 10 frames."""
         self.frame_counter += 1
         if self.frame_counter % 10 != 0:
             return self.state
@@ -327,21 +442,18 @@ class VLMStateMachine:
         return self.state
 
     def check_bench_to_play(self) -> bool:
-        """Consume and return the bench→play transition flag."""
         if self._bench_to_play:
             self._bench_to_play = False
             return True
         return False
 
     def _classify(self, frame: np.ndarray) -> GameState:
-        """Green field ratio < 25% = bench/cutaway."""
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
         mask = cv2.inRange(hsv, np.array([35, 40, 40]), np.array([85, 255, 255]))
         green_ratio = mask.sum() / (frame.shape[0] * frame.shape[1] * 255)
         return GameState.BENCH_SHOT if green_ratio < 0.25 else GameState.PLAY
 
     def get_id_remap(self, frame: np.ndarray, tracks: List, video_frame: int) -> Dict[int, int]:
-        """Returns {botsort_tid: permanent_slot_id} for this frame."""
         if self.check_bench_to_play() and len(tracks) > 0:
             active_tids = set(int(t[4]) for t in tracks if len(t) >= 5)
             self.registry.flush_stale_mappings(active_tids)
