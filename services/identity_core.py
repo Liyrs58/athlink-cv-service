@@ -138,10 +138,11 @@ class IdentityCore:
     # Bench snapshot / revival (Priority D)
     # ------------------------------------------------------------------
 
-    def snapshot_active(self, frame_id: int) -> None:
+    def snapshot_active(self, frame_id: int) -> int:
         """
         Call when entering bench/freeze. Saves all active+dormant slot state
         so we can attempt strong revival on return-to-play.
+        Returns count of slots saved.
         """
         self._bench_snapshot = {}
         for s in self.slots:
@@ -151,7 +152,9 @@ class IdentityCore:
                     "position": s.last_position,
                     "last_seen": s.last_seen_frame,
                 }
-        print(f"[Identity] Snapshot: {len(self._bench_snapshot)} slots saved at frame {frame_id}")
+        saved = len(self._bench_snapshot)
+        print(f"[Identity] Snapshot: {saved} slots saved at frame {frame_id}")
+        return saved
 
     def revive_cost_matrix(
         self,

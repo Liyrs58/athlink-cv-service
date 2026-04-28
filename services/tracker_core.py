@@ -50,47 +50,66 @@ class TrackerCore:
             reid_weights=Path(reid_path),
             device=boxmot_device,
             half=True,
-            # --- Core association ---
-            match_thresh=0.65,         # IoU ≥ 0.35 (relaxed from 0.7 for better persistence)
             asso_func="iou",
             per_class=False,
-            # --- Track lifecycle ---
-            track_high_thresh=0.45,    # slightly relaxed for more confirmed tracks
-            track_low_thresh=0.1,      # BYTE low-conf recovery
-            new_track_thresh=0.55,     # spawn slightly easier
-            track_buffer=150,          # 6s @ 25fps — survive longer pans
-            max_age=150,               # match track_buffer
+            max_age=150,
             det_thresh=0.3,
-            # --- ReID ---
-            appearance_thresh=0.20,    # more permissive ReID matching
             proximity_thresh=0.5,
-            # --- Camera motion ---
             cmc_method="ecc",
+            # Target params (Step A: correct init values)
+            match_thresh=0.30,
+            appearance_thresh=0.55,
+            new_track_thresh=0.40,
+            track_high_thresh=0.50,
+            track_low_thresh=0.10,
+            track_buffer=150,
             frame_rate=25,
         )
+
+        # Step A: patch runtime object for all candidate nested paths
+        self._patch_botsort_params()
 
         # VLM: game state only (scene detection)
         self.vlm = VLMStateMachine(device=device)
         # Identity core: deterministic ID assignment via ReID + position
         self.identity = IdentityCore()
         self.id_remap = {}  # botsort_tid -> int PID
-        self._last_tracks = []
-        self._prev_state = None
-        self._was_frozen = False
+        self._snapshot_taken = False
         self._needs_revival = False
 
-        # Priority B — pre-cutaway collapse guard
-        self._track_history = []   # rolling track counts (last 20 frames)
-        self._baseline_tracks = 0
-        self._suspend_birth = False
-
-        # Priority C — log live BoTSORT params once at startup
-        self._log_botsort_params()
+        # Step B+C: scene state tracking
+        self._scene_state = "play"
+        self._active_baseline = 0
+        self._track_history = []
+        self._transition_frame = -1
 
         self.frame_idx = 0
         self.results = []
 
+        # Log initial params
+        self._log_botsort_params()
+
+    def _patch_botsort_params(self):
+        """Step A: Patch actual runtime object used during update()."""
+        params = {
+            'match_thresh': 0.30,
+            'appearance_thresh': 0.55,
+            'new_track_thresh': 0.40,
+            'track_high_thresh': 0.50,
+            'track_low_thresh': 0.10,
+            'track_buffer': 150,
+            'frame_rate': 25,
+        }
+        for candidate in [self.tracker, getattr(self.tracker, 'tracker', None),
+                         getattr(self.tracker, 'args', None)]:
+            if candidate is None:
+                continue
+            for key, val in params.items():
+                if hasattr(candidate, key):
+                    setattr(candidate, key, val)
+
     def _log_botsort_params(self):
+        """Step C: Log params from actual matcher object."""
         t = self.tracker
         params = {k: getattr(t, k, None) for k in [
             'match_thresh', 'appearance_thresh', 'new_track_thresh',
@@ -170,26 +189,50 @@ class TrackerCore:
 
     def process_frame(self, frame, video_frame, dets, save=True):
         """
-        Priority A: invalid-scene gating — freeze identity on bench, age only
-        Priority B: collapse guard — suspend track birth on steep pre-cut decay
-        Priority C: live param logging at init
-        Priority D: snapshot on freeze entry, revival-first on return-to-play
+        Step A: BoTSORT runtime params patched at init + log verified
+        Step B: Early snapshot via collapse guard (before hard freeze)
+        Step C: Log live params
+        Step D+E: Snapshot on entry, revival-first on return
         """
         state = self.vlm.analyze(frame, video_frame)
-        transitioning_to_freeze = state.is_freeze() and not self._was_frozen
-        transitioning_to_play = state.is_play() and self._was_frozen
+        is_freeze = state.is_freeze()
+        is_play = state.is_play()
 
-        # Priority A: invalid scene — only age slots, no association
-        if state.is_freeze():
-            if transitioning_to_freeze:
-                # Priority D: snapshot before freeze
-                self.identity.snapshot_active(video_frame)
-                self._needs_revival = True
-                print(f"[TrackerCore] Frame {video_frame}: entering freeze → snapshot taken")
-            # Age slots without new assignments
+        # Run BotSort (always except hard freeze)
+        if not is_freeze:
+            tracks = self.track(frame, dets)
+            n_tracks = len(tracks)
+        else:
+            tracks = []
+            n_tracks = 0
+
+        # Step B: Collapse guard — detect pre-cutaway state BEFORE hard freeze
+        if is_play:
+            self._track_history.append(n_tracks)
+            if len(self._track_history) > 20:
+                self._track_history.pop(0)
+
+            # Establish baseline (first 30 valid frames)
+            if len(self._track_history) == 30 and self._active_baseline == 0:
+                self._active_baseline = max(1, sum(self._track_history) / 30)
+
+            # Detect collapse
+            if self._active_baseline > 0 and len(self._track_history) >= 10:
+                recent_mean = sum(self._track_history[-10:]) / 10
+                active_drop = recent_mean / max(self._active_baseline, 1)
+
+                # Step D: Early snapshot if collapse detected (not waiting for hard freeze)
+                if active_drop <= 0.70 and not self._snapshot_taken:
+                    saved = self.identity.snapshot_active(video_frame)
+                    self._snapshot_taken = True
+                    self._transition_frame = video_frame
+                    print(f"[Guard] Frame {video_frame}: active_drop={active_drop:.2f} "
+                          f"→ early snapshot ({saved} slots)")
+
+        # Step A: hard freeze scene — only age, no association
+        if is_freeze:
             self.identity.begin_frame(video_frame)
             self.identity.end_frame(video_frame)
-            self._was_frozen = True
             if save:
                 self.results.append({
                     "frameIndex": int(video_frame),
@@ -201,36 +244,29 @@ class TrackerCore:
                 })
             return 0
 
-        # Run BotSort
-        tracks = self.track(frame, dets)
-        n_tracks = len(tracks)
-
-        # Priority B: update collapse guard
-        self._update_collapse_guard(n_tracks)
-
+        # Step E: Recovery on first valid play after freeze
         embed_map = self._extract_embeds()
         track_objs, positions, embeddings = self._build_track_inputs(tracks, embed_map)
 
-        if state.is_play() and len(track_objs) > 0:
+        if is_play and len(track_objs) > 0:
             self.identity.begin_frame(video_frame)
 
-            # Priority D: revival-first on return from bench
-            if transitioning_to_play and self._needs_revival:
+            # First match: recovery-first if snapshot exists
+            if self._snapshot_taken and not self._needs_revival:
                 revived = self.identity.revive_cost_matrix(track_objs, embeddings, positions)
-                # Seed id_remap with revival matches before normal assignment
                 self.id_remap = {tid: int(pid[1:]) for tid, pid in revived.items()}
-                self._needs_revival = False
-                print(f"[TrackerCore] Frame {video_frame}: return from freeze, {len(revived)} revived")
+                self._needs_revival = True  # only try once
+                n_revived = len(revived)
+                print(f"[Recovery] Frame {video_frame}: {n_revived} revived from snapshot")
 
+            # Then normal assignment
             tid_to_pid = self.identity.assign_tracks(track_objs, embeddings, positions)
             self.identity.end_frame(video_frame)
             self.identity.maybe_log(detections_count=len(dets), tracks_count=n_tracks)
 
-            # Merge: assign_tracks wins over revival for any overlap
+            # Merge: assign_tracks wins
             for tid, pid in tid_to_pid.items():
                 self.id_remap[tid] = int(pid[1:])
-
-        self._was_frozen = False
 
         if save:
             players = []
