@@ -2,12 +2,12 @@ import { useRef, useMemo, useEffect } from "react";
 import { useFrame, useThree } from "@react-three/fiber";
 import { useGLTF, useAnimations, Html } from "@react-three/drei";
 import { SkeletonUtils } from "three-stdlib";
-import { staticFile } from "remotion";
 import * as THREE from "three";
 import type { TrackTrajectory, BallTrajectory, MocapLabel } from "../data/types";
 import { PLAYER_HEIGHT, pitchToWorld } from "./constants";
 
-const AVATAR_URL = staticFile("/avatars/player.glb");
+// Use a plain public path — staticFile() is Remotion-only and crashes in Next.js
+const AVATAR_URL = "/avatars/player.glb";
 try { useGLTF.preload(AVATAR_URL); } catch { /* noop */ }
 
 // ── Constants ──

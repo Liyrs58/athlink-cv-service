@@ -1,5 +1,5 @@
 import { Environment, SoftShadows, Float, PerspectiveCamera, OrbitControls, Sky, ContactShadows } from "@react-three/drei";
-import { useState, useCallback, useRef, useMemo } from "react";
+import { useState, useCallback, useRef, useMemo, useEffect } from "react";
 import * as THREE from "three";
 import { useFrame, useThree } from "@react-three/fiber";
 import { EffectComposer, ChromaticAberration, Vignette } from "@react-three/postprocessing";
@@ -46,10 +46,13 @@ export const Stage: React.FC<Props> = ({ table, frame, videoFps }) => {
   const mustTeleport = drift > 100 || frameJump > 2;
   lastAnchorFrame.current = safeFrame;
 
-  if (safeFrame === 200 && !isDecisionMode && !simulatedTarget) {
-    setIsDecisionMode(true);
-    decisionFrame.current = 200;
-  }
+  // Decision mode trigger moved to useEffect — setState during render is illegal
+  useEffect(() => {
+    if (safeFrame === 200 && !isDecisionMode && !simulatedTarget) {
+      setIsDecisionMode(true);
+      decisionFrame.current = 200;
+    }
+  }, [safeFrame, isDecisionMode, simulatedTarget]);
 
   const handlePitchClick = useCallback((x: number, z: number) => {
     if (isDecisionMode) {

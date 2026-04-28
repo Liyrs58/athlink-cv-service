@@ -48,24 +48,42 @@ export function normalize(raw: RawExport): ReplayTable {
         const x = new Float32Array(frameCount);
         const y = new Float32Array(frameCount);
         const heading = new Float32Array(frameCount);
+        const speedKmh = new Float32Array(frameCount);
+        const vectorX = new Float32Array(frameCount);
+        const vectorY = new Float32Array(frameCount);
         x.fill(NaN);
         y.fill(NaN);
         heading.fill(NaN);
+        speedKmh.fill(NaN);
+        vectorX.fill(NaN);
+        vectorY.fill(NaN);
         trackMap.set(p.trackId, {
           trackId: p.trackId,
           teamId: p.teamId,
           x,
           y,
           heading,
+          speedKmh,
+          vectorX,
+          vectorY,
+          mocapState: new Array(frameCount).fill("idle"),
         });
       }
       const trk = trackMap.get(p.trackId)!;
-      if (p.teamId !== -1) trk.teamId = p.teamId; // take first non-unknown
+      if (p.teamId !== -1) trk.teamId = p.teamId;
       const fi = f.frameIndex;
       if (fi >= 0 && fi < frameCount && p.pitchX !== null && p.pitchY !== null) {
         trk.x[fi] = p.pitchX;
         trk.y[fi] = p.pitchY;
         trk.heading[fi] = p.heading ?? NaN;
+        trk.speedKmh[fi] = p.speed_kmh ?? NaN;
+        if (p.vector) {
+          trk.vectorX[fi] = p.vector[0];
+          trk.vectorY[fi] = p.vector[1];
+          // Derive mocap state from speed
+          const spd = p.speed_kmh ?? 0;
+          trk.mocapState[fi] = spd > 20 ? "sprint" : spd > 8 ? "run" : "idle";
+        }
       }
     }
   }
@@ -89,6 +107,18 @@ export function normalize(raw: RawExport): ReplayTable {
     (a, b) => a.trackId - b.trackId
   );
 
+  // Build timestampMs from frame data if available
+  let timestampMs: Float64Array | null = null;
+  if (raw.frames.length > 0 && raw.frames[0].timestampSeconds !== undefined) {
+    timestampMs = new Float64Array(frameCount);
+    timestampMs.fill(NaN);
+    for (const f of raw.frames) {
+      if (f.frameIndex >= 0 && f.frameIndex < frameCount) {
+        timestampMs[f.frameIndex] = f.timestampSeconds * 1000;
+      }
+    }
+  }
+
   return {
     jobId: raw.jobId,
     fps,
@@ -98,6 +128,7 @@ export function normalize(raw: RawExport): ReplayTable {
     team1Color: raw.teams?.team1?.color ?? "#FF3200",
     tracks,
     ball,
+    timestampMs,
   };
 }
 
