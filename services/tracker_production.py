@@ -181,7 +181,7 @@ class ProductionTracker:
 
     def recover_lost_player(self, embedding, used_ids):
         best_id = None
-        best_sim = 0.55
+        best_sim = 0.25
 
         for lost_entry in self.lost_buffer:
             if lost_entry['id'] in used_ids:
@@ -272,7 +272,11 @@ class ProductionTracker:
 
         similarity = self.compute_similarity_matrix(embeddings, self.players)
         assignments = self.hungarian_match(similarity)
-        assignments = self.uncertainty_lock(similarity, assignments, frame_id)
+        # Keep assignments where similarity >= 0.1 OR player has no embedding yet (allow re-registration)
+        assignments = [
+            (r, c) for r, c in assignments
+            if similarity[r, c] >= 0.1 or self.players[c].embedding is None
+        ]
         track_to_player = self.update_players(assignments, embeddings, valid_dets, frame_id)
 
         # END FRAME: update slot states
