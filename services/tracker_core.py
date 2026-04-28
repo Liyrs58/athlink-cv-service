@@ -49,25 +49,25 @@ class TrackerCore:
             device=boxmot_device,
             half=True,
             # --- Core association ---
-            match_thresh=0.7,          # IoU ≥ 0.30 required (1 - 0.7 = 0.30)
-            asso_func="iou",           # simple IoU — ciou fragments on pan
-            per_class=False,           # single pool — per_class=True was doubling IDs
+            match_thresh=0.65,         # IoU ≥ 0.35 (relaxed from 0.7 for better persistence)
+            asso_func="iou",
+            per_class=False,
             # --- Track lifecycle ---
-            track_high_thresh=0.5,     # confident detections
+            track_high_thresh=0.45,    # slightly relaxed for more confirmed tracks
             track_low_thresh=0.1,      # BYTE low-conf recovery
-            new_track_thresh=0.6,      # spawn threshold
-            track_buffer=90,           # 3.6s @ 25fps — survive pans
-            max_age=90,                # match track_buffer
+            new_track_thresh=0.55,     # spawn slightly easier
+            track_buffer=150,          # 6s @ 25fps — survive longer pans
+            max_age=150,               # match track_buffer
             det_thresh=0.3,
             # --- ReID ---
-            appearance_thresh=0.25,    # allow ReID to bridge motion gaps
+            appearance_thresh=0.20,    # more permissive ReID matching
             proximity_thresh=0.5,
             # --- Camera motion ---
-            cmc_method="ecc",          # compensates camera pans
+            cmc_method="ecc",
             frame_rate=25,
         )
 
-        # VLM: kit-color roster for post-cut ID remapping
+        # VLM: game state + permanent player registry
         self.vlm = VLMStateMachine(device=device)
         self.id_remap = {}
         self._last_tracks = []
@@ -100,21 +100,30 @@ class TrackerCore:
         """
         Track + permanent player ID assignment via PlayerRegistry.
 
-        Pipeline:
-        1. Detect game state (PLAY / BENCH_SHOT)
-        2. Run BoT-SORT
-        3. During PLAY: registry maps every BoT-SORT tid → permanent slot ID
-           - First 30 frames: builds roster
-           - After 30 frames: matches new tids to existing slots by kit color
-        4. Output uses permanent slot IDs — stable across pans/cuts
+        Key behavior:
+        - PLAY: run BoT-SORT + registry remapping
+        - BENCH_SHOT: skip tracker entirely (don't feed empty dets that kill tracks)
+        - bench→play: registry flushes stale mappings, re-matches new IDs to slots
         """
         state = self.vlm.analyze(frame, video_frame)
 
-        # Run BoT-SORT tracker
+        # During bench shots: do NOT run tracker — this prevents tracks from dying
+        if state == GameState.BENCH_SHOT:
+            if save:
+                self.results.append({
+                    "frameIndex": int(video_frame),
+                    "players": [],
+                    "detection_count": 0,
+                    "track_count": 0,
+                    "gameState": state.value,
+                })
+            return 0
+
+        # PLAY state: run tracker normally
         tracks = self.track(frame, dets)
 
-        # Get permanent ID remap from registry (only during play)
-        if state == GameState.PLAY and len(tracks) > 0:
+        # Get permanent ID remap from registry
+        if len(tracks) > 0:
             self.id_remap = self.vlm.get_id_remap(frame, tracks, video_frame)
 
         if save:
