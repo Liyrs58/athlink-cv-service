@@ -156,7 +156,9 @@ class ProductionTracker:
 
             margin = best - second_best
 
-            threshold = 0.05 if frame_id >= 30 else 0.02
+            # Bootstrap phase: strict margins to lock in initial assignments
+            # Normal phase: relax threshold to allow ongoing matching
+            threshold = 0.02 if frame_id < 30 else 0.01
 
             if best < 0.3:
                 continue
