@@ -1,5 +1,6 @@
 import cv2
 import numpy as np
+from collections import deque
 from enum import Enum
 from typing import Dict, List, Optional
 
@@ -24,34 +25,41 @@ def _hungarian(cost: np.ndarray):
     return np.array(rows, dtype=int), np.array(cols, dtype=int)
 
 
+REFEREE_CLASS = 3
+
+
 class PlayerRegistry:
     """
-    Permanent player roster.
+    Permanent player roster with ReID embedding-based identity matching.
 
-    Identity logic:
-    - COLOR → determines TEAM (A vs B), not individual player
-    - POSITION → determines individual player within team
-    - YOLO CLASS → filters referees (class 3)
+    Identity signals:
+    - ReID embeddings (from BoT-SORT's OSNet) → individual player identity
+    - Color histograms → team classification (A vs B) only
+    - YOLO class → referee exclusion (class 3)
 
     Registration (first 30 frames):
-      Every BoT-SORT track gets a slot. Tracks with YOLO class=3 (referee)
-      are excluded. After freeze, K-means clusters slots into 2 teams.
+      Every non-referee BoT-SORT track gets a permanent slot.
+      Embeddings and color histograms are accumulated.
 
-    Matching (post-freeze, normal play):
-      Known BoT-SORT IDs keep their slot. New IDs are matched using
-      Hungarian on SPATIAL distance within the SAME TEAM. Color is only
-      used to determine team membership.
+    Freeze:
+      K-means on color histograms → team A/B labels.
+      Embedding banks are ready for matching.
 
-    Post-bench recovery:
-      Hungarian on color similarity (positions have reset).
+    Normal play (post-freeze):
+      Known tracks keep their slot. New tracks matched via Hungarian
+      on ReID embedding cosine distance, team-gated, strict 1:1.
+
+    Post-bench:
+      All mappings flushed. Hungarian on ReID embeddings to re-match
+      new BoT-SORT IDs to the same permanent player slots.
     """
-
-    REFEREE_CLASS = 3
 
     def __init__(self, max_players=30):
         self.max_players = max_players
-        self.slots: Dict[int, dict] = {}
-        self.botsort_to_slot: Dict[int, int] = {}
+        self.slots: Dict[int, dict] = {}              # slot_id → metadata
+        self.slot_embeddings: Dict[int, deque] = {}    # slot_id → deque of ReID vectors
+        self.slot_mean_embed: Dict[int, np.ndarray] = {}  # slot_id → L2-norm mean
+        self.botsort_to_slot: Dict[int, int] = {}      # botsort_tid → slot_id
         self.next_slot = 1
         self.is_frozen = False
         self._frames_seen = 0
@@ -62,22 +70,26 @@ class PlayerRegistry:
     # Public
     # ------------------------------------------------------------------
 
-    def update(self, frame: np.ndarray, tracks: List, video_frame: int) -> Dict[int, int]:
+    def update(self, frame: np.ndarray, tracks: List, video_frame: int,
+               embed_map: Dict[int, np.ndarray] = None) -> Dict[int, int]:
+        if embed_map is None:
+            embed_map = {}
+
         if len(tracks) == 0:
             return dict(self.botsort_to_slot)
 
         self._frames_seen += 1
 
         if not self.is_frozen:
-            self._register(frame, tracks, video_frame)
+            self._register(frame, tracks, video_frame, embed_map)
             if self._frames_seen >= self._registration_frames:
                 self._freeze()
         else:
             if self._post_bench:
-                self._match_post_bench(frame, tracks, video_frame)
+                self._match_post_bench(frame, tracks, video_frame, embed_map)
                 self._post_bench = False
             else:
-                self._match_spatial(frame, tracks, video_frame)
+                self._match_reid(frame, tracks, video_frame, embed_map)
 
         return dict(self.botsort_to_slot)
 
@@ -90,52 +102,57 @@ class PlayerRegistry:
         self._post_bench = True
 
     # ------------------------------------------------------------------
-    # Registration
+    # Registration (first 30 frames)
     # ------------------------------------------------------------------
 
-    def _register(self, frame: np.ndarray, tracks: List, video_frame: int):
+    def _register(self, frame: np.ndarray, tracks: List, video_frame: int,
+                  embed_map: Dict[int, np.ndarray]):
         for t in tracks:
             if len(t) < 7:
                 continue
             tid = int(t[4])
             cls = int(t[6])
 
-            # Skip referees by YOLO class
-            if cls == self.REFEREE_CLASS:
+            # Skip referees
+            if cls == REFEREE_CLASS:
                 continue
-
-            bbox = [float(t[0]), float(t[1]), float(t[2]), float(t[3])]
-            cx = (bbox[0] + bbox[2]) / 2
-            cy = (bbox[1] + bbox[3]) / 2
-
-            crop = self._crop(frame, t)
-            if crop is None:
-                continue
-            hist = self._color_hist(crop)
 
             if tid in self.botsort_to_slot:
+                # Update existing slot
                 slot_id = self.botsort_to_slot[tid]
-                s = self.slots[slot_id]
-                s["hist"] = self._blend_hist(s["hist"], hist, alpha=0.7)
-                s["last_cx"] = cx
-                s["last_cy"] = cy
-                s["last_bbox"] = bbox
-                s["n_updates"] += 1
+                crop = self._crop(frame, t)
+                if crop is not None:
+                    self.slots[slot_id]["hist"] = self._blend_hist(
+                        self.slots[slot_id]["hist"],
+                        self._color_hist(crop), alpha=0.7
+                    )
+                    self.slots[slot_id]["n_updates"] += 1
+                # Update embedding bank
+                if tid in embed_map:
+                    self._update_slot_embedding(slot_id, embed_map[tid])
             else:
+                # New track → new slot
+                crop = self._crop(frame, t)
+                if crop is None:
+                    continue
+                hist = self._color_hist(crop)
+
                 if self.next_slot <= self.max_players:
                     slot_id = self.next_slot
                     self.next_slot += 1
+                    bbox = [float(t[0]), float(t[1]), float(t[2]), float(t[3])]
                     self.slots[slot_id] = {
                         "hist": hist,
                         "team": "UNK",
                         "first_seen": video_frame,
                         "last_seen": video_frame,
                         "last_bbox": bbox,
-                        "last_cx": cx,
-                        "last_cy": cy,
                         "n_updates": 1,
                     }
                     self.botsort_to_slot[tid] = slot_id
+                    # Store initial embedding
+                    if tid in embed_map:
+                        self._update_slot_embedding(slot_id, embed_map[tid])
 
     # ------------------------------------------------------------------
     # Freeze + team clustering
@@ -146,10 +163,12 @@ class PlayerRegistry:
         self._assign_teams()
         ta = sum(1 for s in self.slots.values() if s["team"] == "A")
         tb = sum(1 for s in self.slots.values() if s["team"] == "B")
-        print(f"[Registry] Frozen: {len(self.slots)} slots | A={ta} B={tb}")
+        n_with_embed = sum(1 for sid in self.slots if sid in self.slot_mean_embed)
+        print(f"[Registry] Frozen: {len(self.slots)} slots | A={ta} B={tb} | "
+              f"{n_with_embed} with ReID embeddings")
 
     def _assign_teams(self):
-        """K-means (k=2) on accumulated color histograms."""
+        """K-means (k=2) on color histograms for team classification."""
         sids = list(self.slots.keys())
         if len(sids) < 4:
             return
@@ -157,7 +176,7 @@ class PlayerRegistry:
         hists = np.array([self.slots[s]["hist"] for s in sids])
         n = len(hists)
 
-        # Pairwise cosine distance
+        # Pairwise cosine distance → find most dissimilar pair as seeds
         dist = np.zeros((n, n))
         for i in range(n):
             for j in range(i + 1, n):
@@ -165,7 +184,6 @@ class PlayerRegistry:
                 dist[i, j] = d
                 dist[j, i] = d
 
-        # Init: most dissimilar pair
         idx = np.unravel_index(np.argmax(dist), dist.shape)
         c0, c1 = hists[idx[0]].copy(), hists[idx[1]].copy()
 
@@ -188,185 +206,193 @@ class PlayerRegistry:
         for i, sid in enumerate(sids):
             self.slots[sid]["team"] = "A" if labels[i] == 0 else "B"
 
-        # Store centroids for runtime team detection
         self._centroid_a = c0
         self._centroid_b = c1
 
     # ------------------------------------------------------------------
-    # Matching — spatial (normal play)
+    # Normal play matching (ReID embedding-based)
     # ------------------------------------------------------------------
 
-    def _match_spatial(self, frame: np.ndarray, tracks: List, video_frame: int):
+    def _match_reid(self, frame: np.ndarray, tracks: List, video_frame: int,
+                    embed_map: Dict[int, np.ndarray]):
         """
-        Known tracks: update position + appearance.
-        Unknown tracks: Hungarian on spatial distance, constrained by team.
-
-        This is the key insight: within the same team, players are distinguished
-        by POSITION, not color (all same-team players look alike in torso crops).
+        Known tracks → keep slot, update embedding bank.
+        New tracks → Hungarian on ReID cosine distance, team-gated, strict 1:1.
         """
         used_slots: set = set()
         unknown = []
 
+        # Pass 1: known tracks keep their slot
         for t in tracks:
             if len(t) < 7:
                 continue
             tid = int(t[4])
             cls = int(t[6])
-
-            if cls == self.REFEREE_CLASS:
+            if cls == REFEREE_CLASS:
                 continue
-
-            bbox = [float(t[0]), float(t[1]), float(t[2]), float(t[3])]
-            cx = (bbox[0] + bbox[2]) / 2
-            cy = (bbox[1] + bbox[3]) / 2
 
             if tid in self.botsort_to_slot:
                 slot_id = self.botsort_to_slot[tid]
-                s = self.slots[slot_id]
-                # Update position + appearance
-                crop = self._crop(frame, t)
-                if crop is not None:
-                    hist = self._color_hist(crop)
-                    s["hist"] = self._blend_hist(s["hist"], hist, alpha=0.85)
-                s["last_cx"] = cx
-                s["last_cy"] = cy
-                s["last_bbox"] = bbox
-                s["last_seen"] = video_frame
-                used_slots.add(slot_id)
-            else:
-                crop = self._crop(frame, t)
-                if crop is not None:
-                    hist = self._color_hist(crop)
-                    team = self._detect_team(hist)
-                    unknown.append((t, tid, cx, cy, hist, team))
 
-        if not unknown:
-            return
-
-        # Available slots (not currently used by active tracks)
-        available = [(sid, self.slots[sid]) for sid in self.slots
-                     if sid not in used_slots]
-        if not available:
-            return
-
-        # Build cost matrix: spatial distance, blocked by team mismatch
-        n_t = len(unknown)
-        n_s = len(available)
-        cost = np.full((n_t, n_s), 1e6)
-
-        for i, (t, tid, cx, cy, hist, team) in enumerate(unknown):
-            for j, (sid, slot) in enumerate(available):
-                # Team gate
-                st = slot["team"]
-                if st in ("A", "B") and team in ("A", "B") and st != team:
+                # Check for slot collision (two tids claiming same slot)
+                if slot_id in used_slots:
+                    # Collision: evict this tid, let it re-match as unknown
+                    del self.botsort_to_slot[tid]
+                    if tid in embed_map:
+                        team = self._detect_team_from_hist(
+                            self._color_hist(self._crop(frame, t)) if self._crop(frame, t) is not None
+                            else np.zeros(52))
+                        unknown.append((t, tid, embed_map.get(tid), team))
                     continue
 
-                # Spatial distance (pixels)
-                dx = cx - slot["last_cx"]
-                dy = cy - slot["last_cy"]
-                dist = np.sqrt(dx * dx + dy * dy)
+                used_slots.add(slot_id)
 
-                # Also check color similarity as tiebreaker
-                color_sim = float(np.dot(hist, slot["hist"]))
+                # Update embedding bank
+                if tid in embed_map:
+                    self._update_slot_embedding(slot_id, embed_map[tid])
 
-                # Combined: spatial distance penalized if color is bad
-                # Max reasonable movement between frames: ~200px
-                if dist < 300 and color_sim > 0.3:
-                    cost[i, j] = dist * (2.0 - color_sim)  # lower color_sim = higher cost
-
-        rows, cols = _hungarian(cost)
-        for r, c in zip(rows, cols):
-            if cost[r, c] < 500:  # reasonable spatial distance
-                _, tid, cx, cy, hist, team = unknown[r]
-                sid = available[c][0]
-                self.botsort_to_slot[tid] = sid
-                used_slots.add(sid)
-                self.slots[sid]["last_cx"] = cx
-                self.slots[sid]["last_cy"] = cy
-                self.slots[sid]["last_seen"] = video_frame
-
-    # ------------------------------------------------------------------
-    # Matching — post-bench (color-based, positions have reset)
-    # ------------------------------------------------------------------
-
-    def _match_post_bench(self, frame: np.ndarray, tracks: List, video_frame: int):
-        """After bench cut, positions are meaningless. Use color + Hungarian."""
-        unknown = []
-        used_slots: set = set()
-
-        for t in tracks:
-            if len(t) < 7:
-                continue
-            tid = int(t[4])
-            cls = int(t[6])
-            if cls == self.REFEREE_CLASS:
-                continue
-
-            bbox = [float(t[0]), float(t[1]), float(t[2]), float(t[3])]
-            cx = (bbox[0] + bbox[2]) / 2
-            cy = (bbox[1] + bbox[3]) / 2
-
-            if tid in self.botsort_to_slot:
-                used_slots.add(self.botsort_to_slot[tid])
+                # Update color histogram + position
                 crop = self._crop(frame, t)
                 if crop is not None:
-                    slot_id = self.botsort_to_slot[tid]
                     hist = self._color_hist(crop)
                     self.slots[slot_id]["hist"] = self._blend_hist(
-                        self.slots[slot_id]["hist"], hist, alpha=0.85
-                    )
-                    self.slots[slot_id]["last_cx"] = cx
-                    self.slots[slot_id]["last_cy"] = cy
-                    self.slots[slot_id]["last_seen"] = video_frame
+                        self.slots[slot_id]["hist"], hist, alpha=0.85)
+                self.slots[slot_id]["last_bbox"] = [float(t[0]), float(t[1]), float(t[2]), float(t[3])]
+                self.slots[slot_id]["last_seen"] = video_frame
             else:
+                # Unknown track — collect for Hungarian matching
+                if cls == REFEREE_CLASS:
+                    continue
                 crop = self._crop(frame, t)
+                team = "UNK"
                 if crop is not None:
                     hist = self._color_hist(crop)
-                    team = self._detect_team(hist)
-                    unknown.append((t, tid, cx, cy, hist, team))
+                    team = self._detect_team_from_hist(hist)
+                unknown.append((t, tid, embed_map.get(tid), team))
 
         if not unknown:
             return
 
+        # Pass 2: Hungarian on ReID embeddings for unknown tracks
         available = [(sid, self.slots[sid]) for sid in self.slots
                      if sid not in used_slots]
         if not available:
             return
 
-        # Color-based cost matrix with team gating
         n_t = len(unknown)
         n_s = len(available)
         cost = np.ones((n_t, n_s))
 
-        for i, (t, tid, cx, cy, hist, team) in enumerate(unknown):
+        for i, (t, tid, emb, team) in enumerate(unknown):
+            for j, (sid, slot) in enumerate(available):
+                # Team gate
+                st = slot["team"]
+                if st in ("A", "B") and team in ("A", "B") and st != team:
+                    cost[i, j] = 1.0
+                    continue
+
+                # ReID embedding distance (primary signal)
+                if emb is not None and sid in self.slot_mean_embed:
+                    cost[i, j] = 1.0 - float(np.dot(emb, self.slot_mean_embed[sid]))
+                else:
+                    # Fallback: color histogram similarity
+                    crop = self._crop(frame, t)
+                    if crop is not None:
+                        hist = self._color_hist(crop)
+                        cost[i, j] = 1.0 - float(np.dot(hist, slot["hist"]))
+
+        if len(cost) == 0:
+            return
+
+        rows, cols = _hungarian(cost)
+        for r, c in zip(rows, cols):
+            if cost[r, c] < 0.5:  # cosine similarity > 0.5
+                _, tid, emb, team = unknown[r]
+                sid = available[c][0]
+                self.botsort_to_slot[tid] = sid
+                used_slots.add(sid)
+                self.slots[sid]["last_seen"] = video_frame
+                if emb is not None:
+                    self._update_slot_embedding(sid, emb)
+
+    # ------------------------------------------------------------------
+    # Post-bench recovery (ReID embedding-based)
+    # ------------------------------------------------------------------
+
+    def _match_post_bench(self, frame: np.ndarray, tracks: List, video_frame: int,
+                          embed_map: Dict[int, np.ndarray]):
+        """All mappings flushed. Re-match all tracks to slots via ReID embeddings."""
+        unknown = []
+        used_slots: set = set()
+
+        # Keep any surviving mappings
+        for t in tracks:
+            if len(t) < 7:
+                continue
+            tid = int(t[4])
+            cls = int(t[6])
+            if cls == REFEREE_CLASS:
+                continue
+
+            if tid in self.botsort_to_slot:
+                used_slots.add(self.botsort_to_slot[tid])
+                if tid in embed_map:
+                    self._update_slot_embedding(self.botsort_to_slot[tid], embed_map[tid])
+            else:
+                crop = self._crop(frame, t)
+                team = "UNK"
+                if crop is not None:
+                    hist = self._color_hist(crop)
+                    team = self._detect_team_from_hist(hist)
+                unknown.append((t, tid, embed_map.get(tid), team))
+
+        if not unknown:
+            return
+
+        available = [(sid, self.slots[sid]) for sid in self.slots
+                     if sid not in used_slots]
+        if not available:
+            return
+
+        n_t = len(unknown)
+        n_s = len(available)
+        cost = np.ones((n_t, n_s))
+
+        for i, (t, tid, emb, team) in enumerate(unknown):
             for j, (sid, slot) in enumerate(available):
                 st = slot["team"]
                 if st in ("A", "B") and team in ("A", "B") and st != team:
                     cost[i, j] = 1.0
                     continue
-                sim = float(np.dot(hist, slot["hist"]))
-                cost[i, j] = 1.0 - sim
+
+                if emb is not None and sid in self.slot_mean_embed:
+                    cost[i, j] = 1.0 - float(np.dot(emb, self.slot_mean_embed[sid]))
+                else:
+                    crop = self._crop(frame, t)
+                    if crop is not None:
+                        hist = self._color_hist(crop)
+                        cost[i, j] = 1.0 - float(np.dot(hist, slot["hist"]))
 
         rows, cols = _hungarian(cost)
         matched = 0
         for r, c in zip(rows, cols):
-            if cost[r, c] < 0.55:
-                _, tid, cx, cy, hist, team = unknown[r]
+            if cost[r, c] < 0.6:  # relaxed threshold (sim > 0.4)
+                _, tid, emb, team = unknown[r]
                 sid = available[c][0]
                 self.botsort_to_slot[tid] = sid
                 used_slots.add(sid)
-                self.slots[sid]["last_cx"] = cx
-                self.slots[sid]["last_cy"] = cy
                 self.slots[sid]["last_seen"] = video_frame
+                if emb is not None:
+                    self._update_slot_embedding(sid, emb)
                 matched += 1
 
         print(f"[Registry] Post-bench: matched {matched}/{n_t} tracks to {n_s} slots")
 
     # ------------------------------------------------------------------
-    # Team detection at runtime
+    # Team detection
     # ------------------------------------------------------------------
 
-    def _detect_team(self, hist: np.ndarray) -> str:
+    def _detect_team_from_hist(self, hist: np.ndarray) -> str:
         if not hasattr(self, '_centroid_a'):
             return "UNK"
         sim_a = float(np.dot(hist, self._centroid_a))
@@ -374,6 +400,20 @@ class PlayerRegistry:
         if max(sim_a, sim_b) < 0.4:
             return "UNK"
         return "A" if sim_a > sim_b else "B"
+
+    # ------------------------------------------------------------------
+    # Embedding utilities
+    # ------------------------------------------------------------------
+
+    def _update_slot_embedding(self, slot_id: int, embedding: np.ndarray):
+        """Append embedding to slot's bank and recompute mean."""
+        if slot_id not in self.slot_embeddings:
+            self.slot_embeddings[slot_id] = deque(maxlen=20)
+        self.slot_embeddings[slot_id].append(embedding.copy())
+        bank = np.array(self.slot_embeddings[slot_id])
+        mean = bank.mean(axis=0)
+        norm = np.linalg.norm(mean)
+        self.slot_mean_embed[slot_id] = mean / norm if norm > 0 else mean
 
     # ------------------------------------------------------------------
     # Image utilities
@@ -441,8 +481,9 @@ class VLMStateMachine:
         green_ratio = mask.sum() / (frame.shape[0] * frame.shape[1] * 255)
         return GameState.BENCH_SHOT if green_ratio < 0.25 else GameState.PLAY
 
-    def get_id_remap(self, frame: np.ndarray, tracks: List, video_frame: int) -> Dict[int, int]:
+    def get_id_remap(self, frame: np.ndarray, tracks: List, video_frame: int,
+                     embed_map: Dict[int, np.ndarray] = None) -> Dict[int, int]:
         if self.check_bench_to_play() and len(tracks) > 0:
             active_tids = set(int(t[4]) for t in tracks if len(t) >= 5)
             self.registry.flush_stale_mappings(active_tids)
-        return self.registry.update(frame, tracks, video_frame)
+        return self.registry.update(frame, tracks, video_frame, embed_map)

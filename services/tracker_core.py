@@ -122,9 +122,16 @@ class TrackerCore:
         # PLAY state: run tracker normally
         tracks = self.track(frame, dets)
 
-        # Get permanent ID remap from registry
+        # Extract ReID embeddings from BoT-SORT track objects
+        embed_map = {}
+        if hasattr(self.tracker, 'active_tracks'):
+            for strack in self.tracker.active_tracks:
+                if strack.is_activated and hasattr(strack, 'smooth_feat') and strack.smooth_feat is not None:
+                    embed_map[strack.id] = strack.smooth_feat.copy()
+
+        # Get permanent ID remap from registry (now with ReID embeddings)
         if len(tracks) > 0:
-            self.id_remap = self.vlm.get_id_remap(frame, tracks, video_frame)
+            self.id_remap = self.vlm.get_id_remap(frame, tracks, video_frame, embed_map)
 
         if save:
             players = []
