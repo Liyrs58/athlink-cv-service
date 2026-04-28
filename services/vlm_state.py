@@ -113,13 +113,8 @@ def _l2norm(v: np.ndarray) -> np.ndarray:
 
 
 def _is_referee_by_color(crop: Optional[np.ndarray]) -> bool:
-    if crop is None or crop.size == 0:
-        return False
-    hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
-    orange = cv2.inRange(hsv, np.array([5,  80, 80]), np.array([25, 255, 255]))
-    yellow = cv2.inRange(hsv, np.array([25, 80, 80]), np.array([40, 255, 255]))
-    px = crop.shape[0] * crop.shape[1] * 255 + 1e-6
-    return (orange.sum() / px > 0.12) or (yellow.sum() / px > 0.12)
+    """DISABLED for now — color filter too aggressive. Use YOLO class only."""
+    return False
 
 
 def _crop_torso(frame: np.ndarray, t) -> Optional[np.ndarray]:
@@ -401,7 +396,7 @@ class PlayerRegistry:
             return
 
         self._assign_unknown(unknown, available, used_slots, video_frame,
-                             embed_map, threshold=0.50)
+                             embed_map, threshold=0.65)
 
     # ------------------------------------------------------------------
     # Post-bench full re-identification
@@ -430,7 +425,7 @@ class PlayerRegistry:
         available = [(sid, s) for sid, s in self.slots.items()
                      if s.state != SlotState.LOST]
         matched = self._assign_unknown(unknown, available, used_slots, video_frame,
-                                       embed_map, threshold=0.60)
+                                       embed_map, threshold=0.75)
         n_unknown = len(unknown)
         print(f"[Registry] Post-bench: matched {matched}/{n_unknown} tracks to {len(available)} slots")
 
@@ -452,8 +447,10 @@ class PlayerRegistry:
 
         rows, cols = _hungarian(cost)
         matched = 0
+        rejected = 0
         for r, c in zip(rows, cols):
             if cost[r, c] >= threshold:
+                rejected += 1
                 continue
             _, tid, emb, team, crop = unknown[r]
             sid, slot = available[c]
@@ -472,6 +469,9 @@ class PlayerRegistry:
                 slot.hist = _blend_hist(slot.hist, _color_hist(crop)) if slot.hist is not None \
                             else _color_hist(crop)
             matched += 1
+        if matched > 0 or rejected > 0:
+            print(f"[Registry] Frame {video_frame}: matched {matched}, rejected {rejected}, "
+                  f"unknown {n_t}, available {n_s}")
         return matched
 
     def _identity_cost(self, emb: Optional[np.ndarray], team: str,
@@ -479,29 +479,26 @@ class PlayerRegistry:
                        slot: PlayerSlot) -> float:
         """
         Lower = better match.
-        Hard blocks return 1.0 (maximum cost).
+        REMOVED: team lock (too strict, breaking matches)
+        CHANGED: thresholds more permissive
         """
-        # Hard: team lock (never cross-team)
-        if slot.team in ("A", "B") and team in ("A", "B") and slot.team != team:
-            return 1.0
-
         score = 0.0
 
-        # ReID embedding similarity (primary, 60%)
+        # ReID embedding similarity (primary, 70% weight — increased)
         reid_sim = _cosine(emb, slot.mean_embed)
-        score += 0.60 * (1.0 - reid_sim)
+        score += 0.70 * (1.0 - reid_sim)
 
-        # Spatial continuity (20%) — IoU with last known bbox
+        # Spatial continuity (15%) — IoU with last known bbox
         if slot.last_bbox is not None and bbox is not None:
             iou = _iou(bbox, slot.last_bbox)
-            score += 0.20 * (1.0 - iou)
+            score += 0.15 * (1.0 - iou)
         else:
-            score += 0.20  # no spatial info = max cost contribution
+            score += 0.15
 
-        # Temporal penalty (20%) — penalise slots not seen recently
+        # Temporal penalty (15% weight — reduced)
         gap = max(0, frame_idx - slot.last_seen_frame)
-        time_penalty = min(gap / 750.0, 1.0)   # saturate at 30s @ 25fps
-        score += 0.20 * time_penalty
+        time_penalty = min(gap / 1500.0, 1.0)   # increased to 60s @ 25fps
+        score += 0.15 * time_penalty
 
         return float(np.clip(score, 0.0, 1.0))
 
