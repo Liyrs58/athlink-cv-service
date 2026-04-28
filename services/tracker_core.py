@@ -17,11 +17,13 @@ except (ImportError, AttributeError):
         print("[ERROR] BotSort import failed")
         BotSort = None
 
-# VLM state machine import
+# Identity + VLM imports
 try:
+    from services.identity_core import IdentityCore, Track as IdentityTrack
     from services.vlm_state import VLMStateMachine, GameState
 except (ImportError, ModuleNotFoundError):
     sys.path.insert(0, os.path.dirname(__file__))
+    from identity_core import IdentityCore, Track as IdentityTrack
     from vlm_state import VLMStateMachine, GameState
 
 
@@ -67,8 +69,10 @@ class TrackerCore:
             frame_rate=25,
         )
 
-        # VLM: game state + permanent player registry
+        # VLM: game state only (scene detection)
         self.vlm = VLMStateMachine(device=device)
+        # Identity core: deterministic, GPU-optimized ID assignment
+        self.identity = IdentityCore(max_players=22)
         self.id_remap = {}
         self._last_tracks = []
 
@@ -98,17 +102,18 @@ class TrackerCore:
 
     def process_frame(self, frame, video_frame, dets, save=True):
         """
-        Track + permanent player ID assignment via PlayerRegistry.
+        Track + permanent player ID assignment via IdentityCore.
 
         Key behavior:
-        - PLAY: run BoT-SORT + registry remapping
-        - BENCH_SHOT: skip tracker entirely (don't feed empty dets that kill tracks)
-        - bench→play: registry flushes stale mappings, re-matches new IDs to slots
+        - PLAY: run BoT-SORT + identity matching
+        - CELEBRATION: run BotSort but freeze identity assignment
+        - BENCH_SHOT: skip tracker entirely
         """
         state = self.vlm.analyze(frame, video_frame)
 
         # Full freeze: field not visible — skip tracker entirely
         if state.is_freeze():
+            self.identity.freeze_on_bench(video_frame)
             if save:
                 self.results.append({
                     "frameIndex": int(video_frame),
@@ -119,19 +124,35 @@ class TrackerCore:
                 })
             return 0
 
+        # Resume from freeze
+        if state.is_play():
+            self.identity.unfreeze_on_play(video_frame)
+
         # Run BotSort (both PLAY and CELEBRATION)
         tracks = self.track(frame, dets)
 
-        # Extract ReID embeddings from BoT-SORT track objects
+        # Extract ReID embeddings from BoT-SORT track objects (batched)
         embed_map = {}
         if hasattr(self.tracker, 'active_tracks'):
             for strack in self.tracker.active_tracks:
                 if strack.is_activated and hasattr(strack, 'smooth_feat') and strack.smooth_feat is not None:
                     embed_map[strack.id] = strack.smooth_feat.copy()
 
-        # Identity assignment only during PLAY (not celebration — freeze assignment)
-        if state.is_play() and len(tracks) > 0:
-            self.id_remap = self.vlm.get_id_remap(frame, tracks, video_frame, embed_map)
+        # Convert BotSort tracks to IdentityCore format
+        identity_tracks = []
+        for t in tracks:
+            if len(t) < 7:
+                continue
+            tid = int(t[4])
+            cls = int(t[6])
+            bbox = np.array([float(t[0]), float(t[1]), float(t[2]), float(t[3])])
+            conf = float(t[5])
+            emb = embed_map.get(tid)
+            identity_tracks.append(IdentityTrack(tid=tid, bbox=bbox, conf=conf, cls=cls, emb=emb))
+
+        # Identity assignment only during PLAY (not celebration)
+        if state.is_play() and len(identity_tracks) > 0:
+            self.id_remap = self.identity.update(identity_tracks, video_frame)
 
         if save:
             players = []
@@ -141,29 +162,19 @@ class TrackerCore:
                 x1, y1, x2, y2, tid, conf, cls, _ = t
                 tid_int = int(tid)
 
-                # Check referee registry first
-                if tid_int in self.vlm.registry.botsort_to_ref:
-                    rid = self.vlm.registry.botsort_to_ref[tid_int]
-                    players.append({
-                        "trackId": f"R{rid}",
-                        "team": "REF",
-                        "bbox": [float(x1), float(y1), float(x2), float(y2)],
-                        "confidence": float(conf),
-                        "class": int(cls),
-                        "gameState": state.value,
-                    })
+                final_pid = self.id_remap.get(tid_int, None)
+                if final_pid is None:
                     continue
 
-                final_tid = self.id_remap.get(tid_int, None)
-                if final_tid is None:
+                player = self.identity.players.get(final_pid)
+                if player is None:
                     continue
 
-                slot = self.vlm.registry.slots.get(final_tid)
-                team = slot.team if slot else "UNK"
+                team_str = player.team.name if player.team.value >= 0 else "UNK"
 
                 players.append({
-                    "trackId": final_tid,
-                    "team": team,
+                    "trackId": final_pid,
+                    "team": team_str,
                     "bbox": [float(x1), float(y1), float(x2), float(y2)],
                     "confidence": float(conf),
                     "class": int(cls),
