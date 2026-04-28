@@ -7,7 +7,7 @@ import numpy as np
 from scipy.optimize import linear_sum_assignment
 
 
-DORMANT_TTL = 180
+DORMANT_TTL = 180          # frames before dormant → lost (~7s @ 25fps)
 MAX_SLOTS = 22
 COST_REJECT_THRESHOLD = 0.72
 EMB_ALPHA = 0.25
@@ -16,7 +16,7 @@ EMB_ALPHA = 0.25
 @dataclass
 class PlayerSlot:
     pid: str
-    state: str = "lost"  # active|dormant|lost
+    state: str = "lost"    # active | dormant | lost
     active_track_id: Optional[int] = None
     seen_this_frame: bool = False
     last_seen_frame: int = -10**9
@@ -48,14 +48,19 @@ class IdentityCore:
         self.unmatched_tracks: int = 0
         self.unmatched_slots: int = 0
 
-    # ---------- lifecycle ----------
+        # Snapshot taken at bench/freeze entry — used for revival on return
+        self._bench_snapshot: Dict[str, dict] = {}  # pid -> {embedding, position, last_seen}
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+
     def begin_frame(self, frame_id: int) -> None:
         self.frame_id = frame_id
         self.assigned_this_frame = 0
         self.unmatched_tracks = 0
         self.unmatched_slots = 0
-
-        # CRITICAL: clear only frame-local attachment flags.
+        # CRITICAL: clear frame-local flags only — do NOT reset state/embedding
         for s in self.slots:
             s.active_track_id = None
             s.seen_this_frame = False
@@ -67,10 +72,9 @@ class IdentityCore:
         positions: Dict[int, Tuple[float, float]],
     ) -> Dict[int, str]:
         """
-        tracks: iterable with .track_id attribute
-        embeddings: track_id -> embedding vector
-        positions: track_id -> (x, y)
-        returns: track_id -> PID
+        Match current tracks to PID slots via Hungarian algorithm.
+        Cost = 0.70 * embedding_distance + 0.25 * position_distance + recency_penalty.
+        Returns {track_id -> PID string}.
         """
         if len(tracks) == 0:
             self.unmatched_slots = MAX_SLOTS
@@ -80,7 +84,6 @@ class IdentityCore:
         n_t = len(track_ids)
         n_s = len(self.slots)
 
-        # Build cost matrix against ALL slots (active/dormant/lost alike).
         cost = np.full((n_t, n_s), 1e3, dtype=np.float32)
         for i, tid in enumerate(track_ids):
             t_emb = embeddings.get(tid)
@@ -91,8 +94,8 @@ class IdentityCore:
         r_idx, c_idx = linear_sum_assignment(cost)
 
         track_to_pid: Dict[int, str] = {}
-        matched_tracks = set()
-        matched_slots = set()
+        matched_tracks: set = set()
+        matched_slots: set = set()
 
         for r, c in zip(r_idx, c_idx):
             cst = float(cost[r, c])
@@ -124,7 +127,6 @@ class IdentityCore:
     def end_frame(self, frame_id: Optional[int] = None) -> None:
         if frame_id is not None:
             self.frame_id = frame_id
-
         for s in self.slots:
             if s.seen_this_frame:
                 continue
@@ -132,7 +134,84 @@ class IdentityCore:
             s.state = "dormant" if age <= DORMANT_TTL else "lost"
             s.active_track_id = None
 
-    # ---------- metrics / logging ----------
+    # ------------------------------------------------------------------
+    # Bench snapshot / revival (Priority D)
+    # ------------------------------------------------------------------
+
+    def snapshot_active(self, frame_id: int) -> None:
+        """
+        Call when entering bench/freeze. Saves all active+dormant slot state
+        so we can attempt strong revival on return-to-play.
+        """
+        self._bench_snapshot = {}
+        for s in self.slots:
+            if s.state in ("active", "dormant") and s.embedding is not None:
+                self._bench_snapshot[s.pid] = {
+                    "embedding": s.embedding.copy(),
+                    "position": s.last_position,
+                    "last_seen": s.last_seen_frame,
+                }
+        print(f"[Identity] Snapshot: {len(self._bench_snapshot)} slots saved at frame {frame_id}")
+
+    def revive_cost_matrix(
+        self,
+        tracks: Sequence[object],
+        embeddings: Dict[int, np.ndarray],
+        positions: Dict[int, Tuple[float, float]],
+    ) -> Dict[int, str]:
+        """
+        Called on first frame after bench→play. Matches tracks to snapshot
+        embeddings first (stronger signal) before normal per-frame assignment.
+        Returns partial {track_id -> PID} for revived tracks.
+        """
+        if not self._bench_snapshot or len(tracks) == 0:
+            return {}
+
+        track_ids = [int(t.track_id) for t in tracks]
+        snap_pids = list(self._bench_snapshot.keys())
+        n_t = len(track_ids)
+        n_s = len(snap_pids)
+
+        cost = np.full((n_t, n_s), 1e3, dtype=np.float32)
+        for i, tid in enumerate(track_ids):
+            t_emb = embeddings.get(tid)
+            t_pos = positions.get(tid)
+            for j, pid in enumerate(snap_pids):
+                snap = self._bench_snapshot[pid]
+                emb_cost = 0.5
+                pos_cost = 0.5
+
+                if t_emb is not None and snap["embedding"] is not None:
+                    e = t_emb.astype(np.float32)
+                    n = np.linalg.norm(e)
+                    if n > 0:
+                        e = e / n
+                    cos = float(np.clip(np.dot(e, snap["embedding"]), -1.0, 1.0))
+                    emb_cost = 1.0 - (cos + 1.0) * 0.5
+
+                if t_pos is not None and snap["position"] is not None:
+                    dx = float(t_pos[0] - snap["position"][0])
+                    dy = float(t_pos[1] - snap["position"][1])
+                    dist = (dx * dx + dy * dy) ** 0.5
+                    pos_cost = min(dist / 300.0, 1.0)  # looser after cut
+
+                cost[i, j] = 0.75 * emb_cost + 0.25 * pos_cost
+
+        r_idx, c_idx = linear_sum_assignment(cost)
+
+        revived: Dict[int, str] = {}
+        for r, c in zip(r_idx, c_idx):
+            if cost[r, c] < 0.60:  # tighter threshold for revival
+                revived[track_ids[r]] = snap_pids[c]
+
+        print(f"[Identity] Revival: {len(revived)}/{n_t} tracks matched from snapshot")
+        self._bench_snapshot = {}  # consume once
+        return revived
+
+    # ------------------------------------------------------------------
+    # Metrics / logging
+    # ------------------------------------------------------------------
+
     def state_counts(self) -> Tuple[int, int, int]:
         active = sum(1 for s in self.slots if s.state == "active")
         dormant = sum(1 for s in self.slots if s.state == "dormant")
@@ -142,17 +221,18 @@ class IdentityCore:
     def maybe_log(self, detections_count: int, tracks_count: int) -> None:
         if self.frame_id % self.debug_every != 0:
             return
-
         active, dormant, lost = self.state_counts()
         lost = min(lost, MAX_SLOTS)
-
         print(
             f"[Frame {self.frame_id}] det={detections_count} tracks={tracks_count} "
             f"assigned={self.assigned_this_frame} active={active} dormant={dormant} lost={lost} "
             f"unmatched_tracks={self.unmatched_tracks} unmatched_slots={self.unmatched_slots}"
         )
 
-    # ---------- internal ----------
+    # ------------------------------------------------------------------
+    # Internal
+    # ------------------------------------------------------------------
+
     def _slot_cost(
         self,
         slot: PlayerSlot,

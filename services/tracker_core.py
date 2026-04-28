@@ -73,12 +73,30 @@ class TrackerCore:
         self.vlm = VLMStateMachine(device=device)
         # Identity core: deterministic ID assignment via ReID + position
         self.identity = IdentityCore()
-        self.id_remap = {}  # botsort_tid -> PID string e.g. "P1"
+        self.id_remap = {}  # botsort_tid -> int PID
         self._last_tracks = []
-        self._frozen = False
+        self._prev_state = None
+        self._was_frozen = False
+        self._needs_revival = False
+
+        # Priority B — pre-cutaway collapse guard
+        self._track_history = []   # rolling track counts (last 20 frames)
+        self._baseline_tracks = 0
+        self._suspend_birth = False
+
+        # Priority C — log live BoTSORT params once at startup
+        self._log_botsort_params()
 
         self.frame_idx = 0
         self.results = []
+
+    def _log_botsort_params(self):
+        t = self.tracker
+        params = {k: getattr(t, k, None) for k in [
+            'match_thresh', 'appearance_thresh', 'new_track_thresh',
+            'track_high_thresh', 'track_low_thresh', 'track_buffer', 'frame_rate'
+        ]}
+        print(f"[TrackerCore] Live BotSort params: {params}")
 
     def detect(self, frame):
         """YOLO – returns np.array (N,6) [x1,y1,x2,y2,conf,cls]."""
@@ -101,35 +119,11 @@ class TrackerCore:
     def track(self, frame, dets):
         return self.tracker.update(dets, frame)
 
-    def process_frame(self, frame, video_frame, dets, save=True):
-        """
-        Track + permanent player ID assignment via IdentityCore.
-        - PLAY: BoT-SORT + identity begin_frame/assign_tracks/end_frame
-        - BENCH_SHOT/freeze: skip tracker, mark frozen
-        """
-        state = self.vlm.analyze(frame, video_frame)
-
-        # Full freeze — skip tracker entirely
-        if state.is_freeze():
-            self._frozen = True
-            if save:
-                self.results.append({
-                    "frameIndex": int(video_frame),
-                    "players": [],
-                    "detection_count": 0,
-                    "track_count": 0,
-                    "gameState": state.value,
-                })
-            return 0
-
-        # Run BotSort
-        tracks = self.track(frame, dets)
-
-        # Extract ReID embeddings from BoT-SORT internal track objects
+    def _extract_embeds(self):
         embed_map = {}
         try:
             src = getattr(self.tracker, 'active_tracks',
-                   getattr(self.tracker, 'tracked_stracks', []))
+                          getattr(self.tracker, 'tracked_stracks', []))
             for strack in src:
                 sid = getattr(strack, 'track_id', getattr(strack, 'id', None))
                 feat = getattr(strack, 'smooth_feat', None)
@@ -137,41 +131,106 @@ class TrackerCore:
                     embed_map[int(sid)] = feat.copy()
         except Exception:
             pass
+        return embed_map
 
-        # Identity assignment only during PLAY
-        if state.is_play() and len(tracks) > 0:
-            # begin_frame resets per-frame flags
+    def _build_track_inputs(self, tracks, embed_map):
+        track_objs, positions, embeddings = [], {}, {}
+        for t in tracks:
+            if len(t) < 5:
+                continue
+            tid = int(t[4])
+            cx = (float(t[0]) + float(t[2])) / 2
+            cy = (float(t[1]) + float(t[3])) / 2
+            positions[tid] = (cx, cy)
+            if tid in embed_map:
+                embeddings[tid] = embed_map[tid]
+
+            class _T:
+                pass
+            obj = _T()
+            obj.track_id = tid
+            track_objs.append(obj)
+        return track_objs, positions, embeddings
+
+    def _update_collapse_guard(self, n_tracks):
+        """Priority B: detect pre-cutaway track collapse."""
+        self._track_history.append(n_tracks)
+        if len(self._track_history) > 20:
+            self._track_history.pop(0)
+
+        # Set baseline from first 30 frames
+        if len(self._track_history) == 30 and self._baseline_tracks == 0:
+            self._baseline_tracks = max(1, sum(self._track_history) / 30)
+
+        if self._baseline_tracks > 0 and len(self._track_history) >= 10:
+            recent_mean = sum(self._track_history[-10:]) / 10
+            self._suspend_birth = recent_mean < 0.5 * self._baseline_tracks
+        else:
+            self._suspend_birth = False
+
+    def process_frame(self, frame, video_frame, dets, save=True):
+        """
+        Priority A: invalid-scene gating — freeze identity on bench, age only
+        Priority B: collapse guard — suspend track birth on steep pre-cut decay
+        Priority C: live param logging at init
+        Priority D: snapshot on freeze entry, revival-first on return-to-play
+        """
+        state = self.vlm.analyze(frame, video_frame)
+        transitioning_to_freeze = state.is_freeze() and not self._was_frozen
+        transitioning_to_play = state.is_play() and self._was_frozen
+
+        # Priority A: invalid scene — only age slots, no association
+        if state.is_freeze():
+            if transitioning_to_freeze:
+                # Priority D: snapshot before freeze
+                self.identity.snapshot_active(video_frame)
+                self._needs_revival = True
+                print(f"[TrackerCore] Frame {video_frame}: entering freeze → snapshot taken")
+            # Age slots without new assignments
+            self.identity.begin_frame(video_frame)
+            self.identity.end_frame(video_frame)
+            self._was_frozen = True
+            if save:
+                self.results.append({
+                    "frameIndex": int(video_frame),
+                    "players": [],
+                    "detection_count": 0,
+                    "track_count": 0,
+                    "gameState": state.value,
+                    "analysis_valid": False,
+                })
+            return 0
+
+        # Run BotSort
+        tracks = self.track(frame, dets)
+        n_tracks = len(tracks)
+
+        # Priority B: update collapse guard
+        self._update_collapse_guard(n_tracks)
+
+        embed_map = self._extract_embeds()
+        track_objs, positions, embeddings = self._build_track_inputs(tracks, embed_map)
+
+        if state.is_play() and len(track_objs) > 0:
             self.identity.begin_frame(video_frame)
 
-            # Build position map: tid -> (cx, cy)
-            positions = {}
-            embeddings = {}
-            track_objs = []
-
-            for t in tracks:
-                if len(t) < 5:
-                    continue
-                tid = int(t[4])
-                cx = (float(t[0]) + float(t[2])) / 2
-                cy = (float(t[1]) + float(t[3])) / 2
-                positions[tid] = (cx, cy)
-                if tid in embed_map:
-                    embeddings[tid] = embed_map[tid]
-
-                # Wrap as simple object with .track_id
-                class _T:
-                    pass
-                obj = _T()
-                obj.track_id = tid
-                track_objs.append(obj)
+            # Priority D: revival-first on return from bench
+            if transitioning_to_play and self._needs_revival:
+                revived = self.identity.revive_cost_matrix(track_objs, embeddings, positions)
+                # Seed id_remap with revival matches before normal assignment
+                self.id_remap = {tid: int(pid[1:]) for tid, pid in revived.items()}
+                self._needs_revival = False
+                print(f"[TrackerCore] Frame {video_frame}: return from freeze, {len(revived)} revived")
 
             tid_to_pid = self.identity.assign_tracks(track_objs, embeddings, positions)
             self.identity.end_frame(video_frame)
-            self.identity.maybe_log(detections_count=len(dets), tracks_count=len(tracks))
+            self.identity.maybe_log(detections_count=len(dets), tracks_count=n_tracks)
 
-            # Convert "P1" -> integer 1 for trackId field
-            self.id_remap = {tid: int(pid[1:]) for tid, pid in tid_to_pid.items()}
-            self._frozen = False
+            # Merge: assign_tracks wins over revival for any overlap
+            for tid, pid in tid_to_pid.items():
+                self.id_remap[tid] = int(pid[1:])
+
+        self._was_frozen = False
 
         if save:
             players = []
@@ -189,16 +248,18 @@ class TrackerCore:
                     "confidence": float(conf),
                     "class": int(cls),
                     "gameState": state.value,
+                    "analysis_valid": True,
                 })
             self.results.append({
                 "frameIndex": int(video_frame),
                 "players": players,
                 "detection_count": len(dets),
-                "track_count": len(tracks),
+                "track_count": n_tracks,
                 "gameState": state.value,
+                "analysis_valid": True,
             })
 
-        return len(tracks) if len(tracks) > 0 else 0
+        return n_tracks
 
     def save(self, job_id):
         out = {
