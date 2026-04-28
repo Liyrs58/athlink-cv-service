@@ -107,8 +107,8 @@ class TrackerCore:
         """
         state = self.vlm.analyze(frame, video_frame)
 
-        # During bench shots: do NOT run tracker — this prevents tracks from dying
-        if state == GameState.BENCH_SHOT:
+        # Full freeze: field not visible — skip tracker entirely
+        if state.is_freeze():
             if save:
                 self.results.append({
                     "frameIndex": int(video_frame),
@@ -119,7 +119,7 @@ class TrackerCore:
                 })
             return 0
 
-        # PLAY state: run tracker normally
+        # Run BotSort (both PLAY and CELEBRATION)
         tracks = self.track(frame, dets)
 
         # Extract ReID embeddings from BoT-SORT track objects
@@ -129,8 +129,8 @@ class TrackerCore:
                 if strack.is_activated and hasattr(strack, 'smooth_feat') and strack.smooth_feat is not None:
                     embed_map[strack.id] = strack.smooth_feat.copy()
 
-        # Get permanent ID remap from registry (now with ReID embeddings)
-        if len(tracks) > 0:
+        # Identity assignment only during PLAY (not celebration — freeze assignment)
+        if state.is_play() and len(tracks) > 0:
             self.id_remap = self.vlm.get_id_remap(frame, tracks, video_frame, embed_map)
 
         if save:
@@ -140,15 +140,26 @@ class TrackerCore:
                     continue
                 x1, y1, x2, y2, tid, conf, cls, _ = t
                 tid_int = int(tid)
-                final_tid = self.id_remap.get(tid_int, None)
 
-                # Tracks not in registry = referee or unclassified, skip them
+                # Check referee registry first
+                if tid_int in self.vlm.registry.botsort_to_ref:
+                    rid = self.vlm.registry.botsort_to_ref[tid_int]
+                    players.append({
+                        "trackId": f"R{rid}",
+                        "team": "REF",
+                        "bbox": [float(x1), float(y1), float(x2), float(y2)],
+                        "confidence": float(conf),
+                        "class": int(cls),
+                        "gameState": state.value,
+                    })
+                    continue
+
+                final_tid = self.id_remap.get(tid_int, None)
                 if final_tid is None:
                     continue
 
-                # Get team from registry slot
-                slot = self.vlm.registry.slots.get(final_tid, {})
-                team = slot.get("team", "UNK")
+                slot = self.vlm.registry.slots.get(final_tid)
+                team = slot.team if slot else "UNK"
 
                 players.append({
                     "trackId": final_tid,

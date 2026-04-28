@@ -11,8 +11,20 @@ from typing import Dict, List, Optional, Tuple
 # ---------------------------------------------------------------------------
 
 class GameState(Enum):
-    PLAY = "play"
-    BENCH_SHOT = "bench_shot"
+    PLAY        = "play"
+    BENCH_SHOT  = "bench_shot"
+    CELEBRATION = "celebration"
+    REPLAY      = "replay"
+    CROWD       = "crowd"
+    CLOSEUP     = "closeup"
+
+    def is_freeze(self) -> bool:
+        """True for any scene where the field is not visible → freeze registry."""
+        return self in (GameState.BENCH_SHOT, GameState.REPLAY,
+                        GameState.CROWD, GameState.CLOSEUP)
+
+    def is_play(self) -> bool:
+        return self == GameState.PLAY
 
 
 # ---------------------------------------------------------------------------
@@ -23,6 +35,7 @@ class SlotState(Enum):
     UNASSIGNED = "unassigned"
     ACTIVE     = "active"
     DORMANT    = "dormant"
+    LOST       = "lost"       # dormant for too long — embeddings kept, won't match
 
 
 # ---------------------------------------------------------------------------
@@ -43,12 +56,22 @@ class PlayerSlot:
     n_updates: int = 0
 
 
+@dataclass
+class RefereeSlot:
+    ref_id: int                                              # 1-based (R1, R2, ...)
+    embeddings: deque = field(default_factory=lambda: deque(maxlen=30))
+    mean_embed: Optional[np.ndarray] = None
+    last_seen_frame: int = -1
+    active_track_id: Optional[int] = None
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 REFEREE_CLASS = 3
-_EMBED_DIM = 512
+_EMBED_DIM    = 512
+_LOST_FRAMES  = 750   # ~30s @ 25fps — dormant slots older than this → LOST
 
 
 def _hungarian(cost: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
@@ -154,6 +177,10 @@ class PlayerRegistry:
         self._post_bench  = False
         self._centroid_a: Optional[np.ndarray] = None
         self._centroid_b: Optional[np.ndarray] = None
+        # Referee registry — separate from P1-P22
+        self.ref_slots: Dict[int, RefereeSlot] = {}   # ref_id → slot
+        self.botsort_to_ref: Dict[int, int] = {}       # BotSort tid → ref_id
+        self.next_ref     = 1
 
     # ------------------------------------------------------------------
     # Public entry point
@@ -180,8 +207,8 @@ class PlayerRegistry:
         self._resolve_duplicates()
         return dict(self.botsort_to_slot)
 
-    def flush_stale_mappings(self, active_tids: set):
-        """Called on bench→play transition. Marks all slots dormant."""
+    def flush_stale_mappings(self, active_tids: set, current_frame: int = 0):
+        """Called on bench→play transition. Marks all slots dormant; ages old dormant → lost."""
         stale = [tid for tid in self.botsort_to_slot if tid not in active_tids]
         n_stale = len(stale)
         for tid in stale:
@@ -190,14 +217,45 @@ class PlayerRegistry:
             if slot:
                 slot.state = SlotState.DORMANT
                 slot.active_track_id = None
-        # Also dormant-ize any active slots that lost their BotSort tid
+        # Dormant-ize active slots that lost their BotSort tid
         still_mapped = set(self.botsort_to_slot.values())
         for slot in self.slots.values():
             if slot.state == SlotState.ACTIVE and slot.slot_id not in still_mapped:
                 slot.state = SlotState.DORMANT
                 slot.active_track_id = None
+        # Age dormant slots that haven't been seen in _LOST_FRAMES → lost
+        if current_frame > 0:
+            for slot in self.slots.values():
+                if (slot.state == SlotState.DORMANT and
+                        current_frame - slot.last_seen_frame > _LOST_FRAMES):
+                    slot.state = SlotState.LOST
+        # Clear stale referee mappings too
+        stale_refs = [tid for tid in self.botsort_to_ref if tid not in active_tids]
+        for tid in stale_refs:
+            del self.botsort_to_ref[tid]
         print(f"[Registry] Flushed {n_stale} stale, {len(self.botsort_to_slot)} remain")
         self._post_bench = True
+
+    # ------------------------------------------------------------------
+    # Referee registry (R1, R2, ...)
+    # ------------------------------------------------------------------
+
+    def _register_referee(self, tid: int, emb: Optional[np.ndarray], video_frame: int):
+        if tid in self.botsort_to_ref:
+            rid = self.botsort_to_ref[tid]
+            ref = self.ref_slots[rid]
+        else:
+            rid = self.next_ref
+            ref = RefereeSlot(ref_id=rid)
+            self.ref_slots[rid] = ref
+            self.botsort_to_ref[tid] = rid
+            self.next_ref += 1
+        ref.last_seen_frame = video_frame
+        ref.active_track_id = tid
+        if emb is not None:
+            ref.embeddings.append(emb.copy())
+            bank = np.array(ref.embeddings)
+            ref.mean_embed = _l2norm(bank.mean(0))
 
     # ------------------------------------------------------------------
     # Registration (pre-freeze)
@@ -210,10 +268,11 @@ class PlayerRegistry:
                 continue
             tid = int(t[4])
             cls = int(t[6])
-            if cls == REFEREE_CLASS:
-                continue
             crop = _crop_torso(frame, t)
-            if _is_referee_by_color(crop):
+
+            # Route referees to ref registry, never into P1-P22
+            if cls == REFEREE_CLASS or _is_referee_by_color(crop):
+                self._register_referee(tid, embed_map.get(tid), video_frame)
                 continue
 
             if tid in self.botsort_to_slot:
@@ -301,10 +360,11 @@ class PlayerRegistry:
                 continue
             tid = int(t[4])
             cls = int(t[6])
-            if cls == REFEREE_CLASS:
-                continue
             crop = _crop_torso(frame, t)
-            if _is_referee_by_color(crop):
+
+            # Route referees to ref registry
+            if cls == REFEREE_CLASS or _is_referee_by_color(crop):
+                self._register_referee(tid, embed_map.get(tid), video_frame)
                 continue
 
             if tid in self.botsort_to_slot:
@@ -334,9 +394,9 @@ class PlayerRegistry:
         if not unknown:
             return
 
-        # Available slots = not currently mapped to an active BotSort tid
+        # Available slots = not active + not lost
         available = [(sid, slot) for sid, slot in self.slots.items()
-                     if sid not in used_slots]
+                     if sid not in used_slots and slot.state != SlotState.LOST]
         if not available:
             return
 
@@ -357,10 +417,9 @@ class PlayerRegistry:
                 continue
             tid = int(t[4])
             cls = int(t[6])
-            if cls == REFEREE_CLASS:
-                continue
             crop = _crop_torso(frame, t)
-            if _is_referee_by_color(crop):
+            if cls == REFEREE_CLASS or _is_referee_by_color(crop):
+                self._register_referee(tid, embed_map.get(tid), video_frame)
                 continue
             team = self._team_from_crop(crop)
             unknown.append((t, tid, embed_map.get(tid), team, crop))
@@ -368,7 +427,8 @@ class PlayerRegistry:
         if not unknown:
             return
 
-        available = list(self.slots.items())
+        available = [(sid, s) for sid, s in self.slots.items()
+                     if s.state != SlotState.LOST]
         matched = self._assign_unknown(unknown, available, used_slots, video_frame,
                                        embed_map, threshold=0.60)
         n_unknown = len(unknown)
@@ -497,7 +557,7 @@ class VLMStateMachine:
         self.prev_state = GameState.PLAY
         self.registry = PlayerRegistry(max_players=30, reg_frames=30)
         self.frame_counter = 0
-        self._bench_to_play = False
+        self._freeze_to_play = False   # any freeze scene → play transition
         print("[VLM] Identity engine ready")
 
     def analyze(self, frame: np.ndarray, video_frame: int) -> GameState:
@@ -508,22 +568,32 @@ class VLMStateMachine:
         self.state = self._classify(frame)
         if self.state != self.prev_state:
             print(f"[VLM] Frame {video_frame}: {self.prev_state.value} → {self.state.value}")
-            if self.prev_state == GameState.BENCH_SHOT and self.state == GameState.PLAY:
-                self._bench_to_play = True
+            if self.prev_state.is_freeze() and self.state.is_play():
+                self._freeze_to_play = True
         return self.state
 
     def _classify(self, frame: np.ndarray) -> GameState:
+        """
+        Cheap HSV classifier.
+        green > 40% → play
+        green 25-40% → celebration (players on pitch, little green visible e.g. goal crowd)
+        green < 25% → bench_shot (field not visible)
+        """
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
         mask = cv2.inRange(hsv, np.array([35, 40, 40]), np.array([85, 255, 255]))
         green_ratio = mask.sum() / (frame.shape[0] * frame.shape[1] * 255)
-        return GameState.BENCH_SHOT if green_ratio < 0.25 else GameState.PLAY
+        if green_ratio >= 0.40:
+            return GameState.PLAY
+        if green_ratio >= 0.25:
+            return GameState.CELEBRATION   # freeze assignment, BotSort still runs
+        return GameState.BENCH_SHOT        # full freeze
 
     def get_id_remap(self, frame: np.ndarray, tracks: List, video_frame: int,
                      embed_map: Dict[int, np.ndarray] = None) -> Dict[int, int]:
         if embed_map is None:
             embed_map = {}
-        if self._bench_to_play and len(tracks) > 0:
-            self._bench_to_play = False
+        if self._freeze_to_play and len(tracks) > 0:
+            self._freeze_to_play = False
             active_tids = {int(t[4]) for t in tracks if len(t) >= 5}
-            self.registry.flush_stale_mappings(active_tids)
+            self.registry.flush_stale_mappings(active_tids, current_frame=video_frame)
         return self.registry.update(frame, tracks, video_frame, embed_map)
