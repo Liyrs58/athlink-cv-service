@@ -28,6 +28,18 @@ def _hungarian(cost: np.ndarray):
 REFEREE_CLASS = 3
 
 
+def _is_referee_by_color(crop: np.ndarray) -> bool:
+    """Orange/yellow kit = referee. Returns True if referee-colored."""
+    if crop is None or crop.size == 0:
+        return False
+    hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+    orange = cv2.inRange(hsv, np.array([5, 80, 80]), np.array([25, 255, 255]))
+    yellow = cv2.inRange(hsv, np.array([25, 80, 80]), np.array([40, 255, 255]))
+    orange_r = orange.sum() / (crop.shape[0] * crop.shape[1] * 255 + 1e-6)
+    yellow_r = yellow.sum() / (crop.shape[0] * crop.shape[1] * 255 + 1e-6)
+    return orange_r > 0.12 or yellow_r > 0.12
+
+
 class PlayerRegistry:
     """
     Permanent player roster with ReID embedding-based identity matching.
@@ -113,14 +125,16 @@ class PlayerRegistry:
             tid = int(t[4])
             cls = int(t[6])
 
-            # Skip referees
+            # Skip referees (YOLO class + color)
             if cls == REFEREE_CLASS:
+                continue
+            crop = self._crop(frame, t)
+            if _is_referee_by_color(crop):
                 continue
 
             if tid in self.botsort_to_slot:
                 # Update existing slot
                 slot_id = self.botsort_to_slot[tid]
-                crop = self._crop(frame, t)
                 if crop is not None:
                     self.slots[slot_id]["hist"] = self._blend_hist(
                         self.slots[slot_id]["hist"],
@@ -131,8 +145,7 @@ class PlayerRegistry:
                 if tid in embed_map:
                     self._update_slot_embedding(slot_id, embed_map[tid])
             else:
-                # New track → new slot
-                crop = self._crop(frame, t)
+                # New track → new slot (crop already computed above)
                 if crop is None:
                     continue
                 hist = self._color_hist(crop)
@@ -264,6 +277,8 @@ class PlayerRegistry:
                 if cls == REFEREE_CLASS:
                     continue
                 crop = self._crop(frame, t)
+                if _is_referee_by_color(crop):
+                    continue
                 team = "UNK"
                 if crop is not None:
                     hist = self._color_hist(crop)
@@ -333,6 +348,8 @@ class PlayerRegistry:
             cls = int(t[6])
             if cls == REFEREE_CLASS:
                 continue
+            if _is_referee_by_color(self._crop(frame, t)):
+                continue
 
             if tid in self.botsort_to_slot:
                 used_slots.add(self.botsort_to_slot[tid])
@@ -340,6 +357,8 @@ class PlayerRegistry:
                     self._update_slot_embedding(self.botsort_to_slot[tid], embed_map[tid])
             else:
                 crop = self._crop(frame, t)
+                if _is_referee_by_color(crop):
+                    continue
                 team = "UNK"
                 if crop is not None:
                     hist = self._color_hist(crop)
@@ -397,8 +416,7 @@ class PlayerRegistry:
             return "UNK"
         sim_a = float(np.dot(hist, self._centroid_a))
         sim_b = float(np.dot(hist, self._centroid_b))
-        if max(sim_a, sim_b) < 0.4:
-            return "UNK"
+        # Always assign — no UNK after freeze, just pick best centroid
         return "A" if sim_a > sim_b else "B"
 
     # ------------------------------------------------------------------
