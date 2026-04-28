@@ -19,11 +19,11 @@ except (ImportError, AttributeError):
 
 # Identity + VLM imports
 try:
-    from services.identity_core import IdentityCore, Track as IdentityTrack
+    from services.identity_core import IdentityCore
     from services.vlm_state import VLMStateMachine, GameState
 except (ImportError, ModuleNotFoundError):
     sys.path.insert(0, os.path.dirname(__file__))
-    from identity_core import IdentityCore, Track as IdentityTrack
+    from identity_core import IdentityCore
     from vlm_state import VLMStateMachine, GameState
 
 
@@ -71,10 +71,11 @@ class TrackerCore:
 
         # VLM: game state only (scene detection)
         self.vlm = VLMStateMachine(device=device)
-        # Identity core: deterministic, GPU-optimized ID assignment
-        self.identity = IdentityCore(max_players=22)
-        self.id_remap = {}
+        # Identity core: deterministic ID assignment via ReID + position
+        self.identity = IdentityCore()
+        self.id_remap = {}  # botsort_tid -> PID string e.g. "P1"
         self._last_tracks = []
+        self._frozen = False
 
         self.frame_idx = 0
         self.results = []
@@ -103,17 +104,14 @@ class TrackerCore:
     def process_frame(self, frame, video_frame, dets, save=True):
         """
         Track + permanent player ID assignment via IdentityCore.
-
-        Key behavior:
-        - PLAY: run BoT-SORT + identity matching
-        - CELEBRATION: run BotSort but freeze identity assignment
-        - BENCH_SHOT: skip tracker entirely
+        - PLAY: BoT-SORT + identity begin_frame/assign_tracks/end_frame
+        - BENCH_SHOT/freeze: skip tracker, mark frozen
         """
         state = self.vlm.analyze(frame, video_frame)
 
-        # Full freeze: field not visible — skip tracker entirely
+        # Full freeze — skip tracker entirely
         if state.is_freeze():
-            self.identity.freeze_on_bench(video_frame)
+            self._frozen = True
             if save:
                 self.results.append({
                     "frameIndex": int(video_frame),
@@ -124,35 +122,56 @@ class TrackerCore:
                 })
             return 0
 
-        # Resume from freeze
-        if state.is_play():
-            self.identity.unfreeze_on_play(video_frame)
-
-        # Run BotSort (both PLAY and CELEBRATION)
+        # Run BotSort
         tracks = self.track(frame, dets)
 
-        # Extract ReID embeddings from BoT-SORT track objects (batched)
+        # Extract ReID embeddings from BoT-SORT internal track objects
         embed_map = {}
-        if hasattr(self.tracker, 'active_tracks'):
-            for strack in self.tracker.active_tracks:
-                if strack.is_activated and hasattr(strack, 'smooth_feat') and strack.smooth_feat is not None:
-                    embed_map[strack.id] = strack.smooth_feat.copy()
+        try:
+            src = getattr(self.tracker, 'active_tracks',
+                   getattr(self.tracker, 'tracked_stracks', []))
+            for strack in src:
+                sid = getattr(strack, 'track_id', getattr(strack, 'id', None))
+                feat = getattr(strack, 'smooth_feat', None)
+                if sid is not None and feat is not None:
+                    embed_map[int(sid)] = feat.copy()
+        except Exception:
+            pass
 
-        # Convert BotSort tracks to IdentityCore format
-        identity_tracks = []
-        for t in tracks:
-            if len(t) < 7:
-                continue
-            tid = int(t[4])
-            cls = int(t[6])
-            bbox = np.array([float(t[0]), float(t[1]), float(t[2]), float(t[3])])
-            conf = float(t[5])
-            emb = embed_map.get(tid)
-            identity_tracks.append(IdentityTrack(tid=tid, bbox=bbox, conf=conf, cls=cls, emb=emb))
+        # Identity assignment only during PLAY
+        if state.is_play() and len(tracks) > 0:
+            # begin_frame resets per-frame flags
+            self.identity.begin_frame(video_frame)
 
-        # Identity assignment only during PLAY (not celebration)
-        if state.is_play() and len(identity_tracks) > 0:
-            self.id_remap = self.identity.update(identity_tracks, video_frame)
+            # Build position map: tid -> (cx, cy)
+            positions = {}
+            embeddings = {}
+            track_objs = []
+
+            for t in tracks:
+                if len(t) < 5:
+                    continue
+                tid = int(t[4])
+                cx = (float(t[0]) + float(t[2])) / 2
+                cy = (float(t[1]) + float(t[3])) / 2
+                positions[tid] = (cx, cy)
+                if tid in embed_map:
+                    embeddings[tid] = embed_map[tid]
+
+                # Wrap as simple object with .track_id
+                class _T:
+                    pass
+                obj = _T()
+                obj.track_id = tid
+                track_objs.append(obj)
+
+            tid_to_pid = self.identity.assign_tracks(track_objs, embeddings, positions)
+            self.identity.end_frame(video_frame)
+            self.identity.maybe_log(detections_count=len(dets), tracks_count=len(tracks))
+
+            # Convert "P1" -> integer 1 for trackId field
+            self.id_remap = {tid: int(pid[1:]) for tid, pid in tid_to_pid.items()}
+            self._frozen = False
 
         if save:
             players = []
@@ -161,20 +180,11 @@ class TrackerCore:
                     continue
                 x1, y1, x2, y2, tid, conf, cls, _ = t
                 tid_int = int(tid)
-
-                final_pid = self.id_remap.get(tid_int, None)
+                final_pid = self.id_remap.get(tid_int)
                 if final_pid is None:
                     continue
-
-                player = self.identity.players.get(final_pid)
-                if player is None:
-                    continue
-
-                team_str = player.team.name if player.team.value >= 0 else "UNK"
-
                 players.append({
                     "trackId": final_pid,
-                    "team": team_str,
                     "bbox": [float(x1), float(y1), float(x2), float(y2)],
                     "confidence": float(conf),
                     "class": int(cls),
