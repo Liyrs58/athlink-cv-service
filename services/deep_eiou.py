@@ -298,23 +298,29 @@ class DeepEIoUTracker:
                 active[ri].update(hi_bboxes[ci], hi_scores[ci], emb, self._frame)
 
         # ---- Round 2: low-conf dets vs unmatched active + stale tracks ----
+        # r2_tracks[0 .. n_unmatched_r1-1] = unmatched active tracks
+        # r2_tracks[n_unmatched_r1 ...]    = stale tracks
+        n_unmatched_r1 = len(unmatched_tracks_r1)
         r2_tracks = [active[i] for i in unmatched_tracks_r1] + stale
+        matched_r2_active_positions = set()  # positions in r2_tracks that are < n_unmatched_r1
         if len(r2_tracks) > 0 and len(lo_bboxes) > 0:
             tr_bboxes = np.array([tr.bbox for tr in r2_tracks])
             exp_tr    = _expand_boxes(tr_bboxes, self.expand_r2)
             exp_det   = _expand_boxes(lo_bboxes,  self.expand_r2)
             iou_cost  = 1.0 - _iou_matrix(exp_tr, exp_det)
 
-            mr2, mc2, still_unmatched_r, _ = _greedy_assign(iou_cost, self.iou_only_thresh)
-            n_unmatched_r1 = len(unmatched_tracks_r1)
-            matched_r2_indices = set(mr2)
+            mr2, mc2, _, _ = _greedy_assign(iou_cost, self.iou_only_thresh)
             for ri, ci in zip(mr2, mc2):
                 r2_tracks[ri].update(lo_bboxes[ci], lo_scores[ci], None, self._frame)
-            # Remove from unmatched_tracks_r1 any r2 index that was in the unmatched_r1 portion
-            unmatched_tracks_r1 = [
-                idx for pos, idx in enumerate(unmatched_tracks_r1)
-                if pos not in matched_r2_indices
-            ]
+                if ri < n_unmatched_r1:
+                    matched_r2_active_positions.add(ri)
+
+        # Keep only unmatched active tracks that were NOT matched in round 2
+        unmatched_tracks_r1 = [
+            unmatched_tracks_r1[pos]
+            for pos in range(n_unmatched_r1)
+            if pos not in matched_r2_active_positions
+        ]
 
         # ---- Spawn new tracks from unmatched high-conf dets ----
         for ci in unmatched_dets_r1:
