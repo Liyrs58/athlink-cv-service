@@ -7,15 +7,12 @@ import torch
 import sys
 import os
 
-# BotSort import with fallback
+# Deep-EIoU tracker (replaces BoT-SORT)
 try:
-    from boxmot import BotSort
-except (ImportError, AttributeError):
-    try:
-        from boxmot.trackers.botsort.botsort import BotSort
-    except ImportError:
-        print("[ERROR] BotSort import failed")
-        BotSort = None
+    from services.deep_eiou import DeepEIoUTracker, GTALink, build_tracklet_summaries
+except (ImportError, ModuleNotFoundError):
+    sys.path.insert(0, os.path.dirname(__file__))
+    from deep_eiou import DeepEIoUTracker, GTALink, build_tracklet_summaries
 
 # Identity + VLM imports
 try:
@@ -28,94 +25,45 @@ except (ImportError, ModuleNotFoundError):
 
 
 class TrackerCore:
-    def __init__(self, yolo_path, reid_path, device="cpu"):
+    def __init__(self, yolo_path, device="cpu"):
         self.device = device
 
         yolo_path = os.path.abspath(yolo_path)
-        reid_path = os.path.abspath(reid_path)
-
         print(f"[TrackerCore] YOLO: {yolo_path} (exists: {os.path.exists(yolo_path)})")
-        print(f"[TrackerCore] ReID: {reid_path} (exists: {os.path.exists(reid_path)})")
 
         yolo_device = "cuda" if device in ("0", "cuda") else "cpu"
-        boxmot_device = "0" if device in ("0", "cuda") else "cpu"
-
         self.yolo = YOLO(yolo_path)
         self.yolo.to(yolo_device)
 
-        if BotSort is None:
-            raise RuntimeError("BotSort not available")
-
-        self.tracker = BotSort(
-            reid_weights=Path(reid_path),
-            device=boxmot_device,
-            half=True,
-            asso_func="iou",
-            per_class=False,
-            max_age=150,
-            det_thresh=0.3,
-            proximity_thresh=0.5,
-            cmc_method="ecc",
-            # Target params (Step A: correct init values)
-            match_thresh=0.30,
-            appearance_thresh=0.55,
-            new_track_thresh=0.40,
+        # Deep-EIoU tracker (no external ReID model needed — uses YOLO crops via identity)
+        self.tracker = DeepEIoUTracker(
             track_high_thresh=0.50,
             track_low_thresh=0.10,
-            track_buffer=150,
-            frame_rate=25,
+            new_track_thresh=0.40,
+            match_thresh=0.70,
+            iou_only_thresh=0.80,
+            max_age=150,
+            min_hits=3,
+            expand_r1=1.5,
+            expand_r2=2.0,
         )
-
-        # Step A: patch runtime object for all candidate nested paths
-        self._patch_botsort_params()
+        print("[TrackerCore] Deep-EIoU tracker initialised")
 
         # VLM: game state only (scene detection)
         self.vlm = VLMStateMachine(device=device)
         # Identity core: deterministic ID assignment via ReID + position
         self.identity = IdentityCore()
-        self.id_remap = {}  # botsort_tid -> int PID
+        self.id_remap = {}  # de_tid -> int PID
         self._snapshot_taken = False
         self._needs_revival = False
 
-        # Step B+C: scene state tracking
-        self._scene_state = "play"
+        # Scene state tracking
         self._active_baseline = 0
         self._track_history = []
         self._transition_frame = -1
 
         self.frame_idx = 0
         self.results = []
-
-        # Log initial params
-        self._log_botsort_params()
-
-    def _patch_botsort_params(self):
-        """Step A: Patch actual runtime object used during update()."""
-        params = {
-            'match_thresh': 0.30,
-            'appearance_thresh': 0.55,
-            'new_track_thresh': 0.40,
-            'track_high_thresh': 0.50,
-            'track_low_thresh': 0.10,
-            'track_buffer': 150,
-            'frame_rate': 25,
-        }
-        for candidate in [self.tracker, getattr(self.tracker, 'tracker', None),
-                         getattr(self.tracker, 'args', None)]:
-            if candidate is None:
-                continue
-            for key, val in params.items():
-                if hasattr(candidate, key):
-                    setattr(candidate, key, val)
-
-    def _log_botsort_params(self):
-        """Step C: Log params from actual matcher object."""
-        t = self.tracker
-        params = {k: getattr(t, k, None) for k in [
-            'match_thresh', 'appearance_thresh', 'new_track_thresh',
-            'track_high_thresh', 'track_low_thresh', 'track_buffer', 'frame_rate'
-        ]}
-        print(f"[TrackerCore] Live BotSort params: {params}")
 
     def detect(self, frame):
         """YOLO – returns np.array (N,6) [x1,y1,x2,y2,conf,cls]."""
@@ -136,39 +84,38 @@ class TrackerCore:
         return np.array(dets, dtype=float) if dets else np.empty((0, 6))
 
     def track(self, frame, dets):
-        return self.tracker.update(dets, frame)
+        """Run Deep-EIoU. dets is (N,6) [x1,y1,x2,y2,conf,cls]. Returns list of DETrack."""
+        if len(dets) == 0:
+            # Still call update so Kalman predicts and ages tracks
+            return self.tracker.update(
+                np.empty((0, 4)), np.empty((0,)), np.empty((0,)), None
+            )
+        bboxes  = dets[:, :4]
+        scores  = dets[:, 4]
+        classes = dets[:, 5]
+        return self.tracker.update(bboxes, scores, classes, embeds=None)
 
     def _extract_embeds(self):
+        """Extract mean embeddings from active DETrack objects."""
         embed_map = {}
-        try:
-            src = getattr(self.tracker, 'active_tracks',
-                          getattr(self.tracker, 'tracked_stracks', []))
-            for strack in src:
-                sid = getattr(strack, 'track_id', getattr(strack, 'id', None))
-                feat = getattr(strack, 'smooth_feat', None)
-                if sid is not None and feat is not None:
-                    embed_map[int(sid)] = feat.copy()
-        except Exception:
-            pass
+        for tr in self.tracker.active_tracks:
+            emb = tr.mean_embed
+            if emb is not None:
+                embed_map[tr.track_id] = emb
         return embed_map
 
     def _build_track_inputs(self, tracks, embed_map):
+        """tracks is list of DETrack objects."""
         track_objs, positions, embeddings = [], {}, {}
-        for t in tracks:
-            if len(t) < 5:
-                continue
-            tid = int(t[4])
-            cx = (float(t[0]) + float(t[2])) / 2
-            cy = (float(t[1]) + float(t[3])) / 2
+        for tr in tracks:
+            tid = tr.track_id
+            bbox = tr.bbox  # [x1,y1,x2,y2]
+            cx = (bbox[0] + bbox[2]) / 2
+            cy = (bbox[1] + bbox[3]) / 2
             positions[tid] = (cx, cy)
             if tid in embed_map:
                 embeddings[tid] = embed_map[tid]
-
-            class _T:
-                pass
-            obj = _T()
-            obj.track_id = tid
-            track_objs.append(obj)
+            track_objs.append(tr)  # DETrack has .track_id already
         return track_objs, positions, embeddings
 
     def _update_collapse_guard(self, n_tracks):
@@ -270,19 +217,17 @@ class TrackerCore:
 
         if save:
             players = []
-            for t in tracks:
-                if len(t) < 8:
-                    continue
-                x1, y1, x2, y2, tid, conf, cls, _ = t
-                tid_int = int(tid)
-                final_pid = self.id_remap.get(tid_int)
+            for tr in tracks:
+                # DETrack object
+                final_pid = self.id_remap.get(tr.track_id)
                 if final_pid is None:
                     continue
+                x1, y1, x2, y2 = tr.bbox
                 players.append({
                     "trackId": final_pid,
                     "bbox": [float(x1), float(y1), float(x2), float(y2)],
-                    "confidence": float(conf),
-                    "class": int(cls),
+                    "confidence": float(tr.score),
+                    "class": int(tr.cls),
                     "gameState": state.value,
                     "analysis_valid": True,
                 })
@@ -317,12 +262,10 @@ def run_tracking(video_path, job_id, frame_stride=1, max_frames=None, device="cp
 
     if os.path.exists("/content/roboflow_players.pt"):
         yolo_path = "/content/roboflow_players.pt"
-        reid_path = "/content/athlink-cv-service/models/osnet_x1_0_msmt17.pt"
     else:
         yolo_path = "models/roboflow_players.pt"
-        reid_path = "models/osnet_x1_0_msmt17.pt"
 
-    tracker = TrackerCore(yolo_path=yolo_path, reid_path=reid_path, device=device)
+    tracker = TrackerCore(yolo_path=yolo_path, device=device)
 
     video_frame = 0
     processed = 0
