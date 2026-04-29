@@ -336,12 +336,14 @@ class DeepEIoUTracker:
         self.lost = [tr for tr in self.lost if tr.time_since_update <= self.max_age]
         self.lost.extend(newly_lost)
 
-        # ---- Recover from lost pool if matched in r1/r2 ----
-        # (tracks in lost that got updated above are implicitly recovered via state)
-        recovered = [tr for tr in self.lost if tr.state == "tracked"]
-        for tr in recovered:
-            self.lost.remove(tr)
-            self.tracked.append(tr)
+        # ---- Age lost pool, recover any that were matched in r1/r2 ----
+        still_lost = []
+        for tr in self.lost:
+            if tr.state == "tracked":
+                self.tracked.append(tr)  # recovered
+            elif tr.time_since_update <= self.max_age:
+                still_lost.append(tr)
+        self.lost = still_lost
 
         # Remove dead tracks
         self.tracked = [tr for tr in self.tracked if tr.time_since_update <= self.max_age]
