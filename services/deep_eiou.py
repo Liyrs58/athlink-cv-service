@@ -306,12 +306,15 @@ class DeepEIoUTracker:
             iou_cost  = 1.0 - _iou_matrix(exp_tr, exp_det)
 
             mr2, mc2, still_unmatched_r, _ = _greedy_assign(iou_cost, self.iou_only_thresh)
+            n_unmatched_r1 = len(unmatched_tracks_r1)
+            matched_r2_indices = set(mr2)
             for ri, ci in zip(mr2, mc2):
                 r2_tracks[ri].update(lo_bboxes[ci], lo_scores[ci], None, self._frame)
-                # Remove from unmatched_tracks_r1 if it was there
-                idx = unmatched_tracks_r1.index(ri) if ri < len(unmatched_tracks_r1) else -1
-                if idx >= 0:
-                    unmatched_tracks_r1.pop(idx)
+            # Remove from unmatched_tracks_r1 any r2 index that was in the unmatched_r1 portion
+            unmatched_tracks_r1 = [
+                idx for pos, idx in enumerate(unmatched_tracks_r1)
+                if pos not in matched_r2_indices
+            ]
 
         # ---- Spawn new tracks from unmatched high-conf dets ----
         for ci in unmatched_dets_r1:
