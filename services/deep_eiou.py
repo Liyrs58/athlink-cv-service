@@ -240,6 +240,8 @@ class DeepEIoUTracker:
         self.expand_r1         = expand_r1
         self.expand_r2         = expand_r2
 
+        self.track_buffer      = 30     # frames before tracked→lost demotion
+
         self.tracked:  List[DETrack] = []
         self.lost:     List[DETrack] = []
         self._frame    = 0
@@ -271,10 +273,21 @@ class DeepEIoUTracker:
         lo_scores  = scores[low_mask]
         lo_cls     = classes[low_mask]
 
-        active = [tr for tr in self.tracked if tr.time_since_update <= 1]
-        stale  = [tr for tr in self.tracked if tr.time_since_update > 1]
+        # Split tracked into active (recently matched) vs stale (drifting)
+        # Bug #1 fix: demote stale tracks to lost after track_buffer frames
+        active = []
+        demoted_to_lost = []
+        for tr in self.tracked:
+            if tr.time_since_update <= 1:
+                active.append(tr)
+            elif tr.time_since_update > self.track_buffer:
+                # Dormant demotion: track hasn't matched in 30 frames → lost
+                tr.mark_lost()
+                demoted_to_lost.append(tr)
+            else:
+                active.append(tr)  # stale but within buffer, still participable
 
-        # ---- Round 1: high-conf dets vs active tracks ----
+        # ---- Round 1: high-conf dets vs ALL active/stale tracked ----
         unmatched_tracks_r1 = list(range(len(active)))
         unmatched_dets_r1   = list(range(len(hi_bboxes)))
 
@@ -287,8 +300,6 @@ class DeepEIoUTracker:
             emb_list  = [e if e is not None else None for e in hi_embeds]
             app_cost  = _embed_cost(active, emb_list)
 
-            # Blend: appearance 50% + iou 50%
-            # If track has no embedding, fall back to iou only
             has_embed = np.array([tr.mean_embed is not None for tr in active])
             cost = np.where(has_embed[:, None], 0.5 * iou_cost + 0.5 * app_cost, iou_cost)
 
@@ -297,12 +308,9 @@ class DeepEIoUTracker:
                 emb = hi_embeds[ci] if embeds is not None else None
                 active[ri].update(hi_bboxes[ci], hi_scores[ci], emb, self._frame)
 
-        # ---- Round 2: low-conf dets vs unmatched active + stale tracks ----
-        # r2_tracks[0 .. n_unmatched_r1-1] = unmatched active tracks
-        # r2_tracks[n_unmatched_r1 ...]    = stale tracks
-        n_unmatched_r1 = len(unmatched_tracks_r1)
-        r2_tracks = [active[i] for i in unmatched_tracks_r1] + stale
-        matched_r2_active_positions = set()  # positions in r2_tracks that are < n_unmatched_r1
+        # ---- Round 2: low-conf dets vs unmatched tracks (IoU only) ----
+        r2_tracks = [active[i] for i in unmatched_tracks_r1]
+        matched_r2_positions = set()
         if len(r2_tracks) > 0 and len(lo_bboxes) > 0:
             tr_bboxes = np.array([tr.bbox for tr in r2_tracks])
             exp_tr    = _expand_boxes(tr_bboxes, self.expand_r2)
@@ -312,44 +320,74 @@ class DeepEIoUTracker:
             mr2, mc2, _, _ = _greedy_assign(iou_cost, self.iou_only_thresh)
             for ri, ci in zip(mr2, mc2):
                 r2_tracks[ri].update(lo_bboxes[ci], lo_scores[ci], None, self._frame)
-                if ri < n_unmatched_r1:
-                    matched_r2_active_positions.add(ri)
+                matched_r2_positions.add(ri)
 
-        # Keep only unmatched active tracks that were NOT matched in round 2
-        unmatched_tracks_r1 = [
-            unmatched_tracks_r1[pos]
-            for pos in range(n_unmatched_r1)
-            if pos not in matched_r2_active_positions
+        # Tracks still unmatched after both rounds
+        finally_unmatched = [
+            active[unmatched_tracks_r1[pos]]
+            for pos in range(len(unmatched_tracks_r1))
+            if pos not in matched_r2_positions
         ]
 
-        # ---- Spawn new tracks from unmatched high-conf dets ----
+        # ---- Round 3 (Bug #2 fix): try unmatched high-conf dets against lost pool ----
+        # Recover lost tracks before spawning new ones to prevent duplicates
+        used_det_indices = set()  # det indices consumed by lost recovery
+        if len(unmatched_dets_r1) > 0 and len(self.lost) > 0:
+            r3_dets_idx = unmatched_dets_r1
+            r3_bboxes = hi_bboxes[r3_dets_idx] if len(r3_dets_idx) > 0 else np.empty((0, 4))
+            if len(r3_bboxes) > 0:
+                tr_bboxes = np.array([tr.bbox for tr in self.lost])
+                exp_tr  = _expand_boxes(tr_bboxes, self.expand_r2)
+                exp_det = _expand_boxes(r3_bboxes, self.expand_r2)
+                iou_cost = 1.0 - _iou_matrix(exp_tr, exp_det)
+
+                # Also use appearance if available
+                r3_embeds = [hi_embeds[ci] if embeds is not None else None for ci in r3_dets_idx]
+                app_cost = _embed_cost(self.lost, r3_embeds)
+                has_embed = np.array([tr.mean_embed is not None for tr in self.lost])
+                cost_r3 = np.where(has_embed[:, None], 0.5 * iou_cost + 0.5 * app_cost, iou_cost)
+
+                mr3, mc3, _, _ = _greedy_assign(cost_r3, self.match_thresh)
+                for ri, ci in zip(mr3, mc3):
+                    emb = hi_embeds[r3_dets_idx[ci]] if embeds is not None else None
+                    self.lost[ri].update(hi_bboxes[r3_dets_idx[ci]], hi_scores[r3_dets_idx[ci]], emb, self._frame)
+                    self.lost[ri].state = "tracked"
+                    used_det_indices.add(r3_dets_idx[ci])
+
+        # ---- Spawn new tracks ONLY from truly unmatched high-conf dets ----
         for ci in unmatched_dets_r1:
+            if ci in used_det_indices:
+                continue  # already recovered a lost track
             if hi_scores[ci] >= self.new_track_thresh:
                 emb = hi_embeds[ci] if embeds is not None else None
                 tr = DETrack(hi_bboxes[ci], hi_scores[ci], hi_cls[ci], emb, self._frame)
                 self.tracked.append(tr)
 
-        # ---- Update lost pool ----
-        newly_lost = [active[i] for i in unmatched_tracks_r1]
-        for tr in newly_lost:
+        # ---- Move unmatched active tracks to lost ----
+        for tr in finally_unmatched:
             tr.mark_lost()
-        self.lost = [tr for tr in self.lost if tr.time_since_update <= self.max_age]
-        self.lost.extend(newly_lost)
+        self.lost.extend(demoted_to_lost)
+        self.lost.extend(finally_unmatched)
 
-        # ---- Age lost pool, recover any that were matched in r1/r2 ----
+        # ---- Process lost pool: recover matched, prune dead ----
         still_lost = []
         for tr in self.lost:
             if tr.state == "tracked":
-                self.tracked.append(tr)  # recovered
+                self.tracked.append(tr)
             elif tr.time_since_update <= self.max_age:
                 still_lost.append(tr)
         self.lost = still_lost
 
-        # Remove dead tracks
-        self.tracked = [tr for tr in self.tracked if tr.time_since_update <= self.max_age]
+        # Remove dead tracks from tracked
+        self.tracked = [tr for tr in self.tracked if tr.time_since_update <= self.track_buffer]
 
         # Return only confirmed active tracks
         return [tr for tr in self.tracked if tr.hits >= self.min_hits]
+
+    def reset(self):
+        """Bug #3: Clear all track state on scene boundary (e.g. bench_shot→play)."""
+        self.tracked.clear()
+        self.lost.clear()
 
     @property
     def active_tracks(self) -> List[DETrack]:

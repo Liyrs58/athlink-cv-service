@@ -61,6 +61,7 @@ class TrackerCore:
         self._active_baseline = 0
         self._track_history = []
         self._transition_frame = -1
+        self._prev_is_freeze = False
 
         self.frame_idx = 0
         self.results = []
@@ -145,7 +146,14 @@ class TrackerCore:
         is_freeze = state.is_freeze()
         is_play = state.is_play()
 
-        # Run BotSort (always except hard freeze)
+        # Bug #3: Reset tracker on freeze→play transition (purge ghost tracks)
+        if self._prev_is_freeze and is_play:
+            self.tracker.reset()
+            self.id_remap.clear()
+            print(f"[Reset] Frame {video_frame}: freeze→play, tracker reset")
+        self._prev_is_freeze = is_freeze
+
+        # Run tracker (always except hard freeze)
         if not is_freeze:
             tracks = self.track(frame, dets)
             n_tracks = len(tracks)
