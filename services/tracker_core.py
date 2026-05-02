@@ -212,12 +212,13 @@ class TrackerCore:
 
         # Suppress noisy tracks before identity sees them
         tracks, _sup_stats = self.suppressor.suppress(tracks, frame, video_frame)
-        # Filter out referees/officials
-        tracks, _officials = self.role_filter.filter(tracks, frame, video_frame)
+        # Filter out referees/officials (DISABLED FOR TESTING)
+        # tracks, _officials = self.role_filter.filter(tracks, frame, video_frame)
+        player_tracks = tracks  # No role filter
 
         # Step E: Recovery on first valid play after freeze
         embed_map = self._extract_embeds()
-        track_objs, positions, embeddings = self._build_track_inputs(tracks, embed_map)
+        track_objs, positions, embeddings = self._build_track_inputs(player_tracks, embed_map)
 
         if is_play and len(track_objs) > 0:
             self.identity.begin_frame(video_frame)
@@ -241,7 +242,7 @@ class TrackerCore:
 
         if save:
             players = []
-            for tr in tracks:
+            for tr in player_tracks:
                 # DETrack object
                 final_pid = self.id_remap.get(tr.track_id)
                 if final_pid is None:
