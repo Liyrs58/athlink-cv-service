@@ -65,7 +65,8 @@ class IdentityCore:
             s.state = "lost"
             s.active_track_id = None
             s.seen_this_frame = False
-        self._bench_snapshot.clear()
+        # BUG FIX 3: Do NOT clear snapshot here! It was taken BEFORE the cutaway 
+        # specifically to be used AFTER the cutaway.
         self._recovery_frames_left = 60  # permissive matching for 60 frames
 
     # ------------------------------------------------------------------

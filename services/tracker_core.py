@@ -96,6 +96,39 @@ class TrackerCore:
                 ])
         return np.array(dets, dtype=float) if dets else np.empty((0, 6))
 
+    def _extract_torso_hsv(self, frame: np.ndarray, bbox: list) -> np.ndarray:
+        """Extract HSV hue/sat histogram from torso region as a fast ReID embedding."""
+        x1, y1, x2, y2 = [int(v) for v in bbox]
+        h, w = frame.shape[:2]
+        x1, x2 = max(0, x1), min(w, x2)
+        y1, y2 = max(0, y1), min(h, y2)
+        
+        bw, bh = x2 - x1, y2 - y1
+        if bw < 8 or bh < 15:
+            return np.zeros(52, dtype=np.float32)  # 36 Hue + 16 Sat bins
+
+        # Torso: top 15-55% of height, center 60% of width
+        ty1, ty2 = y1 + int(bh * 0.15), y1 + int(bh * 0.55)
+        tx1, tx2 = x1 + int(bw * 0.20), x1 + int(bw * 0.80)
+        
+        crop = frame[ty1:ty2, tx1:tx2]
+        if crop.size == 0:
+            return np.zeros(52, dtype=np.float32)
+
+        hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+        # Avoid pitch green
+        green_mask = cv2.inRange(hsv, np.array([25, 20, 20]), np.array([95, 255, 255]))
+        non_green = cv2.bitwise_not(green_mask)
+        
+        h_hist = cv2.calcHist([hsv], [0], non_green, [36], [0, 180]).flatten()
+        s_hist = cv2.calcHist([hsv], [1], non_green, [16], [0, 256]).flatten()
+        
+        hist = np.concatenate([h_hist, s_hist])
+        norm = np.linalg.norm(hist)
+        if norm > 0:
+            hist /= norm
+        return hist.astype(np.float32)
+
     def track(self, frame, dets):
         """Run Deep-EIoU. dets is (N,6) [x1,y1,x2,y2,conf,cls]. Returns list of DETrack."""
         if len(dets) == 0:
@@ -106,7 +139,14 @@ class TrackerCore:
         bboxes  = dets[:, :4]
         scores  = dets[:, 4]
         classes = dets[:, 5]
-        return self.tracker.update(bboxes, scores, classes, embeds=None)
+        
+        # Extract embeddings for all detections
+        embeds = []
+        for bbox in bboxes:
+            embeds.append(self._extract_torso_hsv(frame, bbox))
+        embeds = np.array(embeds)
+        
+        return self.tracker.update(bboxes, scores, classes, embeds=embeds)
 
     def _extract_embeds(self):
         """Extract mean embeddings from active DETrack objects."""
@@ -190,6 +230,23 @@ class TrackerCore:
             # Establish baseline (first 30 valid frames)
             if len(self._track_history) == 30 and self._active_baseline == 0:
                 self._active_baseline = max(1, sum(self._track_history) / 30)
+                
+                # BUG FIX 4: Wire Team Centroids to RoleFilter
+                if not getattr(self, "_teams_initialized", False):
+                    valid_embeds = []
+                    for tr in tracks:
+                        if tr.mean_embed is not None and tr.hits > 5:
+                            valid_embeds.append(tr.mean_embed)
+                    if len(valid_embeds) >= 10:
+                        try:
+                            from sklearn.cluster import KMeans
+                            kmeans = KMeans(n_clusters=2, random_state=42, n_init=10).fit(valid_embeds)
+                            centers = kmeans.cluster_centers_
+                            self.role_filter.set_team_centroids(centers[0], centers[1])
+                            self._teams_initialized = True
+                            print("[TrackerCore] Team centroids initialized via K-Means")
+                        except Exception as e:
+                            print(f"[TrackerCore] Failed to init team centroids: {e}")
 
             # Detect collapse
             if self._active_baseline > 0 and len(self._track_history) >= 10:

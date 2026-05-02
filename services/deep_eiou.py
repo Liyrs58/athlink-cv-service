@@ -364,25 +364,38 @@ class DeepEIoUTracker:
                 self.tracked.append(tr)
 
         # ---- Move unmatched active tracks to lost ----
+        lost_tids = set()
         for tr in finally_unmatched:
             tr.mark_lost()
+            lost_tids.add(tr.track_id)
+        for tr in demoted_to_lost:
+            lost_tids.add(tr.track_id)
+            
         self.lost.extend(demoted_to_lost)
         self.lost.extend(finally_unmatched)
 
         # ---- Process lost pool: recover matched, prune dead ----
+        recovered_tids = set()
         still_lost = []
         for tr in self.lost:
             if tr.state == "tracked":
                 self.tracked.append(tr)
+                recovered_tids.add(tr.track_id)
             elif tr.time_since_update <= self.max_age:
                 still_lost.append(tr)
         self.lost = still_lost
 
-        # Remove dead tracks from tracked
-        self.tracked = [tr for tr in self.tracked if tr.time_since_update <= self.track_buffer]
+        # BUG FIX 1: Remove dead/lost tracks from tracked
+        # Only keep tracks that are actively tracked, and not freshly lost
+        self.tracked = [
+            tr for tr in self.tracked 
+            if tr.state == "tracked" 
+            and tr.time_since_update <= self.track_buffer
+            and tr.track_id not in lost_tids
+        ]
 
         # Return only confirmed active tracks
-        return [tr for tr in self.tracked if tr.hits >= self.min_hits]
+        return [tr for tr in self.tracked if tr.hits >= self.min_hits and tr.state == "tracked"]
 
     def reset(self):
         """Bug #3: Clear all track state on scene boundary (e.g. bench_shot→play)."""
@@ -391,7 +404,7 @@ class DeepEIoUTracker:
 
     @property
     def active_tracks(self) -> List[DETrack]:
-        return [tr for tr in self.tracked if tr.hits >= self.min_hits]
+        return [tr for tr in self.tracked if tr.hits >= self.min_hits and tr.state == "tracked"]
 
 
 # ---------------------------------------------------------------------------
