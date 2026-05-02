@@ -22,6 +22,8 @@ class PlayerSlot:
     last_seen_frame: int = -10**9
     last_position: Optional[Tuple[float, float]] = None
     embedding: Optional[np.ndarray] = None
+    stability_counter: int = 0  # Number of consecutive frames this slot has been active
+
 
     def update_embedding(self, emb: np.ndarray) -> None:
         emb = emb.astype(np.float32)
@@ -148,6 +150,7 @@ class IdentityCore:
             slot.state = "active"
             slot.last_seen_frame = self.frame_id
             slot.last_position = positions.get(tid)
+            slot.stability_counter += 1
 
             # Prompt 11: Only update embedding if crop quality allows it
             emb = embeddings.get(tid)
@@ -175,6 +178,8 @@ class IdentityCore:
             age = self.frame_id - s.last_seen_frame
             s.state = "dormant" if age <= DORMANT_TTL else "lost"
             s.active_track_id = None
+            if not s.seen_this_frame:
+                s.stability_counter = 0
 
     # ------------------------------------------------------------------
     # Bench snapshot / revival (Priority D)
@@ -309,15 +314,23 @@ class IdentityCore:
         recency = min(max(self.frame_id - slot.last_seen_frame, 0), DORMANT_TTL)
         recency_penalty = recency / float(DORMANT_TTL) * 0.15
 
+        # Architecture Change 2: Identity Lock / Anti-Swap logic
+        # If slot has been stable for >= 10 frames, give it a large "continuity lock" discount
+        # to prevent same-team swaps when appearance is ambiguous.
+        lock_discount = 0.0
+        if slot.stability_counter >= 10:
+            lock_discount = 0.15
+
         # Bug Fix F: Lower HSV weight but use it securely. Give position even less weight during recovery!
         if self._recovery_frames_left > 0:
-            final_cost = 0.85 * emb_cost + 0.05 * pos_cost + recency_penalty
+            # Recovery Mode: prioritize appearance almost exclusively
+            final_cost = 0.90 * emb_cost + 0.05 * pos_cost + recency_penalty - lock_discount
         else:
             # Active tracking
             if recency == 0:
                 # Strong continuity prior if active
-                final_cost = 0.50 * emb_cost + 0.30 * pos_cost - 0.10
+                final_cost = 0.50 * emb_cost + 0.35 * pos_cost - 0.10 - lock_discount
             else:
-                final_cost = 0.60 * emb_cost + 0.25 * pos_cost + recency_penalty
+                final_cost = 0.65 * emb_cost + 0.25 * pos_cost + recency_penalty - (lock_discount * 0.5)
                 
         return float(max(0.0, min(1.0, final_cost)))

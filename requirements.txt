@@ -10,6 +10,7 @@ python-dotenv==1.0.0
 # Computer vision and object detection
 opencv-python-headless>=4.9.0
 ultralytics>=8.1.0        # YOLOv8/11 for player detection
+torchvision>=0.16.0       # For ResNet50 ReID fallback
 yolov5>=7.0.0             # YOLOv5 legacy support
 boxmot>=10.0.0            # BoT-SORT tracking algorithm
 supervision>=0.26.0       # Detection handling + visualization

@@ -14,6 +14,13 @@ except (ImportError, ModuleNotFoundError):
     sys.path.insert(0, os.path.dirname(__file__))
     from deep_eiou import DeepEIoUTracker, GTALink, build_tracklet_summaries
 
+try:
+    import torchvision
+    import torchvision.transforms as T
+    from torchvision.models import resnet50, ResNet50_Weights
+except ImportError:
+    torchvision = None
+
 # Identity + VLM imports
 try:
     from services.identity_core import IdentityCore
@@ -28,6 +35,59 @@ except (ImportError, ModuleNotFoundError):
     from track_suppressor import TrackSuppressor
     from role_filter import RoleFilter
     from crop_quality import CropQualityGate
+
+
+class ReIDExtractor:
+    def __init__(self, device="cpu"):
+        self.device = "cuda" if "cuda" in str(device) else "cpu"
+        if torch.backends.mps.is_available():
+            self.device = "mps"
+            
+        self.mode = "HSV-fallback"
+        self.model = None
+        
+        if torchvision is not None:
+            try:
+                print("[ReID] loading ResNet50 appearance model...")
+                self.model = resnet50(weights=ResNet50_Weights.DEFAULT)
+                self.model.fc = torch.nn.Identity() 
+                self.model.to(self.device)
+                self.model.eval()
+                self.transform = T.Compose([
+                    T.ToPILImage(),
+                    T.Resize((128, 128)), # Balanced for speed
+                    T.ToTensor(),
+                    T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+                ])
+                self.mode = "ResNet50"
+                print(f"[ReID] using {self.mode} appearance backbone")
+            except Exception as e:
+                print(f"[ReID] ResNet50 load failed: {e}. Falling back to HSV.")
+        else:
+            print("[ReID] torchvision not found. Using HSV fallback only - same-team identity unreliable.")
+
+    def extract(self, crops: list) -> list:
+        if self.model is None or not crops:
+            return []
+        
+        features_list = []
+        # Batching for performance
+        batch_size = 16
+        for i in range(0, len(crops), batch_size):
+            batch_crops = crops[i:i+batch_size]
+            tensors = []
+            for c in batch_crops:
+                if c.size == 0:
+                    tensors.append(torch.zeros((3, 128, 128)))
+                else:
+                    tensors.append(self.transform(c))
+            
+            batch_tensor = torch.stack(tensors).to(self.device)
+            with torch.no_grad():
+                feat = self.model(batch_tensor)
+                feat = torch.nn.functional.normalize(feat, p=2, dim=1)
+                features_list.extend([f.cpu().numpy() for f in feat])
+        return features_list
 
 
 class TrackerCore:
@@ -59,6 +119,7 @@ class TrackerCore:
         self.vlm = VLMStateMachine(device=device)
         # Identity core: deterministic ID assignment via ReID + position
         self.identity = IdentityCore()
+        self.reid = ReIDExtractor(device=device)
         self.suppressor = TrackSuppressor()
         self.role_filter = RoleFilter()
         self.crop_quality = CropQualityGate()
@@ -69,6 +130,8 @@ class TrackerCore:
         # Scene state tracking
         self._active_baseline = 0
         self._track_history = []
+        self._soft_collapse = False
+        self._soft_recovery_frames = 0
         self._transition_frame = -1
         self._prev_is_freeze = False
 
@@ -148,44 +211,46 @@ class TrackerCore:
         
         return self.tracker.update(bboxes, scores, classes, embeds=embeds)
 
-    def _extract_embeds(self):
-        """Extract mean embeddings from active DETrack objects."""
+    def _extract_embeds(self, frame, tracks):
+        """Architecture Change 3: Extract real ResNet embeddings if available + HSV."""
+        if not tracks:
+            return {}
+            
+        tid_to_crop = {}
+        h, w = frame.shape[:2]
+        for tr in tracks:
+            x1, y1, x2, y2 = [int(v) for v in tr.bbox]
+            crop = frame[max(0, y1):min(h, y2), max(0, x1):min(w, x2)]
+            tid_to_crop[tr.track_id] = crop
+
+        tids = list(tid_to_crop.keys())
+        crops = [tid_to_crop[tid] for tid in tids]
+        
+        # Load real embeddings if model exists
+        if self.reid.mode == "ResNet50":
+            feats = self.reid.extract(crops)
+            return {tids[i]: feats[i] for i in range(len(tids))}
+        
+        # Fallback to HSV
         embed_map = {}
-        for tr in self.tracker.active_tracks:
-            emb = tr.mean_embed
+        for tr in tracks:
+            emb = self._extract_torso_hsv(frame, tr.bbox)
             if emb is not None:
                 embed_map[tr.track_id] = emb
         return embed_map
 
-    def _build_track_inputs(self, tracks, embed_map):
-        """tracks is list of DETrack objects."""
-        track_objs, positions, embeddings = [], {}, {}
-        for tr in tracks:
-            tid = tr.track_id
-            bbox = tr.bbox  # [x1,y1,x2,y2]
-            cx = (bbox[0] + bbox[2]) / 2
-            cy = (bbox[1] + bbox[3]) / 2
-            positions[tid] = (cx, cy)
-            if tid in embed_map:
-                embeddings[tid] = embed_map[tid]
-            track_objs.append(tr)  # DETrack has .track_id already
-        return track_objs, positions, embeddings
-
-    def _update_collapse_guard(self, n_tracks):
-        """Priority B: detect pre-cutaway track collapse."""
-        self._track_history.append(n_tracks)
-        if len(self._track_history) > 20:
-            self._track_history.pop(0)
-
-        # Set baseline from first 30 frames
-        if len(self._track_history) == 30 and self._baseline_tracks == 0:
-            self._baseline_tracks = max(1, sum(self._track_history) / 30)
-
-        if self._baseline_tracks > 0 and len(self._track_history) >= 10:
-            recent_mean = sum(self._track_history[-10:]) / 10
-            self._suspend_birth = recent_mean < 0.5 * self._baseline_tracks
-        else:
-            self._suspend_birth = False
+    def _detect_overlay(self, frame):
+        """Architecture Change 5: Detect lower-third graphics."""
+        h, w = frame.shape[:2]
+        # Check bottom 25%
+        roi = frame[int(h*0.75):, :]
+        if roi.size == 0: return False
+        # High homogeneity or high-contrast horizontal edges typically signify UI
+        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        edges = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
+        edge_intensity = np.mean(np.abs(edges))
+        # If very uniform (solid bar) OR very high edge intensity (text on bar)
+        return edge_intensity < 2.0 or edge_intensity > 40.0
 
     def process_frame(self, frame, video_frame, dets, save=True):
         """
@@ -259,18 +324,28 @@ class TrackerCore:
                     except Exception as e:
                         print(f"[TrackerCore] Failed to init team centroids: {e}")
 
-            # Detect collapse
+            # Detect collapse (Architecture Change 1)
             if self._active_baseline > 0 and len(self._track_history) >= 10:
                 recent_mean = sum(self._track_history[-10:]) / 10
                 active_drop = recent_mean / max(self._active_baseline, 1)
 
-                # Step D: Early snapshot if collapse detected (not waiting for hard freeze)
-                if active_drop <= 0.70 and not self._snapshot_taken:
+                # Soft Collapse: 70% of baseline during play
+                if active_drop <= 0.70:
+                    if not self._soft_collapse:
+                        saved = self.identity.snapshot_active(video_frame)
+                        self._soft_collapse = True
+                        print(f"[SoftCollapse] Frame {video_frame}: active drop {recent_mean:.1f}/{self._active_baseline:.1f} → snapshot {saved}")
+                elif active_drop >= 0.85 and self._soft_collapse:
+                    self._soft_collapse = False
+                    self._soft_recovery_frames = 60
+                    print(f"[SoftRecovery] Frame {video_frame}: count recovered → entering recovery mode")
+
+                # Early snapshot if hard collapse detected (pre-cutaway)
+                if active_drop <= 0.60 and not self._snapshot_taken:
                     saved = self.identity.snapshot_active(video_frame)
                     self._snapshot_taken = True
                     self._transition_frame = video_frame
-                    print(f"[Guard] Frame {video_frame}: active_drop={active_drop:.2f} "
-                          f"→ early snapshot ({saved} slots)")
+                    print(f"[Guard] Frame {video_frame}: hard collapse detected → early snapshot ({saved} slots)")
 
         # Step A: hard freeze scene — only age, no association
         if is_freeze:
@@ -301,48 +376,88 @@ class TrackerCore:
             visible_tracks, frame, video_frame
         )
         player_tracks = filtered_tracks
-
         # ── Prompt 11: Score crop quality for each track ──
         quality_scores = self.crop_quality.score_batch(player_tracks, frame, video_frame)
         self.crop_quality.maybe_log(video_frame)
 
-        # Filter out tracks with quality too low for assignment
+        # ── Architecture Change 4: Hard Field Exclusions ──
+        # Final hammer to keep refs/GK out of P1-P22 slots
         assignable_tracks = [
             t for t in player_tracks
-            if quality_scores.get(t.track_id) is None
-            or quality_scores[t.track_id].allow_assignment
+            if int(getattr(t, 'cls', 0)) == 2 # Field players only
+            and (quality_scores.get(t.track_id) is None or quality_scores[t.track_id].allow_assignment)
         ]
+        
+        # Architecture Change 5: Overlay Guard
+        is_overlay = self._detect_overlay(frame)
+        h, w = frame.shape[:2]
+        overlay_blocked_tids = set()
+        if is_overlay:
+            for t in player_tracks:
+                # If box bottom is in the lower third, block memory
+                if t.bbox[3] > h * 0.70:
+                    overlay_blocked_tids.add(t.track_id)
+            if video_frame % 30 == 0:
+                print(f"[OverlayGuard] Frame {video_frame}: blocked memory updates for {len(overlay_blocked_tids)} boxes")
 
         # Build set of track IDs that allow memory update
         memory_ok_tids = set()
         stale_memory_blocked = 0
         for t in player_tracks:
-            q = quality_scores.get(t.track_id)
-            if t.time_since_update == 0 and (q is None or q.allow_memory_update):
-                memory_ok_tids.add(t.track_id)
-            elif t.time_since_update > 0:
+            tid = t.track_id
+            q = quality_scores.get(tid)
+            
+            # Block if stale OR overlay OR low quality
+            if t.time_since_update > 0:
                 stale_memory_blocked += 1
+                continue
+            if tid in overlay_blocked_tids:
+                continue
+            if q is not None and not q.allow_memory_update:
+                continue
+            if self._soft_collapse: # Block memory during collapse
+                continue
                 
-        if stale_memory_blocked > 0 and video_frame % 30 == 0:
-            print(f"[TrackerCore] F{video_frame}: {stale_memory_blocked} memory updates blocked due to stale tracker age")
+            memory_ok_tids.add(tid)
+                
+        if (stale_memory_blocked > 0 or self._soft_collapse) and video_frame % 30 == 0:
+            msg = f"[TrackerCore] F{video_frame}: memory updates restricted"
+            if stale_memory_blocked > 0: msg += f" (stale={stale_memory_blocked})"
+            if self._soft_collapse: msg += " (SOFT_COLLAPSE active)"
+            print(msg)
 
         # Step E: Recovery on first valid play after freeze
-        embed_map = self._extract_embeds()
-        track_objs, positions, embeddings = self._build_track_inputs(
-            assignable_tracks, embed_map
-        )
+        embed_map = self._extract_embeds(frame, assignable_tracks)
+        
+        # Build inputs for identity
+        track_objs, positions, embeddings = [], {}, {}
+        for tr in assignable_tracks:
+            tid = tr.track_id
+            bx = tr.bbox
+            positions[tid] = ((bx[0]+bx[2])/2, (bx[1]+bx[3])/2)
+            if tid in embed_map:
+                embeddings[tid] = embed_map[tid]
+            track_objs.append(tr)
 
         if is_play and len(track_objs) > 0:
             self.identity.begin_frame(video_frame)
 
-            # First match: recovery-first if snapshot exists
+            # First match: recovery-first if snapshot exists (hard or soft)
             revived_tids = set()
-            if self._snapshot_taken and not self._needs_revival:
+            should_revive = (self._snapshot_taken and not self._needs_revival) or (self._soft_recovery_frames > 0)
+            
+            if should_revive:
                 revived = self.identity.revive_cost_matrix(track_objs, embeddings, positions)
-                self.id_remap = {tid: int(pid[1:]) for tid, pid in revived.items()}
-                self._needs_revival = True  # only try once
+                self.id_remap.update({tid: int(pid[1:]) for tid, pid in revived.items()})
                 revived_tids = set(revived.keys())
-                print(f"[Recovery] Frame {video_frame}: {len(revived)} revived from snapshot")
+                
+                if not self._needs_revival: # Hard revival used
+                    self._needs_revival = True
+                    print(f"[Recovery] Frame {video_frame}: {len(revived)} revived from scene snapshot")
+                else: # Soft recovery
+                    self._soft_recovery_frames -= 1
+                    if len(revived) > 0:
+                        print(f"[SoftRecovery] Frame {video_frame}: {len(revived)} revived from soft snapshot")
 
             # Then normal assignment — pass memory_ok set for gating, EXCLUDE revived
             normal_track_objs = [t for t in track_objs if t.track_id not in revived_tids]
