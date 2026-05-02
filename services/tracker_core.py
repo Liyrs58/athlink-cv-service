@@ -60,9 +60,9 @@ class ReIDExtractor:
                     T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
                 ])
                 self.mode = "ResNet50"
-                print(f"[ReID] using {self.mode} appearance backbone")
+                print(f"[ReID] {self.mode} fallback is generic, identity confidence limited")
             except Exception as e:
-                print(f"[ReID] ResNet50 load failed: {e}. Falling back to HSV.")
+                print(f"[ReID] ResNet50 fallback failed: {e}. Using HSV.")
         else:
             print("[ReID] torchvision not found. Using HSV fallback only - same-team identity unreliable.")
 
@@ -132,6 +132,8 @@ class TrackerCore:
         self._track_history = []
         self._soft_collapse = False
         self._soft_recovery_frames = 0
+        self._streak_collapse = 0
+        self._streak_recover = 0
         self._transition_frame = -1
         self._prev_is_freeze = False
 
@@ -293,59 +295,7 @@ class TrackerCore:
             tracks = []
             n_tracks = 0
 
-        # Step B: Collapse guard — detect pre-cutaway state BEFORE hard freeze
-        if is_play:
-            self._track_history.append(n_tracks)
-            if len(self._track_history) > 20:
-                self._track_history.pop(0)
-
-            # Establish baseline (first 30 valid frames)
-            if len(self._track_history) == 30 and self._active_baseline == 0:
-                self._active_baseline = max(1, sum(self._track_history) / 30)
-                
-            # BUG FIX 4: Wire Team Centroids to RoleFilter
-            # Retries every frame after baseline until it gets >=10 solid player crops
-            if self._active_baseline > 0 and not getattr(self, "_teams_initialized", False):
-                valid_embeds = []
-                for tr in tracks:
-                    # Only class 2 (field players) — exclude 1=goalkeeper, 3=referee
-                    cls_val = int(getattr(tr, 'cls', 0))
-                    if tr.mean_embed is not None and cls_val == 2 and tr.hits > 5:
-                        valid_embeds.append(tr.mean_embed)
-                
-                if len(valid_embeds) >= 10:
-                    try:
-                        from sklearn.cluster import KMeans
-                        kmeans = KMeans(n_clusters=2, random_state=42, n_init=10).fit(valid_embeds)
-                        centers = kmeans.cluster_centers_
-                        self.role_filter.set_team_centroids(centers[0], centers[1])
-                        self._teams_initialized = True
-                        print(f"[TrackerCore] Team centroids initialized via K-Means from {len(valid_embeds)} player samples")
-                    except Exception as e:
-                        print(f"[TrackerCore] Failed to init team centroids: {e}")
-
-            # Detect collapse (Architecture Change 1)
-            if self._active_baseline > 0 and len(self._track_history) >= 10:
-                recent_mean = sum(self._track_history[-10:]) / 10
-                active_drop = recent_mean / max(self._active_baseline, 1)
-
-                # Soft Collapse: 70% of baseline during play
-                if active_drop <= 0.70:
-                    if not self._soft_collapse:
-                        saved = self.identity.snapshot_active(video_frame)
-                        self._soft_collapse = True
-                        print(f"[SoftCollapse] Frame {video_frame}: active drop {recent_mean:.1f}/{self._active_baseline:.1f} → snapshot {saved}")
-                elif active_drop >= 0.85 and self._soft_collapse:
-                    self._soft_collapse = False
-                    self._soft_recovery_frames = 60
-                    print(f"[SoftRecovery] Frame {video_frame}: count recovered → entering recovery mode")
-
-                # Early snapshot if hard collapse detected (pre-cutaway)
-                if active_drop <= 0.60 and not self._snapshot_taken:
-                    saved = self.identity.snapshot_active(video_frame)
-                    self._snapshot_taken = True
-                    self._transition_frame = video_frame
-                    print(f"[Guard] Frame {video_frame}: hard collapse detected → early snapshot ({saved} slots)")
+        # Remove raw tracks collapse checking logic here
 
         # Step A: hard freeze scene — only age, no association
         if is_freeze:
@@ -399,6 +349,67 @@ class TrackerCore:
                     overlay_blocked_tids.add(t.track_id)
             if video_frame % 30 == 0:
                 print(f"[OverlayGuard] Frame {video_frame}: blocked memory updates for {len(overlay_blocked_tids)} boxes")
+                
+        # BUG FIX 4: Wire Team Centroids to RoleFilter
+        if is_play and not getattr(self, "_teams_initialized", False) and len(assignable_tracks) >= 15:
+            valid_embeds = [tr.mean_embed for tr in assignable_tracks if tr.mean_embed is not None and tr.hits > 5]
+            if len(valid_embeds) >= 10:
+                try:
+                    from sklearn.cluster import KMeans
+                    kmeans = KMeans(n_clusters=2, random_state=42, n_init=10).fit(valid_embeds)
+                    centers = kmeans.cluster_centers_
+                    self.role_filter.set_team_centroids(centers[0], centers[1])
+                    self._teams_initialized = True
+                    print(f"[TrackerCore] Team centroids initialized via K-Means from {len(valid_embeds)} player samples")
+                except Exception as e:
+                    pass
+
+        # ── SOFT-STATE TRACKING & COLLAPSE LOGIC ──
+        if is_play and not is_overlay:
+            current_count = len(assignable_tracks)
+            
+            # Maintain rolling baseline from strong play frames only
+            if current_count >= 18 and not self._soft_collapse:
+                self._track_history.append(current_count)
+                if len(self._track_history) > 30:
+                    self._track_history.pop(0)
+                self._active_baseline = max(18.0, float(sum(self._track_history)) / len(self._track_history))
+                
+            if self._active_baseline > 0:
+                # Trigger SoftCollapse if dropped below 65% for 3+ consecutive frames
+                if current_count <= 0.65 * self._active_baseline:
+                    self._streak_collapse += 1
+                else:
+                    self._streak_collapse = 0
+                    
+                # Trigger SoftRecovery if recovered above 80%
+                if current_count >= 0.80 * self._active_baseline:
+                    self._streak_recover += 1
+                else:
+                    self._streak_recover = 0
+                    
+                if self._streak_collapse >= 3 and not self._soft_collapse:
+                    saved = self.identity.snapshot_active(video_frame)
+                    self._soft_collapse = True
+                    self._streak_collapse = 0
+                    print(f"[SoftCollapse] Frame {video_frame}: current={current_count} baseline={self._active_baseline:.1f} saved={saved}")
+                    
+                elif self._streak_recover >= 1 and self._soft_collapse:
+                    self._soft_collapse = False
+                    self._soft_recovery_frames = 60
+                    self._streak_recover = 0
+                    print(f"[SoftRecovery] Frame {video_frame}: current={current_count} baseline={self._active_baseline:.1f} revived=candidates → entering recovery mode")
+
+        # Periodic telemetry
+        if is_play and video_frame % 30 == 0:
+            mode = "collapse" if self._soft_collapse else ("recovery" if self._soft_recovery_frames > 0 else "normal")
+            print(f"[SoftState] frame={video_frame} baseline={self._active_baseline:.1f} current={len(assignable_tracks)} mode={mode} low_streak={self._streak_collapse} recovery_left={self._soft_recovery_frames}")
+            
+        # Hard Collapse pre-cutaway fallback
+        if is_play and self._active_baseline > 0 and len(assignable_tracks) <= 0.60 * self._active_baseline and not self._snapshot_taken:
+            saved = self.identity.snapshot_active(video_frame)
+            self._snapshot_taken = True
+            print(f"[Guard] Frame {video_frame}: hard collapse detected → early snapshot ({saved} slots)")
 
         # Build set of track IDs that allow memory update
         memory_ok_tids = set()
@@ -472,6 +483,13 @@ class TrackerCore:
             # Merge: assign_tracks only updates un-revived mappings
             for tid, pid in tid_to_pid.items():
                 self.id_remap[tid] = int(pid[1:])
+                
+            if should_revive:
+                R = len(revived_tids)
+                N = len(tid_to_pid)
+                U = len(normal_track_objs) - N
+                if R > 0 or N > 0:
+                    print(f"[RecoveryAssign] F{video_frame} revived={R} normal={N} blocked={stale_memory_blocked+len(overlay_blocked_tids)} unassigned={U}")
 
         if save:
             players = []
