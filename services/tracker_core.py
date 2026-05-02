@@ -236,9 +236,9 @@ class TrackerCore:
             if self._active_baseline > 0 and not getattr(self, "_teams_initialized", False):
                 valid_embeds = []
                 for tr in tracks:
-                    # Wait, 'cls' might be a float/int, we enforce 2 (player)
+                    # Include all field player classes: 1=player, 2=goalkeeper, 3=referee
                     cls_val = int(getattr(tr, 'cls', 0))
-                    if tr.mean_embed is not None and cls_val == 2 and tr.hits > 5:
+                    if tr.mean_embed is not None and cls_val in [1, 2, 3] and tr.hits > 5:
                         valid_embeds.append(tr.mean_embed)
                 
                 if len(valid_embeds) >= 10:
