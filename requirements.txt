@@ -31,3 +31,4 @@ supabase>=2.0.0           # Supabase client for file uploads
 # ==================== OPTIONAL / FUTURE ====================
 # Distributed GPU computing
 runpod
+scikit-learn>=1.0.0

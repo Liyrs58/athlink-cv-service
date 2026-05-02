@@ -67,6 +67,8 @@ class IdentityCore:
             s.seen_this_frame = False
         # BUG FIX 3: Do NOT clear snapshot here! It was taken BEFORE the cutaway 
         # specifically to be used AFTER the cutaway.
+        if len(self._bench_snapshot) > 0:
+            print(f"[Identity] Reset: {len(self._bench_snapshot)} snapshot slots survived reset")
         self._recovery_frames_left = 60  # permissive matching for 60 frames
 
     # ------------------------------------------------------------------

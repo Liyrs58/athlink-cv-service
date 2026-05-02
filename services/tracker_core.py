@@ -231,22 +231,26 @@ class TrackerCore:
             if len(self._track_history) == 30 and self._active_baseline == 0:
                 self._active_baseline = max(1, sum(self._track_history) / 30)
                 
-                # BUG FIX 4: Wire Team Centroids to RoleFilter
-                if not getattr(self, "_teams_initialized", False):
-                    valid_embeds = []
-                    for tr in tracks:
-                        if tr.mean_embed is not None and tr.hits > 5:
-                            valid_embeds.append(tr.mean_embed)
-                    if len(valid_embeds) >= 10:
-                        try:
-                            from sklearn.cluster import KMeans
-                            kmeans = KMeans(n_clusters=2, random_state=42, n_init=10).fit(valid_embeds)
-                            centers = kmeans.cluster_centers_
-                            self.role_filter.set_team_centroids(centers[0], centers[1])
-                            self._teams_initialized = True
-                            print("[TrackerCore] Team centroids initialized via K-Means")
-                        except Exception as e:
-                            print(f"[TrackerCore] Failed to init team centroids: {e}")
+            # BUG FIX 4: Wire Team Centroids to RoleFilter
+            # Retries every frame after baseline until it gets >=10 solid player crops
+            if self._active_baseline > 0 and not getattr(self, "_teams_initialized", False):
+                valid_embeds = []
+                for tr in tracks:
+                    # Wait, 'cls' might be a float/int, we enforce 2 (player)
+                    cls_val = int(getattr(tr, 'cls', 0))
+                    if tr.mean_embed is not None and cls_val == 2 and tr.hits > 5:
+                        valid_embeds.append(tr.mean_embed)
+                
+                if len(valid_embeds) >= 10:
+                    try:
+                        from sklearn.cluster import KMeans
+                        kmeans = KMeans(n_clusters=2, random_state=42, n_init=10).fit(valid_embeds)
+                        centers = kmeans.cluster_centers_
+                        self.role_filter.set_team_centroids(centers[0], centers[1])
+                        self._teams_initialized = True
+                        print(f"[TrackerCore] Team centroids initialized via K-Means from {len(valid_embeds)} player samples")
+                    except Exception as e:
+                        print(f"[TrackerCore] Failed to init team centroids: {e}")
 
             # Detect collapse
             if self._active_baseline > 0 and len(self._track_history) >= 10:

@@ -395,7 +395,13 @@ class DeepEIoUTracker:
         ]
 
         # Return only confirmed active tracks
-        return [tr for tr in self.tracked if tr.hits >= self.min_hits and tr.state == "tracked"]
+        active_returns = [tr for tr in self.tracked if tr.hits >= self.min_hits and tr.state == "tracked"]
+        
+        # Guardrail: Log DeepEIoU state
+        if self._frame % 30 == 0:
+            print(f"[DeepEIoU F{self._frame}] tracked={len(self.tracked)} lost={len(self.lost)} returned={len(active_returns)}")
+            
+        return active_returns
 
     def reset(self):
         """Bug #3: Clear all track state on scene boundary (e.g. bench_shot→play)."""
