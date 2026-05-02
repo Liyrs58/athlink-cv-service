@@ -10,9 +10,9 @@ from typing import List, Tuple, Optional, Dict
 class TrackSuppressor:
     def __init__(self, config: Optional[Dict] = None):
         cfg = config or {}
-        self.ghost_max_age = cfg.get("ghost_max_age", 15)
-        self.duplicate_iou_thresh = cfg.get("duplicate_iou_thresh", 0.50)
-        self.duplicate_center_dist = cfg.get("duplicate_center_dist", 60)
+        self.ghost_max_age = cfg.get("ghost_max_age", 25)
+        self.duplicate_iou_thresh = cfg.get("duplicate_iou_thresh", 0.65)
+        self.duplicate_center_dist = cfg.get("duplicate_center_dist", 35)
         self.scoreboard_y_max = cfg.get("scoreboard_y_max", 80)
         self.scoreboard_bottom_y = cfg.get("scoreboard_bottom_y", 620)
         self.min_bbox_height = cfg.get("min_bbox_height", 30)
@@ -78,7 +78,7 @@ class TrackSuppressor:
                 b2 = t2.bbox
                 iou = self._iou(b1, b2)
                 cd = self._cdist(b1, b2)
-                if iou > self.duplicate_iou_thresh or cd < self.duplicate_center_dist:
+                if iou > self.duplicate_iou_thresh and cd < self.duplicate_center_dist:
                     removed.add(t2.track_id)
         return [t for t in tracks_sorted if t.track_id not in removed]
 

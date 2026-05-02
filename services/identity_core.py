@@ -50,6 +50,7 @@ class IdentityCore:
 
         # Snapshot taken at bench/freeze entry — used for revival on return
         self._bench_snapshot: Dict[str, dict] = {}  # pid -> {embedding, position, last_seen}
+        self._recovery_frames_left: int = 0  # countdown after scene reset
 
     # ------------------------------------------------------------------
     # Scene reset
@@ -64,6 +65,7 @@ class IdentityCore:
             s.active_track_id = None
             s.seen_this_frame = False
         self._bench_snapshot.clear()
+        self._recovery_frames_left = 60  # permissive matching for 60 frames
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -74,6 +76,8 @@ class IdentityCore:
         self.assigned_this_frame = 0
         self.unmatched_tracks = 0
         self.unmatched_slots = 0
+        if self._recovery_frames_left > 0:
+            self._recovery_frames_left -= 1
         # CRITICAL: clear frame-local flags only — do NOT reset state/embedding
         for s in self.slots:
             s.active_track_id = None
@@ -256,6 +260,10 @@ class IdentityCore:
         t_emb: Optional[np.ndarray],
         t_pos: Optional[Tuple[float, float]],
     ) -> float:
+        # Recovery mode: lost slots with no embedding eagerly accept tracks
+        if self._recovery_frames_left > 0 and slot.state == "lost" and slot.embedding is None:
+            return 0.30
+
         emb_cost = 0.5
         pos_cost = 0.5
 
