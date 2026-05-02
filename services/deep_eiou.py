@@ -386,10 +386,11 @@ class DeepEIoUTracker:
         self.lost = still_lost
 
         # BUG FIX 1: Remove dead/lost tracks from tracked
-        # Only keep tracks that are actively tracked, and not freshly lost
+        # Keep tentative + tracked tracks alive.
+        # Only remove tracks that are explicitly lost or too stale.
         self.tracked = [
             tr for tr in self.tracked 
-            if tr.state == "tracked" 
+            if tr.state != "lost" 
             and tr.time_since_update <= self.track_buffer
             and tr.track_id not in lost_tids
         ]
