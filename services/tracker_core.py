@@ -150,7 +150,12 @@ class TrackerCore:
         if self._prev_is_freeze and is_play:
             self.tracker.reset()
             self.id_remap.clear()
-            print(f"[Reset] Frame {video_frame}: freeze→play, tracker reset")
+            self.identity.reset_for_scene()
+            self._snapshot_taken = False
+            self._needs_revival = False
+            self._track_history.clear()
+            self._active_baseline = 0
+            print(f"[Reset] Frame {video_frame}: freeze→play, tracker + identity reset")
         self._prev_is_freeze = is_freeze
 
         # Run tracker (always except hard freeze)

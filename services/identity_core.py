@@ -52,6 +52,20 @@ class IdentityCore:
         self._bench_snapshot: Dict[str, dict] = {}  # pid -> {embedding, position, last_seen}
 
     # ------------------------------------------------------------------
+    # Scene reset
+    # ------------------------------------------------------------------
+
+    def reset_for_scene(self) -> None:
+        """Clear all slot state on scene boundary (bench_shot→play).
+        Keeps slot PIDs (P1-P22) but wipes track assignments and state.
+        """
+        for s in self.slots:
+            s.state = "lost"
+            s.active_track_id = None
+            s.seen_this_frame = False
+        self._bench_snapshot.clear()
+
+    # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
 
