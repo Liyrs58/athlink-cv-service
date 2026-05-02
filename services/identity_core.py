@@ -51,6 +51,7 @@ class IdentityCore:
         # Snapshot taken at bench/freeze entry — used for revival on return
         self._bench_snapshot: Dict[str, dict] = {}  # pid -> {embedding, position, last_seen}
         self._recovery_frames_left: int = 0  # countdown after scene reset
+        self._last_memory_skips: int = 0
 
     # ------------------------------------------------------------------
     # Scene reset
@@ -88,10 +89,17 @@ class IdentityCore:
         tracks: Sequence[object],
         embeddings: Dict[int, np.ndarray],
         positions: Dict[int, Tuple[float, float]],
+        memory_ok_tids: Optional[set] = None,
     ) -> Dict[int, str]:
         """
         Match current tracks to PID slots via Hungarian algorithm.
         Cost = 0.70 * embedding_distance + 0.25 * position_distance + recency_penalty.
+
+        Args:
+            memory_ok_tids: Set of track IDs allowed to update slot embeddings.
+                If None, all tracks can update. If provided, tracks NOT in this
+                set will still be assigned a PID but won't pollute identity memory.
+
         Returns {track_id -> PID string}.
         """
         if len(tracks) == 0:
@@ -114,6 +122,7 @@ class IdentityCore:
         track_to_pid: Dict[int, str] = {}
         matched_tracks: set = set()
         matched_slots: set = set()
+        memory_skips = 0
 
         for r, c in zip(r_idx, c_idx):
             cst = float(cost[r, c])
@@ -130,9 +139,13 @@ class IdentityCore:
             slot.last_seen_frame = self.frame_id
             slot.last_position = positions.get(tid)
 
+            # Prompt 11: Only update embedding if crop quality allows it
             emb = embeddings.get(tid)
             if emb is not None:
-                slot.update_embedding(emb)
+                if memory_ok_tids is None or tid in memory_ok_tids:
+                    slot.update_embedding(emb)
+                else:
+                    memory_skips += 1
 
             self.assigned_this_frame += 1
             matched_tracks.add(r)
@@ -140,6 +153,7 @@ class IdentityCore:
 
         self.unmatched_tracks = n_t - len(matched_tracks)
         self.unmatched_slots = n_s - len(matched_slots)
+        self._last_memory_skips = memory_skips
         return track_to_pid
 
     def end_frame(self, frame_id: Optional[int] = None) -> None:
@@ -247,7 +261,8 @@ class IdentityCore:
         print(
             f"[Frame {self.frame_id}] det={detections_count} tracks={tracks_count} "
             f"assigned={self.assigned_this_frame} active={active} dormant={dormant} lost={lost} "
-            f"unmatched_tracks={self.unmatched_tracks} unmatched_slots={self.unmatched_slots}"
+            f"unmatched_tracks={self.unmatched_tracks} unmatched_slots={self.unmatched_slots} "
+            f"memory_skips={self._last_memory_skips}"
         )
 
     # ------------------------------------------------------------------

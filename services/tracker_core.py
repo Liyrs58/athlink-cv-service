@@ -20,12 +20,14 @@ try:
     from services.vlm_state import VLMStateMachine, GameState
     from services.track_suppressor import TrackSuppressor
     from services.role_filter import RoleFilter
+    from services.crop_quality import CropQualityGate
 except (ImportError, ModuleNotFoundError):
     sys.path.insert(0, os.path.dirname(__file__))
     from identity_core import IdentityCore
     from vlm_state import VLMStateMachine, GameState
     from track_suppressor import TrackSuppressor
     from role_filter import RoleFilter
+    from crop_quality import CropQualityGate
 
 
 class TrackerCore:
@@ -59,6 +61,7 @@ class TrackerCore:
         self.identity = IdentityCore()
         self.suppressor = TrackSuppressor()
         self.role_filter = RoleFilter()
+        self.crop_quality = CropQualityGate()
         self.id_remap = {}  # de_tid -> int PID
         self._snapshot_taken = False
         self._needs_revival = False
@@ -68,6 +71,9 @@ class TrackerCore:
         self._track_history = []
         self._transition_frame = -1
         self._prev_is_freeze = False
+
+        # Officials tracking for output
+        self._officials_this_frame = []
 
         self.frame_idx = 0
         self.results = []
@@ -147,6 +153,8 @@ class TrackerCore:
         Step B: Early snapshot via collapse guard (before hard freeze)
         Step C: Log live params
         Step D+E: Snapshot on entry, revival-first on return
+        Prompt 10: Referee filter (smart multi-signal)
+        Prompt 11: Crop quality gating
         """
         state = self.vlm.analyze(frame, video_frame)
         is_freeze = state.is_freeze()
@@ -157,6 +165,7 @@ class TrackerCore:
             self.tracker.reset()
             self.id_remap.clear()
             self.identity.reset_for_scene()
+            self.role_filter.reset()
             self._snapshot_taken = False
             self._needs_revival = False
             self._track_history.clear()
@@ -210,15 +219,38 @@ class TrackerCore:
                 })
             return 0
 
-        # Suppress noisy tracks before identity sees them
+        # ── Prompt 9: Suppress noisy tracks before identity ──
         tracks, _sup_stats = self.suppressor.suppress(tracks, frame, video_frame)
-        # Filter out referees/officials (DISABLED FOR TESTING)
-        # tracks, _officials = self.role_filter.filter(tracks, frame, video_frame)
-        player_tracks = tracks  # No role filter
+
+        # ── Prompt 10: Filter out referees/officials (ENABLED — smart v2) ──
+        tracks, self._officials_this_frame = self.role_filter.filter(
+            tracks, frame, video_frame
+        )
+        player_tracks = tracks
+
+        # ── Prompt 11: Score crop quality for each track ──
+        quality_scores = self.crop_quality.score_batch(player_tracks, frame, video_frame)
+        self.crop_quality.maybe_log(video_frame)
+
+        # Filter out tracks with quality too low for assignment
+        assignable_tracks = [
+            t for t in player_tracks
+            if quality_scores.get(t.track_id) is None
+            or quality_scores[t.track_id].allow_assignment
+        ]
+
+        # Build set of track IDs that allow memory update
+        memory_ok_tids = set()
+        for t in player_tracks:
+            q = quality_scores.get(t.track_id)
+            if q is None or q.allow_memory_update:
+                memory_ok_tids.add(t.track_id)
 
         # Step E: Recovery on first valid play after freeze
         embed_map = self._extract_embeds()
-        track_objs, positions, embeddings = self._build_track_inputs(player_tracks, embed_map)
+        track_objs, positions, embeddings = self._build_track_inputs(
+            assignable_tracks, embed_map
+        )
 
         if is_play and len(track_objs) > 0:
             self.identity.begin_frame(video_frame)
@@ -231,8 +263,11 @@ class TrackerCore:
                 n_revived = len(revived)
                 print(f"[Recovery] Frame {video_frame}: {n_revived} revived from snapshot")
 
-            # Then normal assignment
-            tid_to_pid = self.identity.assign_tracks(track_objs, embeddings, positions)
+            # Then normal assignment — pass memory_ok set for gating
+            tid_to_pid = self.identity.assign_tracks(
+                track_objs, embeddings, positions,
+                memory_ok_tids=memory_ok_tids,
+            )
             self.identity.end_frame(video_frame)
             self.identity.maybe_log(detections_count=len(dets), tracks_count=n_tracks)
 
@@ -248,6 +283,7 @@ class TrackerCore:
                 if final_pid is None:
                     continue
                 x1, y1, x2, y2 = tr.bbox
+                q = quality_scores.get(tr.track_id)
                 players.append({
                     "trackId": final_pid,
                     "bbox": [float(x1), float(y1), float(x2), float(y2)],
@@ -255,12 +291,14 @@ class TrackerCore:
                     "class": int(tr.cls),
                     "gameState": state.value,
                     "analysis_valid": True,
+                    "crop_quality": float(q.score) if q else 1.0,
                 })
             self.results.append({
                 "frameIndex": int(video_frame),
                 "players": players,
                 "detection_count": len(dets),
                 "track_count": n_tracks,
+                "officials_filtered": len(self._officials_this_frame),
                 "gameState": state.value,
                 "analysis_valid": True,
             })
