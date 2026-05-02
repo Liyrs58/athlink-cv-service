@@ -124,8 +124,9 @@ class TrackerCore:
         self.role_filter = RoleFilter()
         self.crop_quality = CropQualityGate()
         self.id_remap = {}  # de_tid -> int PID
-        self._snapshot_taken = False
-        self._needs_revival = False
+        self._scene_snapshot_taken = False
+        self._needs_scene_reset = False
+        self._needs_scene_revival = False
 
         # Scene state tracking
         self._active_baseline = 0
@@ -135,7 +136,6 @@ class TrackerCore:
         self._streak_collapse = 0
         self._streak_recover = 0
         self._transition_frame = -1
-        self._prev_is_freeze = False
 
         # Officials tracking for output
         self._officials_this_frame = []
@@ -267,14 +267,17 @@ class TrackerCore:
         is_freeze = state.is_freeze()
         is_play = state.is_play()
 
+        if is_freeze:
+            self._needs_scene_reset = True
+
         # Bug #3: Reset tracker on freeze→play transition (purge ghost tracks)
-        if self._prev_is_freeze and is_play:
+        if self._needs_scene_reset and is_play:
             self.tracker.reset()
             self.id_remap.clear()
             self.identity.reset_for_scene()
             self.role_filter.reset()
-            self._snapshot_taken = False
-            self._needs_revival = False
+            self._scene_snapshot_taken = False
+            self._needs_scene_revival = True
             self._track_history.clear()
             
             # Fix: Reset post-bench soft state correctly
@@ -283,16 +286,17 @@ class TrackerCore:
             self._streak_collapse = 0
             self._streak_recover = 0
             # Do NOT reset baseline to 0, preserve for quick strong start
-            print(f"[SoftStateReset] Frame {video_frame}: mode=normal baseline={self._active_baseline:.1f}")
+            if self._active_baseline == 0.0:
+                self._active_baseline = 18.0
+            print(f"[SoftStateReset] Frame {video_frame}: mode=normal baseline={self._active_baseline:.1f} low_streak=0 recovery_left=0")
             print(f"[Reset] Frame {video_frame}: freeze→play, tracker + identity reset")
+            self._needs_scene_reset = False
             
         # BUG FIX A: Snapshot on freeze entry
-        if is_freeze and not self._prev_is_freeze:
+        if is_freeze and not self._scene_snapshot_taken:
             saved = self.identity.snapshot_scene(video_frame)
-            self._snapshot_taken = True
+            self._scene_snapshot_taken = True
             print(f"[Snapshot] Frame {video_frame}: freeze entry saved {saved} slots")
-            
-        self._prev_is_freeze = is_freeze
 
         # Run tracker (always except hard freeze)
         if not is_freeze:
@@ -414,9 +418,9 @@ class TrackerCore:
             print(f"[SoftState] frame={video_frame} baseline={self._active_baseline:.1f} current={len(assignable_tracks)} mode={mode} low_streak={self._streak_collapse} recovery_left={self._soft_recovery_frames}")
             
         # Hard Collapse pre-cutaway fallback
-        if is_play and self._active_baseline > 0 and len(assignable_tracks) <= 0.60 * self._active_baseline and not self._snapshot_taken:
+        if is_play and self._active_baseline > 0 and len(assignable_tracks) <= 0.60 * self._active_baseline and not self._scene_snapshot_taken:
             saved = self.identity.snapshot_scene(video_frame)
-            self._snapshot_taken = True
+            self._scene_snapshot_taken = True
             print(f"[Guard] Frame {video_frame}: hard collapse detected → early snapshot ({saved} slots)")
 
         # Build set of track IDs that allow memory update
@@ -434,15 +438,16 @@ class TrackerCore:
                 continue
             if q is not None and not q.allow_memory_update:
                 continue
-            if self._soft_collapse: # Block memory during collapse
+            if self._soft_collapse or self._soft_recovery_frames > 0: # Block memory during collapse and recovery
                 continue
                 
             memory_ok_tids.add(tid)
                 
-        if (stale_memory_blocked > 0 or self._soft_collapse) and video_frame % 30 == 0:
+        if (stale_memory_blocked > 0 or self._soft_collapse or self._soft_recovery_frames > 0) and video_frame % 30 == 0:
             msg = f"[TrackerCore] F{video_frame}: memory updates restricted"
             if stale_memory_blocked > 0: msg += f" (stale={stale_memory_blocked})"
             if self._soft_collapse: msg += " (SOFT_COLLAPSE active)"
+            if self._soft_recovery_frames > 0: msg += " (SOFT_RECOVERY active)"
             print(msg)
 
         # Step E: Recovery on first valid play after freeze
@@ -458,33 +463,41 @@ class TrackerCore:
                 embeddings[tid] = embed_map[tid]
             track_objs.append(tr)
 
+        # Track-level meta for this frame (pid, source, identity_valid, confidence)
+        meta_by_tid = {}
+
         if is_play and len(track_objs) > 0:
-            self.identity.begin_frame(video_frame)
+            present_tids = {int(tr.track_id) for tr in track_objs}
+            self.identity.begin_frame(video_frame, present_tids=present_tids)
 
             # First match: recovery-first if snapshot exists (hard or soft)
             revived_tids = set()
-            should_revive_scene = (self._snapshot_taken and not self._needs_revival)
+            should_revive_scene = self._needs_scene_revival
             should_revive_soft = (self._soft_recovery_frames > 0)
-            
+
             if should_revive_scene:
-                revived = self.identity.revive_cost_matrix(track_objs, embeddings, positions)
+                revived, scene_meta = self.identity.revive_cost_matrix(
+                    track_objs, embeddings, positions
+                )
                 self.id_remap.update({tid: int(pid[1:]) for tid, pid in revived.items()})
+                meta_by_tid.update(scene_meta)
                 revived_tids.update(revived.keys())
-                self._needs_revival = True
+                self._needs_scene_revival = False
                 print(f"[Recovery] Frame {video_frame}: {len(revived)} revived from scene snapshot")
-                
+
             if should_revive_soft:
                 is_first_frame = (self._soft_recovery_frames == 60)
                 self._soft_recovery_frames -= 1
                 cand = len(track_objs)
-                
-                revived_soft = self.identity.revive_from_soft_snapshot(
-                    track_objs, embeddings, positions, 
-                    is_first_recovery_frame=is_first_frame
+
+                revived_soft, soft_meta = self.identity.revive_from_soft_snapshot(
+                    track_objs, embeddings, positions,
+                    is_first_recovery_frame=is_first_frame,
                 )
                 self.id_remap.update({tid: int(pid[1:]) for tid, pid in revived_soft.items()})
+                meta_by_tid.update(soft_meta)
                 revived_tids.update(revived_soft.keys())
-                
+
                 if is_first_frame:
                     print(f"[SoftRecoveryEntry] candidates={cand} revived={len(revived_soft)}")
                     if len(revived_soft) == 0:
@@ -498,45 +511,80 @@ class TrackerCore:
                         else:
                             print(f"[SoftRecoveryCause] F{video_frame} costs too high")
 
-            # Then normal assignment — pass memory_ok set for gating, EXCLUDE revived
+            # Then normal assignment — locks bypass Hungarian internally,
+            # so we pass ALL tracks (revived ones are already locked).
             normal_track_objs = [t for t in track_objs if t.track_id not in revived_tids]
-            
-            tid_to_pid = self.identity.assign_tracks(
+
+            tid_to_pid, normal_meta = self.identity.assign_tracks(
                 normal_track_objs, embeddings, positions,
                 memory_ok_tids=memory_ok_tids,
             )
+            meta_by_tid.update(normal_meta)
             self.identity.end_frame(video_frame)
             self.identity.maybe_log(detections_count=len(dets), tracks_count=n_tracks)
 
             # Merge: assign_tracks only updates un-revived mappings
             for tid, pid in tid_to_pid.items():
                 self.id_remap[tid] = int(pid[1:])
-                
-            if should_revive_scene or should_revive_soft:
-                R = len(revived_tids)
-                N = len(tid_to_pid)
-                U = len(normal_track_objs) - N
-                if R > 0 or N > 0 or should_revive_soft:
-                    print(f"[RecoveryAssign] F{video_frame} revived={R} normal={N} blocked={stale_memory_blocked+len(overlay_blocked_tids)} unassigned={U}")
+
+            # Drop id_remap entries for tracks that became unassigned this frame
+            # (so render shows them as uncertain rather than as a stale P-id)
+            for tid, m in meta_by_tid.items():
+                if m.pid is None and tid in self.id_remap:
+                    del self.id_remap[tid]
+
+            # Lock-aware accounting
+            locked_kept = sum(1 for m in meta_by_tid.values() if m.source == "locked")
+            revived_n = sum(1 for m in meta_by_tid.values() if m.source == "revived")
+            hungarian_n = sum(1 for m in meta_by_tid.values() if m.source == "hungarian")
+            unassigned_n = sum(1 for m in meta_by_tid.values() if m.source == "unassigned")
+
+            if should_revive_scene or should_revive_soft or video_frame % 30 == 0:
+                print(
+                    f"[RecoveryAssign] F{video_frame} locked={locked_kept} "
+                    f"revived={revived_n} normal={hungarian_n} "
+                    f"blocked={stale_memory_blocked+len(overlay_blocked_tids)} "
+                    f"unassigned={unassigned_n}"
+                )
+        elif is_play:
+            # No tracks this frame — still tick the lock TTLs so stale ones expire
+            self.identity.begin_frame(video_frame, present_tids=set())
+            self.identity.end_frame(video_frame)
 
         if save:
             players = []
             for tr in player_tracks:
-                # DETrack object
-                final_pid = self.id_remap.get(tr.track_id)
-                if final_pid is None:
-                    continue
+                tid = tr.track_id
+                meta = meta_by_tid.get(tid)
                 x1, y1, x2, y2 = tr.bbox
-                q = quality_scores.get(tr.track_id)
+                q = quality_scores.get(tid)
+
+                if meta is not None and meta.pid is not None and meta.identity_valid:
+                    out_pid = int(meta.pid[1:])
+                    source = meta.source
+                    identity_valid = True
+                    identity_confidence = float(meta.confidence)
+                else:
+                    # Uncertain — render as raw track (T<id>), no P-id
+                    out_pid = None
+                    source = "unassigned"
+                    identity_valid = False
+                    identity_confidence = float(meta.confidence) if meta else 0.0
+
                 players.append({
-                    "trackId": final_pid,
+                    "trackId": out_pid if out_pid is not None else int(tid),
+                    "rawTrackId": int(tid),
                     "bbox": [float(x1), float(y1), float(x2), float(y2)],
                     "confidence": float(tr.score),
                     "class": int(tr.cls),
                     "gameState": state.value,
                     "analysis_valid": True,
                     "crop_quality": float(q.score) if q else 1.0,
+                    "identity_valid": identity_valid,
+                    "assignment_source": source,
+                    "identity_confidence": identity_confidence,
                 })
+
             self.results.append({
                 "frameIndex": int(video_frame),
                 "players": players,
@@ -604,6 +652,24 @@ def run_tracking(video_path, job_id, frame_stride=1, max_frames=None, device="cp
 
     cap.release()
     tracker.save(job_id)
+
+    # Final identity-lock summary (the real success metric)
+    summary = tracker.identity.locks.summary()
+    print("=" * 60)
+    print("[Identity Summary]")
+    print(f"  identity_switches      = {summary['identity_switches']}")
+    print(f"  switches_blocked       = {summary['switches_blocked']}")
+    print(f"  locks_created          = {summary['locks_created']}")
+    print(f"  locks_expired          = {summary['locks_expired']}")
+    print(f"  locks_live_at_end      = {summary['locks_live']}")
+    print(f"  lock_retention_rate    = {summary['lock_retention_rate']}")
+
+    valid = sum(1 for f in tracker.results for p in f.get("players", []) if p.get("identity_valid"))
+    invalid = sum(1 for f in tracker.results for p in f.get("players", []) if not p.get("identity_valid"))
+    print(f"  valid_identity_frames  = {valid}")
+    print(f"  uncertain_player_boxes = {invalid}")
+    print("=" * 60)
+
     print(f"Done. Video frames: {video_frame}, processed: {processed}")
     return tracker.results
 
