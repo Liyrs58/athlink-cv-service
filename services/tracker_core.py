@@ -19,11 +19,13 @@ try:
     from services.identity_core import IdentityCore
     from services.vlm_state import VLMStateMachine, GameState
     from services.track_suppressor import TrackSuppressor
+    from services.role_filter import RoleFilter
 except (ImportError, ModuleNotFoundError):
     sys.path.insert(0, os.path.dirname(__file__))
     from identity_core import IdentityCore
     from vlm_state import VLMStateMachine, GameState
     from track_suppressor import TrackSuppressor
+    from role_filter import RoleFilter
 
 
 class TrackerCore:
@@ -56,6 +58,7 @@ class TrackerCore:
         # Identity core: deterministic ID assignment via ReID + position
         self.identity = IdentityCore()
         self.suppressor = TrackSuppressor()
+        self.role_filter = RoleFilter()
         self.id_remap = {}  # de_tid -> int PID
         self._snapshot_taken = False
         self._needs_revival = False
@@ -209,6 +212,8 @@ class TrackerCore:
 
         # Suppress noisy tracks before identity sees them
         tracks, _sup_stats = self.suppressor.suppress(tracks, frame, video_frame)
+        # Filter out referees/officials
+        tracks, _officials = self.role_filter.filter(tracks, frame, video_frame)
 
         # Step E: Recovery on first valid play after freeze
         embed_map = self._extract_embeds()
