@@ -18,10 +18,12 @@ except (ImportError, ModuleNotFoundError):
 try:
     from services.identity_core import IdentityCore
     from services.vlm_state import VLMStateMachine, GameState
+    from services.track_suppressor import TrackSuppressor
 except (ImportError, ModuleNotFoundError):
     sys.path.insert(0, os.path.dirname(__file__))
     from identity_core import IdentityCore
     from vlm_state import VLMStateMachine, GameState
+    from track_suppressor import TrackSuppressor
 
 
 class TrackerCore:
@@ -53,6 +55,7 @@ class TrackerCore:
         self.vlm = VLMStateMachine(device=device)
         # Identity core: deterministic ID assignment via ReID + position
         self.identity = IdentityCore()
+        self.suppressor = TrackSuppressor()
         self.id_remap = {}  # de_tid -> int PID
         self._snapshot_taken = False
         self._needs_revival = False
@@ -203,6 +206,9 @@ class TrackerCore:
                     "analysis_valid": False,
                 })
             return 0
+
+        # Suppress noisy tracks before identity sees them
+        tracks, _sup_stats = self.suppressor.suppress(tracks, frame, video_frame)
 
         # Step E: Recovery on first valid play after freeze
         embed_map = self._extract_embeds()
