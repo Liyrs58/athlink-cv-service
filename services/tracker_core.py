@@ -276,12 +276,19 @@ class TrackerCore:
             self._snapshot_taken = False
             self._needs_revival = False
             self._track_history.clear()
-            self._active_baseline = 0
+            
+            # Fix: Reset post-bench soft state correctly
+            self._soft_collapse = False
+            self._soft_recovery_frames = 0
+            self._streak_collapse = 0
+            self._streak_recover = 0
+            # Do NOT reset baseline to 0, preserve for quick strong start
+            print(f"[SoftStateReset] Frame {video_frame}: mode=normal baseline={self._active_baseline:.1f}")
             print(f"[Reset] Frame {video_frame}: freeze→play, tracker + identity reset")
             
         # BUG FIX A: Snapshot on freeze entry
         if is_freeze and not self._prev_is_freeze:
-            saved = self.identity.snapshot_active(video_frame)
+            saved = self.identity.snapshot_scene(video_frame)
             self._snapshot_taken = True
             print(f"[Snapshot] Frame {video_frame}: freeze entry saved {saved} slots")
             
@@ -389,7 +396,7 @@ class TrackerCore:
                     self._streak_recover = 0
                     
                 if self._streak_collapse >= 3 and not self._soft_collapse:
-                    saved = self.identity.snapshot_active(video_frame)
+                    saved = self.identity.snapshot_soft(video_frame)
                     self._soft_collapse = True
                     self._streak_collapse = 0
                     print(f"[SoftCollapse] Frame {video_frame}: current={current_count} baseline={self._active_baseline:.1f} saved={saved}")
@@ -398,7 +405,8 @@ class TrackerCore:
                     self._soft_collapse = False
                     self._soft_recovery_frames = 60
                     self._streak_recover = 0
-                    print(f"[SoftRecovery] Frame {video_frame}: current={current_count} baseline={self._active_baseline:.1f} revived=candidates → entering recovery mode")
+                    snap_len = len(self.identity._soft_snapshot) if hasattr(self.identity, '_soft_snapshot') and self.identity._soft_snapshot else 0
+                    print(f"[SoftRecovery] Frame {video_frame}: current={current_count} baseline={self._active_baseline:.1f} snapshot_slots={snap_len} revived=candidates → entering recovery mode")
 
         # Periodic telemetry
         if is_play and video_frame % 30 == 0:
@@ -407,7 +415,7 @@ class TrackerCore:
             
         # Hard Collapse pre-cutaway fallback
         if is_play and self._active_baseline > 0 and len(assignable_tracks) <= 0.60 * self._active_baseline and not self._snapshot_taken:
-            saved = self.identity.snapshot_active(video_frame)
+            saved = self.identity.snapshot_scene(video_frame)
             self._snapshot_taken = True
             print(f"[Guard] Frame {video_frame}: hard collapse detected → early snapshot ({saved} slots)")
 
@@ -455,20 +463,40 @@ class TrackerCore:
 
             # First match: recovery-first if snapshot exists (hard or soft)
             revived_tids = set()
-            should_revive = (self._snapshot_taken and not self._needs_revival) or (self._soft_recovery_frames > 0)
+            should_revive_scene = (self._snapshot_taken and not self._needs_revival)
+            should_revive_soft = (self._soft_recovery_frames > 0)
             
-            if should_revive:
+            if should_revive_scene:
                 revived = self.identity.revive_cost_matrix(track_objs, embeddings, positions)
                 self.id_remap.update({tid: int(pid[1:]) for tid, pid in revived.items()})
-                revived_tids = set(revived.keys())
+                revived_tids.update(revived.keys())
+                self._needs_revival = True
+                print(f"[Recovery] Frame {video_frame}: {len(revived)} revived from scene snapshot")
                 
-                if not self._needs_revival: # Hard revival used
-                    self._needs_revival = True
-                    print(f"[Recovery] Frame {video_frame}: {len(revived)} revived from scene snapshot")
-                else: # Soft recovery
-                    self._soft_recovery_frames -= 1
-                    if len(revived) > 0:
-                        print(f"[SoftRecovery] Frame {video_frame}: {len(revived)} revived from soft snapshot")
+            if should_revive_soft:
+                is_first_frame = (self._soft_recovery_frames == 60)
+                self._soft_recovery_frames -= 1
+                cand = len(track_objs)
+                
+                revived_soft = self.identity.revive_from_soft_snapshot(
+                    track_objs, embeddings, positions, 
+                    is_first_recovery_frame=is_first_frame
+                )
+                self.id_remap.update({tid: int(pid[1:]) for tid, pid in revived_soft.items()})
+                revived_tids.update(revived_soft.keys())
+                
+                if is_first_frame:
+                    print(f"[SoftRecoveryEntry] candidates={cand} revived={len(revived_soft)}")
+                    if len(revived_soft) == 0:
+                        snap_len = len(self.identity._soft_snapshot) if hasattr(self.identity, "_soft_snapshot") and self.identity._soft_snapshot else 0
+                        if snap_len == 0:
+                            print(f"[SoftRecoveryCause] F{video_frame} no snapshot or consumed early")
+                        elif len(embeddings) == 0:
+                            print(f"[SoftRecoveryCause] F{video_frame} no embeddings available")
+                        elif cand == 0:
+                            print(f"[SoftRecoveryCause] F{video_frame} no candidate tracks")
+                        else:
+                            print(f"[SoftRecoveryCause] F{video_frame} costs too high")
 
             # Then normal assignment — pass memory_ok set for gating, EXCLUDE revived
             normal_track_objs = [t for t in track_objs if t.track_id not in revived_tids]
@@ -484,11 +512,11 @@ class TrackerCore:
             for tid, pid in tid_to_pid.items():
                 self.id_remap[tid] = int(pid[1:])
                 
-            if should_revive:
+            if should_revive_scene or should_revive_soft:
                 R = len(revived_tids)
                 N = len(tid_to_pid)
                 U = len(normal_track_objs) - N
-                if R > 0 or N > 0:
+                if R > 0 or N > 0 or should_revive_soft:
                     print(f"[RecoveryAssign] F{video_frame} revived={R} normal={N} blocked={stale_memory_blocked+len(overlay_blocked_tids)} unassigned={U}")
 
         if save:

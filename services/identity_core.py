@@ -55,6 +55,7 @@ class IdentityCore:
 
         # Snapshot taken at bench/freeze entry — used for revival on return
         self._bench_snapshot: Dict[str, dict] = {}  # pid -> {embedding, position, last_seen}
+        self._soft_snapshot: Dict[str, dict] = {}   # pid -> {embedding, position, last_seen}
         self._recovery_frames_left: int = 0  # countdown after scene reset
         self._last_memory_skips: int = 0
 
@@ -185,7 +186,7 @@ class IdentityCore:
     # Bench snapshot / revival (Priority D)
     # ------------------------------------------------------------------
 
-    def snapshot_active(self, frame_id: int) -> int:
+    def snapshot_scene(self, frame_id: int) -> int:
         """
         Call when entering bench/freeze. Saves all active+dormant slot state
         so we can attempt strong revival on return-to-play.
@@ -200,7 +201,24 @@ class IdentityCore:
                     "last_seen": s.last_seen_frame,
                 }
         saved = len(self._bench_snapshot)
-        print(f"[Identity] Snapshot: {saved} slots saved at frame {frame_id}")
+        print(f"[Identity] SceneSnapshot: {saved} slots saved at frame {frame_id}")
+        return saved
+        
+    def snapshot_soft(self, frame_id: int) -> int:
+        """
+        Call when entering soft-collapse. Saves state to revive tracks
+        when the scene stabilizes.
+        """
+        self._soft_snapshot = {}
+        for s in self.slots:
+            if s.state in ("active", "dormant") and s.embedding is not None:
+                self._soft_snapshot[s.pid] = {
+                    "embedding": s.embedding.copy(),
+                    "position": s.last_position,
+                    "last_seen": s.last_seen_frame,
+                }
+        saved = len(self._soft_snapshot)
+        print(f"[Identity] SoftSnapshot: {saved} slots saved at frame {frame_id}")
         return saved
 
     def revive_cost_matrix(
@@ -254,8 +272,112 @@ class IdentityCore:
             if cost[r, c] < 0.60:  # tighter threshold for revival
                 revived[track_ids[r]] = snap_pids[c]
 
-        print(f"[Identity] Revival: {len(revived)}/{n_t} tracks matched from snapshot")
+        print(f"[Identity] Revival: {len(revived)}/{n_t} tracks matched from scene snapshot")
+        
+        # Explicitly update revived slots so they are recognized by end_frame and assign_tracks
+        for tid, pid in revived.items():
+            for slot in self.slots:
+                if slot.pid == pid:
+                    slot.active_track_id = tid
+                    slot.seen_this_frame = True
+                    slot.state = "active"
+                    slot.last_seen_frame = self.frame_id
+                    if tid in positions:
+                        slot.last_position = positions[tid]
+                    slot.stability_counter += 1
+                    if tid in embeddings:
+                        slot.update_embedding(embeddings[tid])
+                    self.assigned_this_frame += 1
+                    break
+                    
         self._bench_snapshot = {}  # consume once
+        return revived
+
+    def revive_from_soft_snapshot(
+        self,
+        tracks: Sequence[object],
+        embeddings: Dict[int, np.ndarray],
+        positions: Dict[int, Tuple[float, float]],
+        is_first_recovery_frame: bool = False
+    ) -> Dict[int, str]:
+        """
+        Matches tracks to soft snapshot. Removes matched from the soft snapshot progressively.
+        """
+        if not hasattr(self, "_soft_snapshot") or not self._soft_snapshot or len(tracks) == 0:
+            return {}
+
+        track_ids = [int(t.track_id) for t in tracks]
+        snap_pids = list(self._soft_snapshot.keys())
+        n_t = len(track_ids)
+        n_s = len(snap_pids)
+
+        cost = np.full((n_t, n_s), 1e3, dtype=np.float32)
+        debug_costs = []
+
+        for i, tid in enumerate(track_ids):
+            t_emb = embeddings.get(tid)
+            t_pos = positions.get(tid)
+            for j, pid in enumerate(snap_pids):
+                snap = self._soft_snapshot[pid]
+                emb_cost = 0.5
+                pos_cost = 0.5
+
+                if t_emb is not None and snap["embedding"] is not None:
+                    e = t_emb.astype(np.float32)
+                    n = np.linalg.norm(e)
+                    if n > 0: e = e / n
+                    cos = float(np.clip(np.dot(e, snap["embedding"]), -1.0, 1.0))
+                    emb_cost = 1.0 - (cos + 1.0) * 0.5
+
+                if t_pos is not None and snap["position"] is not None:
+                    dx = float(t_pos[0] - snap["position"][0])
+                    dy = float(t_pos[1] - snap["position"][1])
+                    dist = (dx * dx + dy * dy) ** 0.5
+                    pos_cost = min(dist / 300.0, 1.0) 
+
+                cst = 0.85 * emb_cost + 0.15 * pos_cost
+                cost[i, j] = cst
+                if is_first_recovery_frame:
+                    debug_costs.append({
+                        "tid": tid, "pid": pid, "cost": float(cst), 
+                        "emb_cost": emb_cost, "pos_cost": pos_cost
+                    })
+
+        r_idx, c_idx = linear_sum_assignment(cost)
+
+        revived: Dict[int, str] = {}
+        for r, c in zip(r_idx, c_idx):
+            cst = cost[r, c]
+            accepted = cst < 0.65  # Threshold for soft revival inside same scene
+            if accepted:
+                revived[track_ids[r]] = snap_pids[c]
+
+        if is_first_recovery_frame:
+            debug_costs.sort(key=lambda x: x["cost"])
+            for d in debug_costs[:5]:
+                accepted = d["cost"] < 0.65
+                print(f"[ReviveCost] tid={d['tid']} pid={d['pid']} cost={d['cost']:.3f} emb={d['emb_cost']:.3f} pos={d['pos_cost']:.3f} accepted={accepted}")
+
+        # Explicit lock on the slots
+        for tid, pid in revived.items():
+            for slot in self.slots:
+                if slot.pid == pid:
+                    slot.active_track_id = tid
+                    slot.seen_this_frame = True
+                    slot.state = "active"
+                    slot.last_seen_frame = self.frame_id
+                    if tid in positions:
+                        slot.last_position = positions[tid]
+                    slot.stability_counter += 1
+                    if tid in embeddings:
+                        slot.update_embedding(embeddings[tid])
+                    self.assigned_this_frame += 1
+                    break
+            
+            # Consume from soft snapshot progressively
+            if pid in self._soft_snapshot:
+                del self._soft_snapshot[pid]
+                
         return revived
 
     # ------------------------------------------------------------------
