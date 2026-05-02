@@ -42,6 +42,9 @@ class IdentityCore:
         self.logger = logger
         self.debug_every = debug_every
         self.slots: List[PlayerSlot] = [PlayerSlot(pid=f"P{i}") for i in range(1, MAX_SLOTS + 1)]
+        
+        # BUG FIX E: ReID Fallback log
+        print("[ReID] using HSV fallback only for appearance matching")
 
         self.frame_id: int = -1
         self.assigned_this_frame: int = 0
@@ -58,17 +61,21 @@ class IdentityCore:
     # ------------------------------------------------------------------
 
     def reset_for_scene(self) -> None:
-        """Clear all slot state on scene boundary (bench_shot→play).
-        Keeps slot PIDs (P1-P22) but wipes track assignments and state.
-        """
+        """Clear active tracking state on scene boundary (bench_shot→play) 
+        but preserve dormant memory and bench snapshot to revive later."""
         for s in self.slots:
-            s.state = "lost"
             s.active_track_id = None
             s.seen_this_frame = False
-        # BUG FIX 3: Do NOT clear snapshot here! It was taken BEFORE the cutaway 
-        # specifically to be used AFTER the cutaway.
+            if s.state in ("active", "dormant") and s.embedding is not None:
+                s.state = "dormant"
+            else:
+                s.state = "lost"
+
         if len(self._bench_snapshot) > 0:
             print(f"[Identity] Reset: {len(self._bench_snapshot)} snapshot slots survived reset")
+        else:
+            print(f"[Identity] Reset: No snapshot exists to survive reset.")
+            
         self._recovery_frames_left = 60  # permissive matching for 60 frames
 
     # ------------------------------------------------------------------
@@ -302,4 +309,15 @@ class IdentityCore:
         recency = min(max(self.frame_id - slot.last_seen_frame, 0), DORMANT_TTL)
         recency_penalty = recency / float(DORMANT_TTL) * 0.15
 
-        return 0.70 * emb_cost + 0.25 * pos_cost + recency_penalty
+        # Bug Fix F: Lower HSV weight but use it securely. Give position even less weight during recovery!
+        if self._recovery_frames_left > 0:
+            final_cost = 0.85 * emb_cost + 0.05 * pos_cost + recency_penalty
+        else:
+            # Active tracking
+            if recency == 0:
+                # Strong continuity prior if active
+                final_cost = 0.50 * emb_cost + 0.30 * pos_cost - 0.10
+            else:
+                final_cost = 0.60 * emb_cost + 0.25 * pos_cost + recency_penalty
+                
+        return float(max(0.0, min(1.0, final_cost)))

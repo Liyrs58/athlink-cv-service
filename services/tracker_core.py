@@ -211,6 +211,13 @@ class TrackerCore:
             self._track_history.clear()
             self._active_baseline = 0
             print(f"[Reset] Frame {video_frame}: freeze→play, tracker + identity reset")
+            
+        # BUG FIX A: Snapshot on freeze entry
+        if is_freeze and not self._prev_is_freeze:
+            saved = self.identity.snapshot_active(video_frame)
+            self._snapshot_taken = True
+            print(f"[Snapshot] Frame {video_frame}: freeze entry saved {saved} slots")
+            
         self._prev_is_freeze = is_freeze
 
         # Run tracker (always except hard freeze)
@@ -283,11 +290,17 @@ class TrackerCore:
         # ── Prompt 9: Suppress noisy tracks before identity ──
         tracks, _sup_stats = self.suppressor.suppress(tracks, frame, video_frame)
 
+        # BUG FIX D: Suppress stale predicted tracks (drift guard)
+        visible_tracks = [t for t in tracks if t.time_since_update <= 1]
+        stale_suppressed = len(tracks) - len(visible_tracks)
+        if stale_suppressed > 0 and video_frame % 30 == 0:
+            print(f"[TrackerCore] F{video_frame}: {stale_suppressed} stale tracks suppressed from render/assign")
+
         # ── Prompt 10: Filter out referees/officials (ENABLED — smart v2) ──
-        tracks, self._officials_this_frame = self.role_filter.filter(
-            tracks, frame, video_frame
+        filtered_tracks, self._officials_this_frame = self.role_filter.filter(
+            visible_tracks, frame, video_frame
         )
-        player_tracks = tracks
+        player_tracks = filtered_tracks
 
         # ── Prompt 11: Score crop quality for each track ──
         quality_scores = self.crop_quality.score_batch(player_tracks, frame, video_frame)
@@ -302,10 +315,16 @@ class TrackerCore:
 
         # Build set of track IDs that allow memory update
         memory_ok_tids = set()
+        stale_memory_blocked = 0
         for t in player_tracks:
             q = quality_scores.get(t.track_id)
-            if q is None or q.allow_memory_update:
+            if t.time_since_update == 0 and (q is None or q.allow_memory_update):
                 memory_ok_tids.add(t.track_id)
+            elif t.time_since_update > 0:
+                stale_memory_blocked += 1
+                
+        if stale_memory_blocked > 0 and video_frame % 30 == 0:
+            print(f"[TrackerCore] F{video_frame}: {stale_memory_blocked} memory updates blocked due to stale tracker age")
 
         # Step E: Recovery on first valid play after freeze
         embed_map = self._extract_embeds()
@@ -317,22 +336,25 @@ class TrackerCore:
             self.identity.begin_frame(video_frame)
 
             # First match: recovery-first if snapshot exists
+            revived_tids = set()
             if self._snapshot_taken and not self._needs_revival:
                 revived = self.identity.revive_cost_matrix(track_objs, embeddings, positions)
                 self.id_remap = {tid: int(pid[1:]) for tid, pid in revived.items()}
                 self._needs_revival = True  # only try once
-                n_revived = len(revived)
-                print(f"[Recovery] Frame {video_frame}: {n_revived} revived from snapshot")
+                revived_tids = set(revived.keys())
+                print(f"[Recovery] Frame {video_frame}: {len(revived)} revived from snapshot")
 
-            # Then normal assignment — pass memory_ok set for gating
+            # Then normal assignment — pass memory_ok set for gating, EXCLUDE revived
+            normal_track_objs = [t for t in track_objs if t.track_id not in revived_tids]
+            
             tid_to_pid = self.identity.assign_tracks(
-                track_objs, embeddings, positions,
+                normal_track_objs, embeddings, positions,
                 memory_ok_tids=memory_ok_tids,
             )
             self.identity.end_frame(video_frame)
             self.identity.maybe_log(detections_count=len(dets), tracks_count=n_tracks)
 
-            # Merge: assign_tracks wins
+            # Merge: assign_tracks only updates un-revived mappings
             for tid, pid in tid_to_pid.items():
                 self.id_remap[tid] = int(pid[1:])
 
