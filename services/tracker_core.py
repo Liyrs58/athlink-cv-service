@@ -127,6 +127,7 @@ class TrackerCore:
         self._scene_snapshot_taken = False
         self._needs_scene_reset = False
         self._needs_scene_revival = False
+        self._scene_reset_at_frame = -1   # guard hard-collapse for 30 frames post-reset
 
         # Scene state tracking
         self._active_baseline = 0
@@ -274,18 +275,18 @@ class TrackerCore:
         if self._needs_scene_reset and is_play:
             self.tracker.reset()
             self.id_remap.clear()
-            self.identity.reset_for_scene()
+            self.identity.reset_for_scene(frame_id=video_frame)
             self.role_filter.reset()
             self._scene_snapshot_taken = False
             self._needs_scene_revival = True
             self._track_history.clear()
-            
-            # Fix: Reset post-bench soft state correctly
+            self._scene_reset_at_frame = video_frame  # guard hard-collapse for 30 frames
+
+            # Reset soft state
             self._soft_collapse = False
             self._soft_recovery_frames = 0
             self._streak_collapse = 0
             self._streak_recover = 0
-            # Do NOT reset baseline to 0, preserve for quick strong start
             if self._active_baseline == 0.0:
                 self._active_baseline = 18.0
             print(f"[SoftStateReset] Frame {video_frame}: mode=normal baseline={self._active_baseline:.1f} low_streak=0 recovery_left=0")
@@ -402,12 +403,16 @@ class TrackerCore:
                 if self._streak_collapse >= 3 and not self._soft_collapse:
                     saved = self.identity.snapshot_soft(video_frame)
                     self._soft_collapse = True
+                    self.identity.in_soft_collapse = True   # ban Hungarian lock promotion
+                    self.identity.in_soft_recovery = False
                     self._streak_collapse = 0
                     print(f"[SoftCollapse] Frame {video_frame}: current={current_count} baseline={self._active_baseline:.1f} saved={saved}")
-                    
+
                 elif self._streak_recover >= 1 and self._soft_collapse:
                     self._soft_collapse = False
+                    self.identity.in_soft_collapse = False
                     self._soft_recovery_frames = 60
+                    self.identity.in_soft_recovery = True   # ban rebind/takeover during recovery
                     self._streak_recover = 0
                     snap_len = len(self.identity._soft_snapshot) if hasattr(self.identity, '_soft_snapshot') and self.identity._soft_snapshot else 0
                     print(f"[SoftRecovery] Frame {video_frame}: current={current_count} baseline={self._active_baseline:.1f} snapshot_slots={snap_len} revived=candidates → entering recovery mode")
@@ -418,7 +423,16 @@ class TrackerCore:
             print(f"[SoftState] frame={video_frame} baseline={self._active_baseline:.1f} current={len(assignable_tracks)} mode={mode} low_streak={self._streak_collapse} recovery_left={self._soft_recovery_frames}")
             
         # Hard Collapse pre-cutaway fallback
-        if is_play and self._active_baseline > 0 and len(assignable_tracks) <= 0.60 * self._active_baseline and not self._scene_snapshot_taken:
+        # Disabled for 30 frames after scene reset (snapshot would be empty/stale)
+        frames_since_reset = video_frame - self._scene_reset_at_frame
+        hard_collapse_ok = (
+            is_play
+            and self._active_baseline > 0
+            and len(assignable_tracks) <= 0.60 * self._active_baseline
+            and not self._scene_snapshot_taken
+            and frames_since_reset > 30
+        )
+        if hard_collapse_ok:
             saved = self.identity.snapshot_scene(video_frame)
             self._scene_snapshot_taken = True
             print(f"[Guard] Frame {video_frame}: hard collapse detected → early snapshot ({saved} slots)")
@@ -463,6 +477,12 @@ class TrackerCore:
                 embeddings[tid] = embed_map[tid]
             track_objs.append(tr)
 
+        # Clear scene recovery protection after 60 frames
+        if (self.identity.in_scene_recovery
+                and self._scene_reset_at_frame >= 0
+                and video_frame - self._scene_reset_at_frame > 60):
+            self.identity.in_scene_recovery = False
+
         # Track-level meta for this frame (pid, source, identity_valid, confidence)
         meta_by_tid = {}
 
@@ -483,11 +503,15 @@ class TrackerCore:
                 meta_by_tid.update(scene_meta)
                 revived_tids.update(revived.keys())
                 self._needs_scene_revival = False
+                # Keep scene_recovery protection for 60 frames even if revival matched 0
+                # (cleared by in_soft_recovery drain in the soft path above)
                 print(f"[Recovery] Frame {video_frame}: {len(revived)} revived from scene snapshot")
 
             if should_revive_soft:
                 is_first_frame = (self._soft_recovery_frames == 60)
                 self._soft_recovery_frames -= 1
+                if self._soft_recovery_frames <= 0:
+                    self.identity.in_soft_recovery = False
                 cand = len(track_objs)
 
                 revived_soft, soft_meta = self.identity.revive_from_soft_snapshot(
@@ -655,19 +679,25 @@ def run_tracking(video_path, job_id, frame_stride=1, max_frames=None, device="cp
 
     # Final identity-lock summary (the real success metric)
     summary = tracker.identity.locks.summary()
-    print("=" * 60)
-    print("[Identity Summary]")
-    print(f"  identity_switches      = {summary['identity_switches']}")
-    print(f"  switches_blocked       = {summary['switches_blocked']}")
-    print(f"  locks_created          = {summary['locks_created']}")
-    print(f"  locks_expired          = {summary['locks_expired']}")
-    print(f"  locks_live_at_end      = {summary['locks_live']}")
-    print(f"  lock_retention_rate    = {summary['lock_retention_rate']}")
-
     valid = sum(1 for f in tracker.results for p in f.get("players", []) if p.get("identity_valid"))
     invalid = sum(1 for f in tracker.results for p in f.get("players", []) if not p.get("identity_valid"))
-    print(f"  valid_identity_frames  = {valid}")
-    print(f"  uncertain_player_boxes = {invalid}")
+    print("=" * 60)
+    print("[Identity Summary]")
+    print(f"  identity_switches            = {summary['identity_switches']}")
+    print(f"  id_rebind_count              = {summary['id_rebind_count']}")
+    print(f"  pid_takeover_count           = {summary['pid_takeover_count']}")
+    print(f"  switches_blocked             = {summary['switches_blocked']}")
+    print(f"  soft_recovery_rebinds_blocked= {summary['soft_recovery_rebinds_blocked']}")
+    print(f"  collapse_lock_creations      = {summary['collapse_lock_creations']}")
+    print(f"  locks_created                = {summary['locks_created']}")
+    print(f"  locks_expired                = {summary['locks_expired']}")
+    print(f"  locks_live_at_end            = {summary['locks_live']}")
+    print(f"  lock_retention_rate          = {summary['lock_retention_rate']}")
+    print(f"  excessive_lock_churn         = {summary['excessive_lock_churn']}")
+    print(f"  valid_identity_frames        = {valid}")
+    print(f"  uncertain_player_boxes       = {invalid}")
+    if summary['excessive_lock_churn']:
+        print(f"[IdentityWarning] excessive lock churn: {summary['locks_created']} locks created (target ≤40)")
     print("=" * 60)
 
     print(f"Done. Video frames: {video_frame}, processed: {processed}")
