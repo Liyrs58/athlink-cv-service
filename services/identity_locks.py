@@ -1,11 +1,12 @@
 """
 Identity Lock Manager — persistent track_id <-> pid bindings.
 
-Key invariants:
+Invariants:
   - 1:1 mapping: each tid has at most one pid, each pid at most one tid.
-  - Locks survive until their TTL drains (track absent) or explicit release.
-  - rebind / takeover are ALWAYS counted as ID switches (never hidden).
-  - During recovery or collapse, rebind/takeover are BLOCKED, not silently done.
+  - During restricted mode (collapse/recovery/bench): locks decay to DORMANT,
+    never expire. Dormant locks reserve the pid — no Hungarian can steal it.
+  - Hungarian lock creation is hard-blocked during restricted mode.
+  - rebind/takeover during normal play are counted as switches.
 """
 
 from __future__ import annotations
@@ -15,8 +16,9 @@ from typing import Dict, List, Optional, Set, Tuple
 
 
 STABLE_PROMOTE_FRAMES = 5      # Hungarian must agree this many consecutive frames to lock
-LOCK_DEFAULT_TTL = 60          # frames a lock survives when track is absent
+LOCK_DEFAULT_TTL = 60          # frames a lock survives absent track in normal play
 LOCK_REVIVED_TTL = 90          # revivals get a longer grace
+LOCK_DORMANT_TTL = 150         # frames a dormant lock reserves pid before true expiry
 MEMORY_UPDATE_MIN_STABLE = 5   # don't write embedding until lock is this stable
 
 
@@ -30,6 +32,7 @@ class IdentityLock:
     last_seen_frame: int = -1
     ttl: int = LOCK_DEFAULT_TTL
     created_frame: int = -1
+    dormant: bool = False       # True → pid reserved but track absent; cannot be stolen
 
 
 class IdentityLockManager:
@@ -40,19 +43,23 @@ class IdentityLockManager:
         self._tid_to_lock: Dict[int, IdentityLock] = {}
         self._pid_to_tid: Dict[str, int] = {}
 
-        # Honest metrics — rebind/takeover count as switches
-        self.identity_switches: int = 0       # actual switches (rebind + takeover)
-        self.id_switches_blocked: int = 0     # attempts blocked during recovery/collapse
+        # Honest metrics
+        self.identity_switches: int = 0
+        self.id_switches_blocked: int = 0
         self.locks_created: int = 0
-        self.locks_expired: int = 0           # stale TTL expiry only
-        self.id_rebind_count: int = 0         # tid changed its pid
-        self.pid_takeover_count: int = 0      # pid stolen from a live tid
-        self.collapse_lock_attempts: int = 0  # hungarian attempts while collapse (blocked before write)
-        self.collapse_lock_creations: int = 0  # locks actually written during collapse (must be 0)
+        self.locks_expired: int = 0
+        self.locks_dormanted: int = 0          # locks converted to dormant instead of expired
+        self.id_rebind_count: int = 0
+        self.pid_takeover_count: int = 0
+        self.collapse_lock_attempts: int = 0   # hungarian attempts blocked before write
+        self.collapse_lock_creations: int = 0  # locks actually written during restricted (must be 0)
+        self.restricted_lock_attempts: int = 0 # all restricted-mode block attempts
         self.soft_recovery_rebinds_blocked: int = 0
-        self._switch_log: List[Tuple] = []    # (frame, pid, old_tid, new_tid, reason)
+        self._switch_log: List[Tuple] = []
 
-        # Mirror of IdentityCore mode — checked at lock-creation to audit collapse
+        # Set True by tracker whenever identity is restricted
+        self.in_restricted: bool = False
+        # Legacy alias kept for callers that set in_collapse
         self.in_collapse: bool = False
 
     # ------------------------------------------------------------------
@@ -74,6 +81,13 @@ class IdentityLockManager:
 
     def is_tid_locked(self, tid: int) -> bool:
         return tid in self._tid_to_lock
+
+    def is_pid_dormant(self, pid: str) -> bool:
+        tid = self._pid_to_tid.get(pid)
+        if tid is None:
+            return False
+        lk = self._tid_to_lock.get(tid)
+        return lk is not None and lk.dormant
 
     def locked_tids(self) -> Set[int]:
         return set(self._tid_to_lock.keys())
@@ -101,22 +115,37 @@ class IdentityLockManager:
         allow_rebind: bool = False,
     ) -> Tuple[Optional[IdentityLock], str]:
         """
-        Attempt to create a lock. Returns (lock_or_None, status_string).
-
-        Status: "created" | "blocked_takeover" | "blocked_rebind" | "refreshed"
-
-        If allow_takeover=False and pid already has a different live tid → block.
-        If allow_rebind=False and tid already has a different pid → block.
-        Caller decides whether to count block as switch or not.
+        Returns (lock_or_None, status_string).
+        Hard-blocks hungarian source during restricted/collapse mode.
         """
+        restricted = self.in_restricted or self.in_collapse
+
+        # Hard block: any Hungarian lock during restricted mode
+        if restricted and source == "hungarian":
+            self.collapse_lock_attempts += 1
+            self.restricted_lock_attempts += 1
+            print(
+                f"[CollapseBlock] frame={frame_id} tid={tid} pid={pid} "
+                f"source=hungarian BLOCKED restricted=True (not written)"
+            )
+            return None, "blocked_collapse"
+
         existing_tid_for_pid = self._pid_to_tid.get(pid)
         existing_pid_for_tid = self._tid_to_lock.get(tid)
 
         # Check pid conflict
         if existing_tid_for_pid is not None and existing_tid_for_pid != tid:
+            existing_lk = self._tid_to_lock.get(existing_tid_for_pid)
+            if existing_lk and existing_lk.dormant and restricted:
+                # Dormant pid is reserved during restricted mode — block takeover
+                self.restricted_lock_attempts += 1
+                print(
+                    f"[DormantBlock] frame={frame_id} pid={pid} "
+                    f"dormant_tid={existing_tid_for_pid} new_tid={tid} BLOCKED (restricted)"
+                )
+                return None, "blocked_dormant"
             if not allow_takeover:
                 return None, "blocked_takeover"
-            # Takeover allowed → count as switch
             self._record_switch_internal(
                 frame_id, pid,
                 old_tid=existing_tid_for_pid, new_tid=tid,
@@ -129,7 +158,6 @@ class IdentityLockManager:
         if existing_pid_for_tid is not None and existing_pid_for_tid.pid != pid:
             if not allow_rebind:
                 return None, "blocked_rebind"
-            # Rebind allowed → count as switch
             self._record_switch_internal(
                 frame_id, existing_pid_for_tid.pid,
                 old_tid=tid, new_tid=-1,
@@ -138,16 +166,10 @@ class IdentityLockManager:
             self._release_internal(tid, reason="rebind", frame_id=frame_id)
             self.id_rebind_count += 1
 
-        # If it's the exact same lock already — just refresh
+        # Exact same lock already — just refresh
         if tid in self._tid_to_lock and self._tid_to_lock[tid].pid == pid:
             self.refresh_lock(tid, frame_id, confidence)
             return self._tid_to_lock[tid], "refreshed"
-
-        # Hard block: collapse + hungarian — count attempt but write nothing
-        if self.in_collapse and source == "hungarian":
-            self.collapse_lock_attempts += 1
-            print(f"[CollapseBlock] frame={frame_id} tid={tid} pid={pid} BLOCKED (not written)")
-            return None, "blocked_collapse"
 
         # Create fresh
         eff_ttl = ttl if ttl is not None else (
@@ -161,6 +183,12 @@ class IdentityLockManager:
         self._tid_to_lock[tid] = lk
         self._pid_to_tid[pid] = tid
         self.locks_created += 1
+
+        # Audit: should never happen after the block above, but count if it does
+        if restricted and source == "hungarian":
+            self.collapse_lock_creations += 1
+            print(f"[IdentityInvariantFAIL] Hungarian lock written during restricted mode! "
+                  f"frame={frame_id} tid={tid} pid={pid}")
 
         print(
             f"[IDLock] frame={frame_id} tid={tid} pid={pid} "
@@ -177,7 +205,7 @@ class IdentityLockManager:
         confidence: float = 0.0,
         ttl: Optional[int] = None,
     ) -> IdentityLock:
-        """Force-create (used by revival paths — conflicts counted as switches)."""
+        """Force-create used by revival paths — conflicts counted as switches."""
         lk, status = self.try_create_lock(
             tid, pid, source, frame_id, confidence, ttl,
             allow_takeover=True, allow_rebind=True,
@@ -195,6 +223,7 @@ class IdentityLockManager:
             return None
         lk.stable_count += 1
         lk.last_seen_frame = frame_id
+        lk.dormant = False  # track seen → no longer dormant
         if confidence is not None:
             lk.confidence = confidence
         lk.ttl = LOCK_REVIVED_TTL if lk.source == "revived" else LOCK_DEFAULT_TTL
@@ -234,23 +263,45 @@ class IdentityLockManager:
         self._pid_to_tid.clear()
 
     # ------------------------------------------------------------------
-    # Per-frame TTL decay
+    # Per-frame TTL decay — dormant-aware
     # ------------------------------------------------------------------
 
-    def tick(self, frame_id: int, present_tids: Set[int]) -> None:
-        """Decay TTL for absent tracks. Expire at 0."""
-        expired = []
+    def tick(self, frame_id: int, present_tids: Set[int], restricted: bool = False) -> None:
+        """
+        Decay TTL for absent tracks.
+        In restricted mode: convert to DORMANT instead of expiring.
+        Dormant locks reserve the pid — they decay on a longer timer.
+        """
+        to_expire = []
         for tid, lk in self._tid_to_lock.items():
             if tid in present_tids:
+                # Track visible — ensure not dormant
+                if lk.dormant:
+                    lk.dormant = False
                 continue
+
             lk.ttl -= 1
+
             if lk.ttl <= 0:
-                expired.append(tid)
-        for tid in expired:
+                if restricted and not lk.dormant:
+                    # Convert to dormant: give it DORMANT_TTL more frames
+                    lk.dormant = True
+                    lk.ttl = LOCK_DORMANT_TTL
+                    self.locks_dormanted += 1
+                    print(
+                        f"[IDLockDormant] frame={frame_id} tid={tid} pid={lk.pid} "
+                        f"stable={lk.stable_count} reason=stale_during_restricted"
+                    )
+                elif lk.dormant and lk.ttl <= 0:
+                    to_expire.append(tid)
+                elif not lk.dormant:
+                    to_expire.append(tid)
+
+        for tid in to_expire:
             self._release_internal(tid, reason="stale", frame_id=frame_id)
 
     # ------------------------------------------------------------------
-    # Blocked-switch helpers for callers
+    # Blocked-switch helpers
     # ------------------------------------------------------------------
 
     def record_blocked_switch(
@@ -268,6 +319,7 @@ class IdentityLockManager:
 
     def summary(self) -> Dict[str, object]:
         live = len(self._tid_to_lock)
+        dormant = sum(1 for lk in self._tid_to_lock.values() if lk.dormant)
         total_seen = self.locks_created
         retention = (
             (total_seen - self.locks_expired) / float(total_seen)
@@ -275,16 +327,19 @@ class IdentityLockManager:
         )
         churn_warning = self.locks_created > 40
         return {
-            "identity_switches": self.identity_switches,    # honest: rebind+takeover
+            "identity_switches": self.identity_switches,
             "id_rebind_count": self.id_rebind_count,
             "pid_takeover_count": self.pid_takeover_count,
             "switches_blocked": self.id_switches_blocked,
             "soft_recovery_rebinds_blocked": self.soft_recovery_rebinds_blocked,
             "collapse_lock_attempts": self.collapse_lock_attempts,
             "collapse_lock_creations": self.collapse_lock_creations,
+            "restricted_lock_attempts": self.restricted_lock_attempts,
             "locks_created": self.locks_created,
             "locks_expired": self.locks_expired,
+            "locks_dormanted": self.locks_dormanted,
             "locks_live": live,
+            "locks_dormant": dormant,
             "lock_retention_rate": round(retention, 3),
             "excessive_lock_churn": churn_warning,
         }

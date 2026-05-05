@@ -2,20 +2,22 @@
 Identity Core — stateful player identity engine.
 
 Identity validity states (per output box):
-  LOCKED     — has a stable lock (stable_count >= LOCK_PROMOTE_FRAMES); export as P-ID.
-  REVIVED    — just recovered from snapshot with good confidence; export as P-ID.
-  PROVISIONAL — matched by Hungarian, not yet stable; internal only, render as unknown.
-  UNKNOWN    — no match, or rejected by gate; render as T<raw_track_id>.
+  LOCKED     — stable lock (stable_count >= LOCK_PROMOTE_FRAMES); export as P-ID.
+  REVIVED    — recovered from snapshot with good confidence; export as P-ID.
+  PROVISIONAL — matched by Hungarian in normal play, not yet stable; do NOT export.
+  UNKNOWN    — no match, or restricted mode, or rejected by gate; render as UNK.
 
-Key invariants:
-  1. P-IDs are only emitted for LOCKED or REVIVED states.
-  2. During collapse/recovery/scene_recovery: no new Hungarian locks, no
-     normal assignments at all — only locked pairs pass through.
-  3. DORMANT locks: when a lock's track is absent for < DORMANT_TTL frames,
-     the pid is reserved (not stealable). Only truly stale locks (past DORMANT_TTL)
-     can be taken over.
-  4. Cross-team matches → hard reject (cost = 1.0).
-  5. No pid takeover during recovery.
+Single source of truth for restricted mode: _identity_restricted() property.
+This is the ONLY check used everywhere inside this class.
+
+Key invariants (enforced in code, not just comments):
+  1. P-IDs emitted ONLY for LOCKED or REVIVED.
+  2. _identity_restricted() == True → allow_new_assignments=False, no PROVISIONAL,
+     no Hungarian lock creation, no slot embedding updates from unknown tracks.
+  3. _identity_restricted() includes ALL of: soft_collapse, soft_recovery,
+     scene_recovery, _recovery_frames_left > 0.
+  4. Lock tick passes restricted flag → stale locks become DORMANT not expired.
+  5. Cross-team matches → hard reject.
 """
 
 from __future__ import annotations
@@ -29,22 +31,20 @@ from scipy.optimize import linear_sum_assignment
 
 from services.identity_locks import (
     IdentityLockManager,
-    STABLE_PROMOTE_FRAMES,
     MEMORY_UPDATE_MIN_STABLE,
 )
-from services.pitch_geometry import assignment_position_cost, max_speed_gate
+from services.pitch_geometry import assignment_position_cost
 
 
-DORMANT_TTL = 180           # frames before dormant → lost (~7s @ 25fps)
-DORMANT_LOCK_TTL = 90       # frames a lock stays DORMANT (pid reserved, not stealable)
+DORMANT_TTL = 180
 MAX_SLOTS = 22
 COST_REJECT_THRESHOLD = 0.72
 REVIVAL_COST_THRESHOLD = 0.60
 REVIVAL_MARGIN_MIN = 0.05
 LOW_CONFIDENCE_THRESHOLD = 0.55
 EMB_ALPHA = 0.25
-STABLE_PROTECT_THRESHOLD = 10   # stable_count >= this → protected lock
-LOCK_PROMOTE_FRAMES = 5         # consecutive Hungarian frames before lock promotion
+STABLE_PROTECT_THRESHOLD = 10
+LOCK_PROMOTE_FRAMES = 5
 
 
 class IdentityState(str, Enum):
@@ -56,17 +56,17 @@ class IdentityState(str, Enum):
 
 @dataclass
 class AssignmentMeta:
-    pid: Optional[str]              # "P7" or None
-    source: str                     # locked | revived | provisional | unknown
+    pid: Optional[str]
+    source: str                 # locked | revived | provisional | unknown
     identity_state: IdentityState
-    confidence: float               # 0..1
-    identity_valid: bool            # True only for LOCKED or REVIVED
+    confidence: float
+    identity_valid: bool        # True only for LOCKED or REVIVED
 
 
 @dataclass
 class PlayerSlot:
     pid: str
-    state: str = "lost"             # active | dormant | lost
+    state: str = "lost"         # active | dormant | lost
     active_track_id: Optional[int] = None
     seen_this_frame: bool = False
     last_seen_frame: int = -10**9
@@ -76,7 +76,7 @@ class PlayerSlot:
     stability_counter: int = 0
     pending_tid: Optional[int] = None
     pending_streak: int = 0
-    team_id: Optional[int] = None   # locked in after enough stable frames
+    team_id: Optional[int] = None
 
     def update_embedding(self, emb: np.ndarray) -> None:
         emb = emb.astype(np.float32)
@@ -126,8 +126,39 @@ class IdentityCore:
 
         # Run-level metrics
         self.recovery_normal_assignments: int = 0
+        self.scene_recovery_normal_assignments: int = 0
+        self.restricted_hungarian_assignments: int = 0
         self.ambiguous_rejects: int = 0
         self.revived_count: int = 0
+
+    # ------------------------------------------------------------------
+    # Single source of truth for restricted identity mode
+    # ------------------------------------------------------------------
+
+    @property
+    def _identity_restricted(self) -> bool:
+        """
+        True when ANY recovery/collapse condition is active.
+        This is the ONE check used everywhere. No partial checks allowed.
+        """
+        return (
+            self.in_soft_collapse
+            or self.in_soft_recovery
+            or self.in_scene_recovery
+            or self._recovery_frames_left > 0
+        )
+
+    def _identity_restricted_reason(self) -> str:
+        reasons = []
+        if self.in_soft_collapse:
+            reasons.append("soft_collapse")
+        if self.in_soft_recovery:
+            reasons.append("soft_recovery")
+        if self.in_scene_recovery:
+            reasons.append("scene_recovery")
+        if self._recovery_frames_left > 0:
+            reasons.append(f"recovery_frames_left={self._recovery_frames_left}")
+        return ",".join(reasons) if reasons else "none"
 
     # ------------------------------------------------------------------
     # Scene reset
@@ -156,6 +187,9 @@ class IdentityCore:
         self.in_soft_recovery = False
         self.in_scene_recovery = True
         self._scene_reset_frame = frame_id
+        # Sync lock manager restricted flag
+        self.locks.in_restricted = True
+        self.locks.in_collapse = False
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -171,11 +205,15 @@ class IdentityCore:
         for s in self.slots:
             s.active_track_id = None
             s.seen_this_frame = False
+        # Sync lock manager restricted/collapse flags from our state
+        restricted = self._identity_restricted
+        self.locks.in_restricted = restricted
+        self.locks.in_collapse = self.in_soft_collapse
         if present_tids is not None:
-            self.locks.tick(frame_id, present_tids)
+            self.locks.tick(frame_id, present_tids, restricted=restricted)
 
     # ------------------------------------------------------------------
-    # assign_tracks — the main entry point every frame
+    # assign_tracks — single entry point every frame
     # ------------------------------------------------------------------
 
     def assign_tracks(
@@ -187,19 +225,26 @@ class IdentityCore:
         allow_new_assignments: bool = True,
     ) -> Tuple[Dict[int, str], Dict[int, AssignmentMeta]]:
         """
-        allow_new_assignments=False → only locked pairs emitted; all others UNKNOWN.
-        This is the key gate: caller sets it False during collapse/recovery.
+        allow_new_assignments=False OR _identity_restricted=True:
+          → only locked pairs emitted; all others UNKNOWN.
+        Caller always passes allow_new_assignments=not _identity_restricted().
+        The internal check here is a second safety net.
         """
         meta_map: Dict[int, AssignmentMeta] = {}
         track_to_pid: Dict[int, str] = {}
         memory_skips = 0
         locked_kept = 0
 
+        # Internal gate — overrides caller if they passed wrong value
+        restricted = self._identity_restricted
+        if restricted:
+            allow_new_assignments = False
+
         if len(tracks) == 0:
             self.unmatched_slots = MAX_SLOTS
             return {}, {}
 
-        # ── Step 1: locked pairs emit directly (always, regardless of mode) ──
+        # ── Step 1: locked pairs always pass through ─────────────────────
         unlocked_tracks: List[object] = []
         for tr in tracks:
             tid = int(tr.track_id)
@@ -223,7 +268,7 @@ class IdentityCore:
             emb = embeddings.get(tid)
             if (emb is not None
                     and lk.stable_count >= MEMORY_UPDATE_MIN_STABLE
-                    and not self.in_soft_collapse
+                    and not restricted
                     and (memory_ok_tids is None or tid in memory_ok_tids)):
                 slot.update_embedding(emb)
             elif emb is not None:
@@ -241,8 +286,9 @@ class IdentityCore:
         if locked_kept and self.frame_id % self.debug_every == 0:
             print(f"[IDLockKeep] frame={self.frame_id} kept={locked_kept}")
 
-        # ── Step 2: gate — if not allowed, all unlocked → UNKNOWN ──────
+        # ── Step 2: gate — restricted or not allowed → all UNKNOWN ───────
         if not allow_new_assignments:
+            reason = self._identity_restricted_reason()
             for tr in unlocked_tracks:
                 tid = int(tr.track_id)
                 meta_map[tid] = AssignmentMeta(
@@ -253,24 +299,12 @@ class IdentityCore:
             self.unmatched_tracks = len(unlocked_tracks)
             self.unmatched_slots = sum(1 for s in self.slots if not s.seen_this_frame)
             self._last_memory_skips = memory_skips
+            if unlocked_tracks and self.frame_id % self.debug_every == 0:
+                print(f"[IdentityGate] frame={self.frame_id} blocked={len(unlocked_tracks)} "
+                      f"reason={reason}")
             return track_to_pid, meta_map
 
-        # ── Step 3: During collapse — also gate out ──────────────────────
-        if self.in_soft_collapse:
-            for tr in unlocked_tracks:
-                tid = int(tr.track_id)
-                meta_map[tid] = AssignmentMeta(
-                    pid=None, source="unknown",
-                    identity_state=IdentityState.UNKNOWN,
-                    confidence=0.0, identity_valid=False,
-                )
-            self.unmatched_tracks = len(unlocked_tracks)
-            self.unmatched_slots = sum(1 for s in self.slots if not s.seen_this_frame)
-            self._last_memory_skips = memory_skips
-            return track_to_pid, meta_map
-
-        # ── Step 4: Hungarian on unlocked tracks × unlocked/free slots ──
-        # "Free" slot = not locked AND not already activated this frame
+        # ── Step 3: Normal play — Hungarian on unlocked tracks × free slots
         unlocked_slot_idx = [
             j for j, s in enumerate(self.slots)
             if not self.locks.is_pid_locked(s.pid) and not s.seen_this_frame
@@ -311,38 +345,6 @@ class IdentityCore:
                     )
                     continue
 
-                # During recovery: emit PROVISIONAL, do not create locks, do not
-                # update id_remap (caller decides to exclude from export)
-                in_recovery = self.in_soft_recovery or self.in_scene_recovery
-                if in_recovery:
-                    # Only allowed if cost is good AND slot has no recent lock
-                    if self.locks.is_pid_locked(slot.pid):
-                        old_tid = self.locks.get_tid_for_pid(slot.pid)
-                        self.locks.record_blocked_switch(
-                            self.frame_id, slot.pid, old_tid or -1, tid,
-                            reason="recovery_gate",
-                        )
-                        self.locks.soft_recovery_rebinds_blocked += 1
-                        meta_map[tid] = AssignmentMeta(
-                            pid=None, source="unknown",
-                            identity_state=IdentityState.UNKNOWN,
-                            confidence=0.0, identity_valid=False,
-                        )
-                        continue
-
-                    # Tentative — PROVISIONAL, no lock, no export
-                    self._activate_slot(slot, tid, positions)
-                    self.assigned_this_frame += 1
-                    self.recovery_normal_assignments += 1
-                    meta_map[tid] = AssignmentMeta(
-                        pid=slot.pid,
-                        source="provisional",
-                        identity_state=IdentityState.PROVISIONAL,
-                        confidence=max(0.0, 1.0 - cst),
-                        identity_valid=False,   # PROVISIONAL never exported
-                    )
-                    continue
-
                 # Normal play: stable-promote streak → lock
                 confidence = max(0.0, 1.0 - cst)
 
@@ -374,7 +376,6 @@ class IdentityCore:
                         slot.pending_streak = 0
 
                 self.assigned_this_frame += 1
-                # PROVISIONAL until locked; caller gates export on LOCKED/REVIVED
                 is_locked = self.locks.is_tid_locked(tid)
                 meta_map[tid] = AssignmentMeta(
                     pid=slot.pid,
@@ -464,7 +465,7 @@ class IdentityCore:
         embeddings: Dict[int, np.ndarray],
         positions: Dict[int, Tuple[float, float]],
     ) -> Tuple[Dict[int, str], Dict[int, AssignmentMeta]]:
-        """Scene revival after bench→play. Logs exact failure reason."""
+        """Scene revival after bench→play. Only unlocked tracks passed in."""
         revived: Dict[int, str] = {}
         meta: Dict[int, AssignmentMeta] = {}
 
@@ -492,7 +493,6 @@ class IdentityCore:
             t_team = self.team_labels.get(tid)
             for j, pid in enumerate(snap_pids):
                 s = snap[pid]
-                # Team hard gate
                 if (t_team is not None and s.get("team_id") is not None
                         and t_team != s["team_id"]):
                     cost[i, j] = 1e3
@@ -529,7 +529,6 @@ class IdentityCore:
             if tid in used_tids or pid in used_pids:
                 continue
 
-            # Margin check
             row_costs = cost[r, :]
             valid_row = row_costs[row_costs < 1e2]
             if len(valid_row) >= 2:
@@ -541,7 +540,6 @@ class IdentityCore:
                     self.ambiguous_rejects += 1
                     continue
 
-            # Stable-lock protection
             existing_tid = self.locks.get_tid_for_pid(pid)
             if existing_tid is not None and existing_tid != tid:
                 existing_lk = self.locks.get_lock(existing_tid)
@@ -569,7 +567,7 @@ class IdentityCore:
         else:
             print(f"[Identity] Revival: {accepted}/{n_t} from scene snapshot")
 
-        self._bench_snapshot = {}
+        # Do NOT clear bench_snapshot here — tracker_core keeps retrying for 90 frames
         return revived, meta
 
     def revive_from_soft_snapshot(
@@ -599,7 +597,6 @@ class IdentityCore:
             t_team = self.team_labels.get(tid)
             for j, pid in enumerate(snap_pids):
                 s = self._soft_snapshot[pid]
-                # Team hard gate
                 if (t_team is not None and s.get("team_id") is not None
                         and t_team != s["team_id"]):
                     cost[i, j] = 1e3
@@ -638,7 +635,6 @@ class IdentityCore:
             if tid in used_tids or pid in used_pids:
                 continue
 
-            # Margin check
             row_costs = cost[r, :]
             valid_row = row_costs[row_costs < 1e2]
             if len(valid_row) >= 2:
@@ -649,7 +645,6 @@ class IdentityCore:
                     self.ambiguous_rejects += 1
                     continue
 
-            # Stable-lock protection — pid side
             existing_tid = self.locks.get_tid_for_pid(pid)
             if existing_tid is not None and existing_tid != tid:
                 existing_lk = self.locks.get_lock(existing_tid)
@@ -659,7 +654,6 @@ class IdentityCore:
                     self.locks.soft_recovery_rebinds_blocked += 1
                     continue
 
-            # Stable-lock protection — tid side (don't rebind a stable tid)
             existing_lk_for_tid = self.locks.get_lock(tid)
             if (existing_lk_for_tid is not None
                     and existing_lk_for_tid.pid != pid
@@ -740,7 +734,6 @@ class IdentityCore:
         t_pitch = self.pitch_positions.get(tid)
         if t_pitch is not None:
             slot.last_pitch = t_pitch
-        # Lock in team_id after enough stable frames
         if slot.stability_counter >= 5 and slot.team_id is None:
             t_team = self.team_labels.get(tid)
             if t_team is not None:
@@ -763,12 +756,13 @@ class IdentityCore:
             return
         active, dormant, lost = self.state_counts()
         n_locks = len(self.locks._tid_to_lock)
+        restricted = self._identity_restricted
         print(
             f"[Frame {self.frame_id}] det={detections_count} tracks={tracks_count} "
             f"assigned={self.assigned_this_frame} active={active} dormant={dormant} "
             f"lost={min(lost, MAX_SLOTS)} unmatched_t={self.unmatched_tracks} "
             f"unmatched_s={self.unmatched_slots} skips={self._last_memory_skips} "
-            f"locks={n_locks}"
+            f"locks={n_locks} restricted={restricted}"
         )
 
     def _slot_cost(
@@ -778,19 +772,16 @@ class IdentityCore:
         t_pos: Optional[Tuple[float, float]],
         tid: Optional[int] = None,
     ) -> float:
-        # Boot: empty lost slots eagerly accept tracks — but NEVER during collapse/recovery
-        in_any_recovery = (self.in_soft_collapse or self.in_soft_recovery
-                           or self.in_scene_recovery or self._recovery_frames_left > 0)
-        if not in_any_recovery and slot.state == "lost" and slot.embedding is None:
+        # Boot: empty lost slots eagerly accept — but NEVER during any restricted mode
+        if not self._identity_restricted and slot.state == "lost" and slot.embedding is None:
             return 0.30
 
-        # Team hard gate — guaranteed above COST_REJECT_THRESHOLD
+        # Team hard gate
         if tid is not None:
             t_team = self.team_labels.get(tid)
             if t_team is not None and slot.team_id is not None and t_team != slot.team_id:
                 return float(COST_REJECT_THRESHOLD + 0.05)
 
-        # Appearance cost
         emb_cost = 0.5
         if t_emb is not None and slot.embedding is not None:
             e = t_emb.astype(np.float32)
@@ -800,21 +791,16 @@ class IdentityCore:
             cos = float(np.clip(np.dot(e, slot.embedding), -1.0, 1.0))
             emb_cost = 1.0 - (cos + 1.0) * 0.5
 
-        # Pitch/position cost via pitch_geometry
         t_pitch = self.pitch_positions.get(tid) if tid is not None else None
         pos_cost = assignment_position_cost(slot.last_pitch, t_pitch) if t_pitch is not None \
             else (assignment_position_cost(slot.last_position, t_pos) if t_pos is not None else 0.5)
 
-        # Recency and lock continuity
         recency = min(max(self.frame_id - slot.last_seen_frame, 0), DORMANT_TTL)
         recency_cost = recency / float(DORMANT_TTL)
         lock_discount = 0.15 if slot.stability_counter >= 10 else 0.0
 
         mode = self.reid_mode
-        if self._recovery_frames_left > 0:
-            final_cost = (0.85 * emb_cost + 0.10 * pos_cost
-                          + 0.05 * recency_cost - lock_discount)
-        elif mode == "OSNet":
+        if mode == "OSNet":
             if recency == 0:
                 final_cost = (0.55 * emb_cost + 0.20 * pos_cost
                               + 0.05 * recency_cost - 0.10 - lock_discount)
@@ -829,7 +815,6 @@ class IdentityCore:
                 final_cost = (0.45 * emb_cost + 0.25 * pos_cost
                               + 0.15 * recency_cost - lock_discount)
         else:
-            # HSV: colour is team-level; lean on position more
             if recency == 0:
                 final_cost = (0.30 * emb_cost + 0.35 * pos_cost
                               + 0.05 * recency_cost - 0.10 - lock_discount)
@@ -840,46 +825,59 @@ class IdentityCore:
         return float(max(0.0, min(1.0, final_cost)))
 
     def end_run_summary(self) -> Dict[str, object]:
-        """Called at end of run by tracker_core for metrics."""
         lock_summary = self.locks.summary()
         stable_locked = sum(
             1 for lk in self.locks._tid_to_lock.values()
             if lk.stable_count >= LOCK_PROMOTE_FRAMES
         )
         collapse_lock_creations = lock_summary.get("collapse_lock_creations", 0)
+        collapse_lock_attempts = lock_summary.get("collapse_lock_attempts", 0)
+        restricted_lock_attempts = lock_summary.get("restricted_lock_attempts", 0)
         locks_created = lock_summary.get("locks_created", 1)
         locks_expired = lock_summary.get("locks_expired", 0)
         retention = round((locks_created - locks_expired) / max(locks_created, 1), 3)
 
-        result = {
-            **lock_summary,
-            "recovery_normal_assignments": self.recovery_normal_assignments,
-            "ambiguous_rejects": self.ambiguous_rejects,
-            "revived_count": self.revived_count,
-            "stable_locked_count": stable_locked,
-        }
-
-        collapse_lock_attempts = lock_summary.get("collapse_lock_attempts", 0)
         ok_collapse = collapse_lock_creations == 0
         ok_recovery_normal = self.recovery_normal_assignments == 0
+        ok_scene_normal = self.scene_recovery_normal_assignments == 0
+        ok_restricted_hungarian = self.restricted_hungarian_assignments == 0
         ok_retention = retention >= 0.65
         ok_locks = locks_created <= 40
+
         print("\n[IdentityMetrics]")
-        print(f"  collapse_lock_attempts       = {collapse_lock_attempts}  (blocked before write)")
-        print(f"  collapse_lock_creations      = {collapse_lock_creations}  {'OK' if ok_collapse else 'INVARIANT VIOLATED — locks were written during collapse'}")
-        print(f"  recovery_normal_assignments  = {self.recovery_normal_assignments}  {'OK' if ok_recovery_normal else 'INVARIANT VIOLATED — normal assignments happened during recovery'}")
-        print(f"  locks_created                = {locks_created}  {'OK' if ok_locks else 'WARN target<=40'}")
-        print(f"  lock_retention_rate          = {retention}  {'OK' if ok_retention else 'WARN target>=0.65'}")
-        print(f"  ambiguous_rejects            = {self.ambiguous_rejects}")
-        print(f"  revived_count                = {self.revived_count}")
-        print(f"  stable_locked_count          = {stable_locked}")
+        print(f"  collapse_lock_attempts            = {collapse_lock_attempts}  (blocked, not written)")
+        print(f"  restricted_lock_attempts          = {restricted_lock_attempts}  (all restricted blocks)")
+        print(f"  collapse_lock_creations           = {collapse_lock_creations}  {'OK' if ok_collapse else 'FAIL must=0'}")
+        print(f"  recovery_normal_assignments       = {self.recovery_normal_assignments}  {'OK' if ok_recovery_normal else 'FAIL must=0'}")
+        print(f"  scene_recovery_normal_assignments = {self.scene_recovery_normal_assignments}  {'OK' if ok_scene_normal else 'FAIL must=0'}")
+        print(f"  restricted_hungarian_assignments  = {self.restricted_hungarian_assignments}  {'OK' if ok_restricted_hungarian else 'FAIL must=0'}")
+        print(f"  locks_created                     = {locks_created}  {'OK' if ok_locks else 'WARN target<=40'}")
+        print(f"  lock_retention_rate               = {retention}  {'OK' if ok_retention else 'WARN target>=0.65'}")
+        print(f"  locks_dormanted                   = {lock_summary.get('locks_dormanted', 0)}")
+        print(f"  ambiguous_rejects                 = {self.ambiguous_rejects}")
+        print(f"  revived_count                     = {self.revived_count}")
+        print(f"  stable_locked_count               = {stable_locked}")
 
         violations = []
         if not ok_collapse:
             violations.append(f"collapse_lock_creations={collapse_lock_creations} (must be 0)")
         if not ok_recovery_normal:
             violations.append(f"recovery_normal_assignments={self.recovery_normal_assignments} (must be 0)")
+        if not ok_scene_normal:
+            violations.append(f"scene_recovery_normal_assignments={self.scene_recovery_normal_assignments} (must be 0)")
+        if not ok_restricted_hungarian:
+            violations.append(f"restricted_hungarian_assignments={self.restricted_hungarian_assignments} (must be 0)")
         if violations:
-            raise RuntimeError("[IdentityInvariantViolation] " + "; ".join(violations))
+            msg = "[IdentityInvariantFAIL] " + "; ".join(violations)
+            print(msg)
+            raise RuntimeError(msg)
 
-        return result
+        return {
+            **lock_summary,
+            "recovery_normal_assignments": self.recovery_normal_assignments,
+            "scene_recovery_normal_assignments": self.scene_recovery_normal_assignments,
+            "restricted_hungarian_assignments": self.restricted_hungarian_assignments,
+            "ambiguous_rejects": self.ambiguous_rejects,
+            "revived_count": self.revived_count,
+            "stable_locked_count": stable_locked,
+        }

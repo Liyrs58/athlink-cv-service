@@ -653,19 +653,16 @@ class TrackerCore:
                         else:
                             print(f"[SoftRecoveryCause] F{video_frame} costs too high")
 
-            # Then normal assignment — locks bypass Hungarian internally,
-            # so we pass ALL tracks (revived ones are already locked).
+            # Normal assignment — identity_restricted is the single source of truth.
+            # assign_tracks also enforces this internally as a second safety net.
             normal_track_objs = [t for t in track_objs if t.track_id not in revived_tids]
+            restricted = self.identity._identity_restricted
+            restricted_reason = self.identity._identity_restricted_reason()
 
-            in_any_recovery = (
-                self._soft_recovery_frames > 0
-                or self.identity.in_scene_recovery
-                or self._soft_collapse
-            )
             tid_to_pid, normal_meta = self.identity.assign_tracks(
                 normal_track_objs, embeddings, positions,
                 memory_ok_tids=memory_ok_tids,
-                allow_new_assignments=not in_any_recovery,
+                allow_new_assignments=not restricted,
             )
             meta_by_tid.update(normal_meta)
             self.identity.end_frame(video_frame)
@@ -676,23 +673,30 @@ class TrackerCore:
                 self.id_remap[tid] = int(pid[1:])
 
             # Drop id_remap entries for tracks that became unassigned this frame
-            # (so render shows them as uncertain rather than as a stale P-id)
             for tid, m in meta_by_tid.items():
                 if m.pid is None and tid in self.id_remap:
                     del self.id_remap[tid]
 
-            # Lock-aware accounting
+            # Lock-aware accounting — count provisional as normal (they should be 0 in restricted)
             locked_kept = sum(1 for m in meta_by_tid.values() if m.source == "locked")
             revived_n = sum(1 for m in meta_by_tid.values() if m.source == "revived")
-            hungarian_n = sum(1 for m in meta_by_tid.values() if m.source == "hungarian")
+            provisional_n = sum(1 for m in meta_by_tid.values() if m.source == "provisional")
+            unknown_n = sum(1 for m in meta_by_tid.values() if m.source == "unknown")
             unassigned_n = sum(1 for m in meta_by_tid.values() if m.source == "unassigned")
+
+            # Invariant check: if restricted, provisional must be 0
+            if restricted and provisional_n > 0:
+                print(
+                    f"[IdentityInvariantFAIL] F{video_frame} provisional={provisional_n} "
+                    f"during restricted mode reason={restricted_reason}"
+                )
 
             if should_revive_scene or should_revive_soft or video_frame % 30 == 0:
                 print(
                     f"[RecoveryAssign] F{video_frame} locked={locked_kept} "
-                    f"revived={revived_n} normal={hungarian_n} "
+                    f"revived={revived_n} normal={provisional_n} unknown={unknown_n} "
                     f"blocked={stale_memory_blocked+len(overlay_blocked_tids)} "
-                    f"unassigned={unassigned_n}"
+                    f"unassigned={unassigned_n} restricted={restricted} reason={restricted_reason}"
                 )
         elif is_play:
             # No tracks this frame — still tick the lock TTLs so stale ones expire
