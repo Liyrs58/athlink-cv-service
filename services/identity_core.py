@@ -13,11 +13,14 @@ from services.identity_locks import (
 )
 
 
-DORMANT_TTL = 180          # frames before dormant → lost (~7s @ 25fps)
+DORMANT_TTL = 180
 MAX_SLOTS = 22
 COST_REJECT_THRESHOLD = 0.72
-LOW_CONFIDENCE_THRESHOLD = 0.55  # cost above this → identity_valid=False
+LOW_CONFIDENCE_THRESHOLD = 0.55
 EMB_ALPHA = 0.25
+STABLE_PROTECT_THRESHOLD = 10   # lock with stable_count >= this is "stable-protected"
+REVIVAL_MARGIN_MIN = 0.05       # soft revival: best vs 2nd best must differ by at least this
+REVIVAL_COST_THRESHOLD = 0.60   # soft/scene revival acceptance ceiling
 
 
 @dataclass
@@ -28,6 +31,7 @@ class PlayerSlot:
     seen_this_frame: bool = False
     last_seen_frame: int = -10**9
     last_position: Optional[Tuple[float, float]] = None
+    last_pitch: Optional[Tuple[float, float]] = None   # normalised pitch (x,y) ∈ [0,1]²
     embedding: Optional[np.ndarray] = None
     stability_counter: int = 0
     pending_tid: Optional[int] = None
@@ -60,7 +64,6 @@ class IdentityCore:
         self.logger = logger
         self.debug_every = debug_every
         self.slots: List[PlayerSlot] = [PlayerSlot(pid=f"P{i}") for i in range(1, MAX_SLOTS + 1)]
-
         print("[ReID] using HSV fallback only for appearance matching")
 
         self.frame_id: int = -1
@@ -73,11 +76,19 @@ class IdentityCore:
         self._recovery_frames_left: int = 0
         self._last_memory_skips: int = 0
 
-        # Mode flags set by tracker_core
-        self.in_soft_collapse: bool = False    # no new Hungarian locks during collapse
-        self.in_soft_recovery: bool = False    # no rebind/takeover during recovery
-        self.in_scene_recovery: bool = False   # same protection post-bench
-        self._scene_reset_frame: int = -1      # frame of last scene reset
+        # Mode flags — set externally by tracker_core
+        self.in_soft_collapse: bool = False
+        self.in_soft_recovery: bool = False
+        self.in_scene_recovery: bool = False
+        self._scene_reset_frame: int = -1
+
+        # Per-frame extras injected by tracker_core before assign_tracks
+        self.pitch_positions: Dict[int, Tuple[float, float]] = {}  # tid -> (norm_x, norm_y)
+        self.team_labels: Dict[int, Optional[int]] = {}            # tid -> team int or None
+        self.reid_mode: str = "HSV-fallback"                       # "OSNet"|"ResNet50"|"HSV-fallback"
+
+        # Per-slot team label (set when slot is first stabilised)
+        self._slot_team: Dict[str, Optional[int]] = {}
 
         self.locks = IdentityLockManager(logger=logger)
 
@@ -133,11 +144,11 @@ class IdentityCore:
         memory_ok_tids: Optional[set] = None,
     ) -> Tuple[Dict[int, str], Dict[int, AssignmentMeta]]:
         """
-        Step 1: Auto-emit locked pairs (no Hungarian).
-        Step 2: Hungarian on unlocked tracks × unlocked slots.
-                - During collapse: skip lock promotion.
-                - During recovery: block any rebind/takeover.
-        Step 3: Promote stable Hungarian streak → lock (only outside collapse).
+        Step 1: Auto-emit locked pairs. No Hungarian for locked tracks.
+        Step 2: During collapse — skip Hungarian entirely. All unlocked → unassigned.
+        Step 3: Outside collapse — Hungarian on (unlocked tracks × unlocked slots).
+                During recovery — no new lock promotion, no rebind/takeover.
+                Outside recovery — promote stable streak → lock.
         """
         meta_map: Dict[int, AssignmentMeta] = {}
         track_to_pid: Dict[int, str] = {}
@@ -170,7 +181,9 @@ class IdentityCore:
             locked_kept += 1
 
             emb = embeddings.get(tid)
-            if emb is not None and lk.stable_count >= MEMORY_UPDATE_MIN_STABLE:
+            if (emb is not None
+                    and lk.stable_count >= MEMORY_UPDATE_MIN_STABLE
+                    and not self.in_soft_collapse):
                 if memory_ok_tids is None or tid in memory_ok_tids:
                     slot.update_embedding(emb)
                 else:
@@ -184,7 +197,19 @@ class IdentityCore:
         if locked_kept and self.frame_id % self.debug_every == 0:
             print(f"[IDLockKeep] frame={self.frame_id} kept={locked_kept}")
 
-        # ── Step 2: Hungarian on unlocked tracks × unlocked slots ───────
+        # ── Step 2: During collapse, leave all unlocked tracks unassigned ─
+        if self.in_soft_collapse:
+            for tr in unlocked_tracks:
+                tid = int(tr.track_id)
+                meta_map[tid] = AssignmentMeta(pid=None, source="unassigned",
+                                               confidence=0.0, identity_valid=False)
+            self.unmatched_tracks = len(unlocked_tracks)
+            self.unmatched_slots = sum(1 for s in self.slots if not s.seen_this_frame)
+            self._last_memory_skips = memory_skips
+            return track_to_pid, meta_map
+
+        # ── Step 3: Hungarian on unlocked tracks × unlocked slots ───────
+        # Unlocked slots = not locked AND not already seen this frame
         unlocked_slot_idx = [
             j for j, s in enumerate(self.slots)
             if not self.locks.is_pid_locked(s.pid) and not s.seen_this_frame
@@ -204,7 +229,7 @@ class IdentityCore:
                 tid = int(tr.track_id)
                 for jj, j in enumerate(unlocked_slot_idx):
                     cost[i, jj] = self._slot_cost(
-                        self.slots[j], embeddings.get(tid), positions.get(tid)
+                        self.slots[j], embeddings.get(tid), positions.get(tid), tid=tid
                     )
 
             r_idx, c_idx = linear_sum_assignment(cost)
@@ -222,8 +247,9 @@ class IdentityCore:
                 confidence = max(0.0, 1.0 - cst)
                 identity_valid = cst <= LOW_CONFIDENCE_THRESHOLD
 
-                # During recovery: block takeover of any pid that had a recent lock
-                if (self.in_soft_recovery or self.in_scene_recovery):
+                # During recovery: block new hungarian lock on a slot that was
+                # recently stable-locked (even if the old lock expired from TTL)
+                if self.in_soft_recovery or self.in_scene_recovery:
                     if self.locks.is_pid_locked(slot.pid):
                         old_tid = self.locks.get_tid_for_pid(slot.pid)
                         self.locks.record_blocked_switch(
@@ -234,15 +260,31 @@ class IdentityCore:
                         meta_map[tid] = AssignmentMeta(pid=None, source="unassigned",
                                                        confidence=0.0, identity_valid=False)
                         continue
+                    # Also block promoting to lock during recovery
+                    # (only emit tentative hungarian assignment, no lock creation)
+                    track_to_pid[tid] = slot.pid
+                    self._activate_slot(slot, tid, positions)
+                    if identity_valid:
+                        emb = embeddings.get(tid)
+                        if emb is not None:
+                            if memory_ok_tids is None or tid in memory_ok_tids:
+                                slot.update_embedding(emb)
+                            else:
+                                memory_skips += 1
+                    self.assigned_this_frame += 1
+                    meta_map[tid] = AssignmentMeta(
+                        pid=slot.pid, source="hungarian",
+                        confidence=confidence, identity_valid=identity_valid,
+                    )
+                    continue
 
-                # Stable-promote streak tracking
+                # Outside recovery: promote stable streak → lock
                 if slot.pending_tid == tid:
                     slot.pending_streak += 1
                 else:
                     slot.pending_tid = tid
                     slot.pending_streak = 1
 
-                # Tentative assignment
                 track_to_pid[tid] = slot.pid
                 self._activate_slot(slot, tid, positions)
 
@@ -254,29 +296,21 @@ class IdentityCore:
                         else:
                             memory_skips += 1
 
-                # Promote to lock only when streak is stable AND we are NOT in collapse
-                if (not self.in_soft_collapse
-                        and slot.pending_streak >= STABLE_PROMOTE_FRAMES
-                        and identity_valid):
+                if slot.pending_streak >= STABLE_PROMOTE_FRAMES and identity_valid:
                     lk_new, status = self.locks.try_create_lock(
                         tid=tid, pid=slot.pid, source="hungarian",
                         frame_id=self.frame_id, confidence=cst,
-                        # Outside recovery: allow rebind/takeover (counts as switch)
-                        allow_takeover=not (self.in_soft_recovery or self.in_scene_recovery),
-                        allow_rebind=not (self.in_soft_recovery or self.in_scene_recovery),
+                        allow_takeover=True, allow_rebind=True,
                     )
                     if status in ("created", "refreshed"):
                         slot.pending_tid = None
                         slot.pending_streak = 0
                     elif status in ("blocked_takeover", "blocked_rebind"):
-                        # Should not happen since we already checked above, but be safe
                         self.locks.record_blocked_switch(
                             self.frame_id, slot.pid,
                             self.locks.get_tid_for_pid(slot.pid) or -1, tid,
                             reason=status,
                         )
-                elif self.in_soft_collapse and slot.pending_streak >= STABLE_PROMOTE_FRAMES:
-                    self.locks.collapse_lock_creations += 1
 
                 self.assigned_this_frame += 1
                 meta_map[tid] = AssignmentMeta(
@@ -316,14 +350,15 @@ class IdentityCore:
     # ------------------------------------------------------------------
 
     def snapshot_scene(self, frame_id: int) -> int:
-        """Save active+dormant slot state at freeze entry. Never overwrite
-        with empty — if no slots have embeddings, keep the old snapshot."""
+        """Save active+dormant slot state at freeze entry.
+        Never overwrite an existing non-empty snapshot with 0 slots."""
         candidate = {}
         for s in self.slots:
             if s.state in ("active", "dormant") and s.embedding is not None:
                 candidate[s.pid] = {
                     "embedding": s.embedding.copy(),
                     "position": s.last_position,
+                    "pitch": s.last_pitch,
                     "last_seen": s.last_seen_frame,
                 }
         if len(candidate) == 0 and len(self._bench_snapshot) > 0:
@@ -344,6 +379,7 @@ class IdentityCore:
                 self._soft_snapshot[s.pid] = {
                     "embedding": s.embedding.copy(),
                     "position": s.last_position,
+                    "pitch": s.last_pitch,
                     "last_seen": s.last_seen_frame,
                 }
         saved = len(self._soft_snapshot)
@@ -360,7 +396,8 @@ class IdentityCore:
         embeddings: Dict[int, np.ndarray],
         positions: Dict[int, Tuple[float, float]],
     ) -> Tuple[Dict[int, str], Dict[int, AssignmentMeta]]:
-        """Scene revival — called once after bench→play. Logs exact failure reason."""
+        """Scene revival — called once after bench→play. Logs exact failure reason.
+        Respects stable-lock protection: won't rebind a pid with stable_count >= threshold."""
         revived: Dict[int, str] = {}
         meta: Dict[int, AssignmentMeta] = {}
 
@@ -371,7 +408,6 @@ class IdentityCore:
         if len(tracks) == 0:
             print(f"[SceneReviveFail] frame={self.frame_id} reason=no_candidate_tracks")
             return {}, {}
-
         embed_missing = sum(1 for tr in tracks if embeddings.get(int(tr.track_id)) is None)
         if embed_missing == len(tracks):
             print(f"[SceneReviveFail] frame={self.frame_id} reason=all_embeddings_missing")
@@ -385,17 +421,22 @@ class IdentityCore:
         for i, tid in enumerate(track_ids):
             t_emb = embeddings.get(tid)
             t_pos = positions.get(tid)
+            t_pitch = self.pitch_positions.get(tid)
             for j, pid in enumerate(snap_pids):
                 s = snap[pid]
-                emb_c = 0.5
-                pos_c = 0.5
+                emb_c, pos_c = 0.5, 0.5
                 if t_emb is not None and s["embedding"] is not None:
                     e = t_emb.astype(np.float32)
                     n = np.linalg.norm(e)
                     if n > 0: e /= n
                     cos = float(np.clip(np.dot(e, s["embedding"]), -1.0, 1.0))
                     emb_c = 1.0 - (cos + 1.0) * 0.5
-                if t_pos is not None and s["position"] is not None:
+                # Prefer pitch coords when available, fall back to raw pixel
+                if t_pitch is not None and s.get("pitch") is not None:
+                    dx = float(t_pitch[0] - s["pitch"][0])
+                    dy = float(t_pitch[1] - s["pitch"][1])
+                    pos_c = min((dx*dx + dy*dy)**0.5 / 0.4, 1.0)
+                elif t_pos is not None and s["position"] is not None:
                     dx = float(t_pos[0] - s["position"][0])
                     dy = float(t_pos[1] - s["position"][1])
                     pos_c = min((dx*dx + dy*dy)**0.5 / 300.0, 1.0)
@@ -405,22 +446,51 @@ class IdentityCore:
         accepted = 0
         min_cost = float(cost[r_idx, c_idx].min()) if len(r_idx) else 999.0
 
-        for r, c in zip(r_idx, c_idx):
+        # Sort by cost ascending so cheapest matches applied first
+        pairs = sorted(zip(r_idx, c_idx), key=lambda rc: cost[rc[0], rc[1]])
+        used_tids: Set[int] = set()
+        used_pids: Set[str] = set()
+
+        for r, c in pairs:
             cst = float(cost[r, c])
-            if cst < 0.60:
-                tid = track_ids[r]
-                pid = snap_pids[c]
-                revived[tid] = pid
-                meta[tid] = AssignmentMeta(pid=pid, source="revived",
-                                           confidence=max(0.0, 1.0 - cst),
-                                           identity_valid=True)
-                self._apply_revival(tid, pid, embeddings, positions, source="scene", cost=cst)
-                accepted += 1
+            if cst >= REVIVAL_COST_THRESHOLD:
+                continue
+            tid = track_ids[r]
+            pid = snap_pids[c]
+            if tid in used_tids or pid in used_pids:
+                continue
+
+            # Margin check: reject ambiguous matches
+            row_costs = cost[r, :]
+            sorted_row = np.sort(row_costs[row_costs < 1e2])
+            if len(sorted_row) >= 2 and (sorted_row[1] - sorted_row[0]) < REVIVAL_MARGIN_MIN:
+                print(f"[SceneReviveReject] tid={tid} pid={pid} cost={cst:.3f} "
+                      f"margin={sorted_row[1]-sorted_row[0]:.3f} reason=ambiguous")
+                continue
+
+            # Stable-lock protection: never rebind a pid whose current lock is stable
+            existing_tid = self.locks.get_tid_for_pid(pid)
+            if existing_tid is not None and existing_tid != tid:
+                existing_lk = self.locks.get_lock(existing_tid)
+                if existing_lk and existing_lk.stable_count >= STABLE_PROTECT_THRESHOLD:
+                    print(f"[SoftReviveReject] pid={pid} old_tid={existing_tid} "
+                          f"new_tid={tid} reason=stable_lock_protected "
+                          f"stable={existing_lk.stable_count}")
+                    continue
+
+            revived[tid] = pid
+            meta[tid] = AssignmentMeta(pid=pid, source="revived",
+                                       confidence=max(0.0, 1.0 - cst),
+                                       identity_valid=True)
+            self._apply_revival(tid, pid, embeddings, positions, source="scene", cost=cst)
+            used_tids.add(tid)
+            used_pids.add(pid)
+            accepted += 1
 
         if accepted == 0:
             print(
                 f"[SceneReviveFail] frame={self.frame_id} reason=costs_too_high "
-                f"n_tracks={n_t} n_snap={n_s} min_cost={min_cost:.3f} threshold=0.60"
+                f"n_tracks={n_t} n_snap={n_s} min_cost={min_cost:.3f} threshold={REVIVAL_COST_THRESHOLD}"
             )
         else:
             print(f"[Identity] Revival: {accepted}/{n_t} tracks matched from scene snapshot")
@@ -435,7 +505,14 @@ class IdentityCore:
         positions: Dict[int, Tuple[float, float]],
         is_first_recovery_frame: bool = False,
     ) -> Tuple[Dict[int, str], Dict[int, AssignmentMeta]]:
-        """Soft revival — enforces strict 1:1, blocks conflicts, no rebind."""
+        """Soft revival with stable-lock protection + margin check.
+
+        Rules:
+          1. Never rebind a pid whose live lock has stable_count >= STABLE_PROTECT_THRESHOLD.
+          2. If the same tid already holds that pid lock → accept (same pair, just refresh).
+          3. Reject ambiguous matches (best vs 2nd-best margin < REVIVAL_MARGIN_MIN).
+          4. Strict 1:1: no tid or pid consumed twice.
+        """
         revived: Dict[int, str] = {}
         meta: Dict[int, AssignmentMeta] = {}
 
@@ -451,17 +528,21 @@ class IdentityCore:
         for i, tid in enumerate(track_ids):
             t_emb = embeddings.get(tid)
             t_pos = positions.get(tid)
+            t_pitch = self.pitch_positions.get(tid)
             for j, pid in enumerate(snap_pids):
                 s = self._soft_snapshot[pid]
-                emb_c = 0.5
-                pos_c = 0.5
+                emb_c, pos_c = 0.5, 0.5
                 if t_emb is not None and s["embedding"] is not None:
                     e = t_emb.astype(np.float32)
                     n = np.linalg.norm(e)
                     if n > 0: e /= n
                     cos = float(np.clip(np.dot(e, s["embedding"]), -1.0, 1.0))
                     emb_c = 1.0 - (cos + 1.0) * 0.5
-                if t_pos is not None and s["position"] is not None:
+                if t_pitch is not None and s.get("pitch") is not None:
+                    dx = float(t_pitch[0] - s["pitch"][0])
+                    dy = float(t_pitch[1] - s["pitch"][1])
+                    pos_c = min((dx*dx + dy*dy)**0.5 / 0.4, 1.0)
+                elif t_pos is not None and s["position"] is not None:
                     dx = float(t_pos[0] - s["position"][0])
                     dy = float(t_pos[1] - s["position"][1])
                     pos_c = min((dx*dx + dy*dy)**0.5 / 300.0, 1.0)
@@ -473,26 +554,56 @@ class IdentityCore:
 
         r_idx, c_idx = linear_sum_assignment(cost)
 
+        # Sort cheapest first so stable pairs claim slots before ambiguous ones
+        pairs = sorted(zip(r_idx, c_idx), key=lambda rc: cost[rc[0], rc[1]])
         used_tids: Set[int] = set()
         used_pids: Set[str] = set()
 
-        for r, c in zip(r_idx, c_idx):
+        for r, c in pairs:
             cst = float(cost[r, c])
-            if cst >= 0.60:
+            if cst >= REVIVAL_COST_THRESHOLD:
                 continue
             tid = track_ids[r]
             pid = snap_pids[c]
 
-            # Strict 1:1 — skip if either already consumed
             if tid in used_tids or pid in used_pids:
                 continue
 
-            # Block if pid already has a live lock to a different tid
+            # Margin check per row: reject if 2nd-best is too close
+            row_costs = cost[r, :]
+            valid_row = row_costs[row_costs < 1e2]
+            if len(valid_row) >= 2:
+                sorted_row = np.sort(valid_row)
+                margin = float(sorted_row[1] - sorted_row[0])
+                if margin < REVIVAL_MARGIN_MIN:
+                    print(f"[SoftReviveReject] tid={tid} pid={pid} cost={cst:.3f} "
+                          f"margin={margin:.3f} reason=ambiguous")
+                    continue
+
+            # Stable-lock protection —
+            #   Case A: same tid already holds this pid → accept (refresh only)
+            #   Case B: different tid holds this pid AND is stable → reject
+            #   Case C: different tid holds this pid AND is NOT stable → allow takeover
+            #   Case D: no live lock on this pid → allow
             existing_tid = self.locks.get_tid_for_pid(pid)
             if existing_tid is not None and existing_tid != tid:
-                self.locks.record_blocked_switch(
-                    self.frame_id, pid, existing_tid, tid, reason="soft_revival_conflict"
-                )
+                existing_lk = self.locks.get_lock(existing_tid)
+                if existing_lk and existing_lk.stable_count >= STABLE_PROTECT_THRESHOLD:
+                    print(f"[SoftReviveReject] pid={pid} old_tid={existing_tid} "
+                          f"new_tid={tid} reason=stable_lock_protected "
+                          f"stable={existing_lk.stable_count}")
+                    self.locks.soft_recovery_rebinds_blocked += 1
+                    continue
+                # Unstable lock → takeover is acceptable, counted as switch
+
+            # Also check: if tid already has a stable lock on a *different* pid, protect it
+            existing_lk_for_tid = self.locks.get_lock(tid)
+            if (existing_lk_for_tid is not None
+                    and existing_lk_for_tid.pid != pid
+                    and existing_lk_for_tid.stable_count >= STABLE_PROTECT_THRESHOLD):
+                print(f"[SoftReviveReject] tid={tid} current_pid={existing_lk_for_tid.pid} "
+                      f"attempted_pid={pid} reason=tid_stable_lock_protected "
+                      f"stable={existing_lk_for_tid.stable_count}")
                 self.locks.soft_recovery_rebinds_blocked += 1
                 continue
 
@@ -508,11 +619,9 @@ class IdentityCore:
 
         if is_first_recovery_frame:
             debug_costs.sort(key=lambda x: x["cost"])
-            for d in debug_costs[:5]:
-                print(
-                    f"[SoftReviveCost] tid={d['tid']} pid={d['pid']} cost={d['cost']:.3f} "
-                    f"emb={d['emb']:.3f} pos={d['pos']:.3f} accepted={d['cost'] < 0.60}"
-                )
+            for d in debug_costs[:8]:
+                print(f"[SoftReviveCost] tid={d['tid']} pid={d['pid']} cost={d['cost']:.3f} "
+                      f"emb={d['emb']:.3f} pos={d['pos']:.3f} accepted={d['cost'] < REVIVAL_COST_THRESHOLD}")
         return revived, meta
 
     def _apply_revival(
@@ -524,13 +633,28 @@ class IdentityCore:
         source: str,
         cost: float,
     ) -> None:
+        """Mark slot active and create a lock. Uses try_create_lock so the
+        stable-lock gate is enforced at the lock layer too."""
         slot = self._slot_by_pid(pid)
         if slot is None:
             return
         self._activate_slot(slot, tid, positions)
         self.assigned_this_frame += 1
-        self.locks.create_lock(tid=tid, pid=pid, source="revived",
-                               frame_id=self.frame_id, confidence=cost)
+
+        # Use try_create_lock with allow_rebind/takeover only if NOT stable-protected
+        existing_tid = self.locks.get_tid_for_pid(pid)
+        allow_over = True
+        if existing_tid is not None and existing_tid != tid:
+            existing_lk = self.locks.get_lock(existing_tid)
+            if existing_lk and existing_lk.stable_count >= STABLE_PROTECT_THRESHOLD:
+                allow_over = False  # caller should have already rejected this — extra safety
+
+        self.locks.try_create_lock(
+            tid=tid, pid=pid, source="revived",
+            frame_id=self.frame_id, confidence=cost,
+            allow_takeover=allow_over,
+            allow_rebind=allow_over,
+        )
         print(f"[RevivalLock] frame={self.frame_id} tid={tid} pid={pid} ttl=90 source={source}")
 
     # ------------------------------------------------------------------
@@ -547,6 +671,15 @@ class IdentityCore:
         slot.last_seen_frame = self.frame_id
         slot.last_position = positions.get(tid, slot.last_position)
         slot.stability_counter += 1
+        # Store pitch position if available
+        t_pitch = self.pitch_positions.get(tid)
+        if t_pitch is not None:
+            slot.last_pitch = t_pitch
+        # Lock in slot team once stable enough
+        if slot.stability_counter >= 5 and self._slot_team.get(slot.pid) is None:
+            t_team = self.team_labels.get(tid)
+            if t_team is not None:
+                self._slot_team[slot.pid] = t_team
 
     def _slot_by_pid(self, pid: str) -> Optional[PlayerSlot]:
         for s in self.slots:
@@ -577,34 +710,97 @@ class IdentityCore:
         slot: PlayerSlot,
         t_emb: Optional[np.ndarray],
         t_pos: Optional[Tuple[float, float]],
+        tid: Optional[int] = None,
     ) -> float:
+        """
+        Composite cost: 4 signals weighted by ReID quality.
+
+        OSNet mode  : 0.55 appearance + 0.20 pitch + 0.15 team + 0.10 recency
+        ResNet50    : 0.45 appearance + 0.25 pitch + 0.15 team + 0.15 recency
+        HSV-fallback: 0.30 appearance + 0.30 pitch + 0.20 team + 0.20 recency
+          (HSV is team-level only, so pitch+team carry more weight)
+
+        Team penalty: 0.0 same team / unknown, 0.5 confirmed cross-team.
+        Pitch cost  : normalised Euclidean on [0,1]x[0,1] pitch grid.
+        Lock continuity discount: 0.15 when slot.stability_counter >= 10.
+        """
+        # Eagerly accept lost/empty slots during recovery boot
         if self._recovery_frames_left > 0 and slot.state == "lost" and slot.embedding is None:
             return 0.30
 
+        # ── Appearance ───────────────────────────────────────────────────
         emb_cost = 0.5
-        pos_cost = 0.5
-
         if t_emb is not None and slot.embedding is not None:
             e = t_emb.astype(np.float32)
             n = np.linalg.norm(e)
-            if n > 0: e /= n
+            if n > 0:
+                e /= n
             cos = float(np.clip(np.dot(e, slot.embedding), -1.0, 1.0))
             emb_cost = 1.0 - (cos + 1.0) * 0.5
 
-        if t_pos is not None and slot.last_position is not None:
+        # ── Pitch-coordinate distance ─────────────────────────────────────
+        pitch_cost = 0.5
+        t_pitch = self.pitch_positions.get(tid) if tid is not None else None
+        if t_pitch is not None and slot.last_pitch is not None:
+            dx = float(t_pitch[0] - slot.last_pitch[0])
+            dy = float(t_pitch[1] - slot.last_pitch[1])
+            # Max meaningful distance on normalised pitch ≈ 1.4 (diagonal)
+            pitch_cost = min((dx*dx + dy*dy)**0.5 / 0.4, 1.0)
+        elif t_pos is not None and slot.last_position is not None:
+            # Raw pixel fallback when pitch transform not available
             dx = float(t_pos[0] - slot.last_position[0])
             dy = float(t_pos[1] - slot.last_position[1])
-            pos_cost = min((dx*dx + dy*dy)**0.5 / 200.0, 1.0)
+            pitch_cost = min((dx*dx + dy*dy)**0.5 / 200.0, 1.0)
 
+        # ── Team consistency ──────────────────────────────────────────────
+        # Cross-team penalty is additive and NOT cancellable by lock discount.
+        # We return early with a guaranteed high cost to block cross-team assignment.
+        if tid is not None:
+            t_team = self.team_labels.get(tid)
+            s_team = self._slot_team.get(slot.pid)
+            if (t_team is not None and s_team is not None and t_team != s_team):
+                # Hard gate: cross-team cost floor at COST_REJECT_THRESHOLD + margin
+                return float(COST_REJECT_THRESHOLD + 0.05)
+
+        # ── Recency / lock continuity ─────────────────────────────────────
         recency = min(max(self.frame_id - slot.last_seen_frame, 0), DORMANT_TTL)
-        recency_penalty = recency / float(DORMANT_TTL) * 0.15
+        recency_cost = recency / float(DORMANT_TTL)
         lock_discount = 0.15 if slot.stability_counter >= 10 else 0.0
 
+        # ── Weights by ReID quality ───────────────────────────────────────
+        mode = self.reid_mode
         if self._recovery_frames_left > 0:
-            final_cost = 0.90 * emb_cost + 0.05 * pos_cost + recency_penalty - lock_discount
-        elif recency == 0:
-            final_cost = 0.50 * emb_cost + 0.35 * pos_cost - 0.10 - lock_discount
+            # Recovery: appearance-dominant regardless of mode
+            final_cost = (0.85 * emb_cost + 0.10 * pitch_cost
+                          + 0.15 * 0.0 + 0.05 * recency_cost
+                          - lock_discount)
+        elif mode == "OSNet":
+            if recency == 0:
+                final_cost = (0.55 * emb_cost + 0.20 * pitch_cost
+                              + 0.15 * 0.0 + 0.05 * recency_cost
+                              - 0.10 - lock_discount)
+            else:
+                final_cost = (0.55 * emb_cost + 0.20 * pitch_cost
+                              + 0.15 * 0.0 + 0.10 * recency_cost
+                              - lock_discount)
+        elif mode == "ResNet50":
+            if recency == 0:
+                final_cost = (0.45 * emb_cost + 0.25 * pitch_cost
+                              + 0.15 * 0.0 + 0.05 * recency_cost
+                              - 0.10 - lock_discount)
+            else:
+                final_cost = (0.45 * emb_cost + 0.25 * pitch_cost
+                              + 0.15 * 0.0 + 0.15 * recency_cost
+                              - lock_discount)
         else:
-            final_cost = 0.65 * emb_cost + 0.25 * pos_cost + recency_penalty - (lock_discount * 0.5)
+            # HSV fallback — appearance is team-level only, weight pitch more
+            if recency == 0:
+                final_cost = (0.30 * emb_cost + 0.30 * pitch_cost
+                              + 0.20 * 0.0 + 0.05 * recency_cost
+                              - 0.10 - lock_discount)
+            else:
+                final_cost = (0.30 * emb_cost + 0.30 * pitch_cost
+                              + 0.20 * 0.0 + 0.20 * recency_cost
+                              - lock_discount)
 
         return float(max(0.0, min(1.0, final_cost)))

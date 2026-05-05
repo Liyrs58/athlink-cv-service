@@ -38,50 +38,103 @@ except (ImportError, ModuleNotFoundError):
 
 
 class ReIDExtractor:
+    """
+    Priority order:
+      1. OSNet (torchreid) — 512-D person-specific ReID, best for same-team
+      2. ResNet50 (torchvision) — 2048-D generic ImageNet, limited same-team
+      3. HSV histogram — 52-D color, team-level only
+
+    OSNet weights: /content/osnet_x1_0_msmt17.pt (upload to Colab)
+    """
+    OSNET_PATH = "/content/osnet_x1_0_msmt17.pt"
+
     def __init__(self, device="cpu"):
         self.device = "cuda" if "cuda" in str(device) else "cpu"
         if torch.backends.mps.is_available():
             self.device = "mps"
-            
+
         self.mode = "HSV-fallback"
         self.model = None
-        
-        if torchvision is not None:
-            try:
-                print("[ReID] loading ResNet50 appearance model...")
-                self.model = resnet50(weights=ResNet50_Weights.DEFAULT)
-                self.model.fc = torch.nn.Identity() 
-                self.model.to(self.device)
-                self.model.eval()
-                self.transform = T.Compose([
-                    T.ToPILImage(),
-                    T.Resize((128, 128)), # Balanced for speed
-                    T.ToTensor(),
-                    T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-                ])
-                self.mode = "ResNet50"
-                print(f"[ReID] {self.mode} fallback is generic, identity confidence limited")
-            except Exception as e:
-                print(f"[ReID] ResNet50 fallback failed: {e}. Using HSV.")
-        else:
-            print("[ReID] torchvision not found. Using HSV fallback only - same-team identity unreliable.")
+        self.transform = None
+        self.feat_dim = 52  # HSV fallback dim
+
+        # Try OSNet first
+        self._try_load_osnet()
+
+        # Fallback: ResNet50
+        if self.model is None and torchvision is not None:
+            self._try_load_resnet50()
+
+        if self.model is None:
+            print("[ReID] torchvision not found. Using HSV fallback only — same-team identity unreliable.")
+
+    def _try_load_osnet(self):
+        if not os.path.exists(self.OSNET_PATH):
+            print(f"[ReID] OSNet weights not found at {self.OSNET_PATH} — skipping")
+            return
+        try:
+            import torchreid
+            self.model = torchreid.models.build_model(
+                name="osnet_x1_0",
+                num_classes=1000,
+                pretrained=False,
+            )
+            state = torch.load(self.OSNET_PATH, map_location="cpu")
+            # torchreid checkpoint may be wrapped
+            state_dict = state.get("state_dict", state)
+            self.model.load_state_dict(state_dict, strict=False)
+            self.model.to(self.device)
+            self.model.eval()
+            self.transform = T.Compose([
+                T.ToPILImage(),
+                T.Resize((256, 128)),
+                T.ToTensor(),
+                T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            ])
+            self.mode = "OSNet"
+            self.feat_dim = 512
+            print(f"[ReID] OSNet loaded from {self.OSNET_PATH} — high-quality person ReID active")
+        except Exception as e:
+            print(f"[ReID] OSNet load failed: {e}")
+            self.model = None
+
+    def _try_load_resnet50(self):
+        try:
+            print("[ReID] loading ResNet50 fallback...")
+            self.model = resnet50(weights=ResNet50_Weights.DEFAULT)
+            self.model.fc = torch.nn.Identity()
+            self.model.to(self.device)
+            self.model.eval()
+            self.transform = T.Compose([
+                T.ToPILImage(),
+                T.Resize((128, 128)),
+                T.ToTensor(),
+                T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            ])
+            self.mode = "ResNet50"
+            self.feat_dim = 2048
+            print("[ReID] ResNet50 fallback loaded — generic, identity confidence limited")
+        except Exception as e:
+            print(f"[ReID] ResNet50 failed: {e}")
+            self.model = None
 
     def extract(self, crops: list) -> list:
+        """Returns list of L2-normalised numpy arrays, one per crop."""
         if self.model is None or not crops:
             return []
-        
         features_list = []
-        # Batching for performance
         batch_size = 16
         for i in range(0, len(crops), batch_size):
-            batch_crops = crops[i:i+batch_size]
+            batch_crops = crops[i:i + batch_size]
             tensors = []
             for c in batch_crops:
-                if c.size == 0:
-                    tensors.append(torch.zeros((3, 128, 128)))
+                if c is None or c.size == 0:
+                    tensors.append(torch.zeros(3, *self.transform.transforms[1].size[::-1]))
                 else:
-                    tensors.append(self.transform(c))
-            
+                    try:
+                        tensors.append(self.transform(c))
+                    except Exception:
+                        tensors.append(torch.zeros(3, 128, 128))
             batch_tensor = torch.stack(tensors).to(self.device)
             with torch.no_grad():
                 feat = self.model(batch_tensor)
@@ -215,32 +268,47 @@ class TrackerCore:
         return self.tracker.update(bboxes, scores, classes, embeds=embeds)
 
     def _extract_embeds(self, frame, tracks):
-        """Architecture Change 3: Extract real ResNet embeddings if available + HSV."""
+        """Extract ReID embeddings. OSNet > ResNet50 > HSV fallback."""
         if not tracks:
             return {}
-            
-        tid_to_crop = {}
+
         h, w = frame.shape[:2]
+        tids = []
+        crops = []
         for tr in tracks:
             x1, y1, x2, y2 = [int(v) for v in tr.bbox]
             crop = frame[max(0, y1):min(h, y2), max(0, x1):min(w, x2)]
-            tid_to_crop[tr.track_id] = crop
+            tids.append(tr.track_id)
+            crops.append(crop)
 
-        tids = list(tid_to_crop.keys())
-        crops = [tid_to_crop[tid] for tid in tids]
-        
-        # Load real embeddings if model exists
-        if self.reid.mode == "ResNet50":
+        if self.reid.mode in ("OSNet", "ResNet50"):
             feats = self.reid.extract(crops)
-            return {tids[i]: feats[i] for i in range(len(tids))}
-        
-        # Fallback to HSV
+            if len(feats) == len(tids):
+                return {tids[i]: feats[i] for i in range(len(tids))}
+
+        # HSV fallback
         embed_map = {}
         for tr in tracks:
             emb = self._extract_torso_hsv(frame, tr.bbox)
             if emb is not None:
                 embed_map[tr.track_id] = emb
         return embed_map
+
+    def _pixel_to_pitch(self, frame_w: int, frame_h: int,
+                        px: float, py: float) -> tuple:
+        """Convert pixel foot-point to normalised pitch coords [0,1]x[0,1].
+        Uses homography if available, otherwise proportional fallback."""
+        H = getattr(self, '_homography', None)
+        if H is not None:
+            pt = np.array([[[px, py]]], dtype=np.float32)
+            mapped = cv2.perspectiveTransform(pt, H)
+            mx, my = float(mapped[0, 0, 0]), float(mapped[0, 0, 1])
+            # Clamp to pitch bounds (105m x 68m)
+            return (np.clip(mx / 105.0, 0.0, 1.0),
+                    np.clip(my / 68.0, 0.0, 1.0))
+        # Proportional fallback
+        return (np.clip(px / frame_w, 0.0, 1.0),
+                np.clip(py / frame_h, 0.0, 1.0))
 
     def _detect_overlay(self, frame):
         """Architecture Change 5: Detect lower-third graphics."""
@@ -403,7 +471,8 @@ class TrackerCore:
                 if self._streak_collapse >= 3 and not self._soft_collapse:
                     saved = self.identity.snapshot_soft(video_frame)
                     self._soft_collapse = True
-                    self.identity.in_soft_collapse = True   # ban Hungarian lock promotion
+                    self.identity.in_soft_collapse = True
+                    self.identity.locks.in_collapse = True   # audit flag
                     self.identity.in_soft_recovery = False
                     self._streak_collapse = 0
                     print(f"[SoftCollapse] Frame {video_frame}: current={current_count} baseline={self._active_baseline:.1f} saved={saved}")
@@ -411,8 +480,9 @@ class TrackerCore:
                 elif self._streak_recover >= 1 and self._soft_collapse:
                     self._soft_collapse = False
                     self.identity.in_soft_collapse = False
+                    self.identity.locks.in_collapse = False
                     self._soft_recovery_frames = 60
-                    self.identity.in_soft_recovery = True   # ban rebind/takeover during recovery
+                    self.identity.in_soft_recovery = True
                     self._streak_recover = 0
                     snap_len = len(self.identity._soft_snapshot) if hasattr(self.identity, '_soft_snapshot') and self.identity._soft_snapshot else 0
                     print(f"[SoftRecovery] Frame {video_frame}: current={current_count} baseline={self._active_baseline:.1f} snapshot_slots={snap_len} revived=candidates → entering recovery mode")
@@ -466,16 +536,28 @@ class TrackerCore:
 
         # Step E: Recovery on first valid play after freeze
         embed_map = self._extract_embeds(frame, assignable_tracks)
-        
+        h_frame, w_frame = frame.shape[:2]
+
         # Build inputs for identity
-        track_objs, positions, embeddings = [], {}, {}
+        track_objs, positions, embeddings, pitch_positions, team_labels = [], {}, {}, {}, {}
         for tr in assignable_tracks:
             tid = tr.track_id
             bx = tr.bbox
-            positions[tid] = ((bx[0]+bx[2])/2, (bx[1]+bx[3])/2)
+            cx = (bx[0] + bx[2]) / 2
+            # Use foot-point (bottom-centre) for pitch projection
+            foot_y = float(bx[3])
+            positions[tid] = (cx, foot_y)
+            pitch_positions[tid] = self._pixel_to_pitch(w_frame, h_frame, cx, foot_y)
             if tid in embed_map:
                 embeddings[tid] = embed_map[tid]
+            # Team label from id_remap history or track attribute
+            team_labels[tid] = getattr(tr, 'team', None)
             track_objs.append(tr)
+
+        # Pass pitch coords and team labels to identity core
+        self.identity.pitch_positions = pitch_positions
+        self.identity.team_labels = team_labels
+        self.identity.reid_mode = self.reid.mode
 
         # Clear scene recovery protection after 60 frames
         if (self.identity.in_scene_recovery

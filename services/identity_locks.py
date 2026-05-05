@@ -47,9 +47,12 @@ class IdentityLockManager:
         self.locks_expired: int = 0           # stale TTL expiry only
         self.id_rebind_count: int = 0         # tid changed its pid
         self.pid_takeover_count: int = 0      # pid stolen from a live tid
-        self.collapse_lock_creations: int = 0 # Hungarian locks during collapse (bad)
+        self.collapse_lock_creations: int = 0 # locks created while collapse flag was set (must be 0)
         self.soft_recovery_rebinds_blocked: int = 0
         self._switch_log: List[Tuple] = []    # (frame, pid, old_tid, new_tid, reason)
+
+        # Mirror of IdentityCore mode — checked at lock-creation to audit collapse
+        self.in_collapse: bool = False
 
     # ------------------------------------------------------------------
     # Query
@@ -151,6 +154,11 @@ class IdentityLockManager:
         self._tid_to_lock[tid] = lk
         self._pid_to_tid[pid] = tid
         self.locks_created += 1
+
+        if self.in_collapse and source == "hungarian":
+            self.collapse_lock_creations += 1
+            print(f"[CollapseWarning] Hungarian lock created during collapse! "
+                  f"frame={frame_id} tid={tid} pid={pid}")
 
         print(
             f"[IDLock] frame={frame_id} tid={tid} pid={pid} "
