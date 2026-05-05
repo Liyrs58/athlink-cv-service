@@ -202,6 +202,7 @@ class TrackerCore:
         self._scene_snapshot_taken = False
         self._needs_scene_reset = False
         self._needs_scene_revival = False
+        self._scene_revival_frames_left = 0   # keep trying scene revival for N frames
         self._scene_reset_at_frame = -1   # guard hard-collapse for 30 frames post-reset
 
         # Scene state tracking
@@ -369,6 +370,7 @@ class TrackerCore:
             self.role_filter.reset()
             self._scene_snapshot_taken = False
             self._needs_scene_revival = True
+            self._scene_revival_frames_left = 90
             self._track_history.clear()
             self._scene_reset_at_frame = video_frame  # guard hard-collapse for 30 frames
 
@@ -584,7 +586,7 @@ class TrackerCore:
         # Clear scene recovery protection after 60 frames
         if (self.identity.in_scene_recovery
                 and self._scene_reset_at_frame >= 0
-                and video_frame - self._scene_reset_at_frame > 60):
+                and video_frame - self._scene_reset_at_frame > 90):
             self.identity.in_scene_recovery = False
 
         # Track-level meta for this frame (pid, source, identity_valid, confidence)
@@ -600,16 +602,28 @@ class TrackerCore:
             should_revive_soft = (self._soft_recovery_frames > 0)
 
             if should_revive_scene:
-                revived, scene_meta = self.identity.revive_cost_matrix(
-                    track_objs, embeddings, positions
-                )
-                self.id_remap.update({tid: int(pid[1:]) for tid, pid in revived.items()})
-                meta_by_tid.update(scene_meta)
-                revived_tids.update(revived.keys())
-                self._needs_scene_revival = False
-                # Keep scene_recovery protection for 60 frames even if revival matched 0
-                # (cleared by in_soft_recovery drain in the soft path above)
-                print(f"[Recovery] Frame {video_frame}: {len(revived)} revived from scene snapshot")
+                self._scene_revival_frames_left -= 1
+                if self._scene_revival_frames_left <= 0:
+                    self._needs_scene_revival = False
+                    print(f"[SceneRevivalExpired] frame={video_frame} giving up after 90 frames")
+                # Only attempt revival for tracks not yet locked
+                unlocked_for_revival = [
+                    t for t in track_objs
+                    if not self.identity.locks.is_tid_locked(int(t.track_id))
+                ]
+                if unlocked_for_revival:
+                    revived, scene_meta = self.identity.revive_cost_matrix(
+                        unlocked_for_revival, embeddings, positions
+                    )
+                    self.id_remap.update({tid: int(pid[1:]) for tid, pid in revived.items()})
+                    meta_by_tid.update(scene_meta)
+                    revived_tids.update(revived.keys())
+                    if revived:
+                        print(f"[SceneRevival] frame={video_frame} revived={len(revived)} remaining_window={self._scene_revival_frames_left}")
+                else:
+                    # All tracks are locked — revival complete
+                    self._needs_scene_revival = False
+                    print(f"[SceneRevivalDone] frame={video_frame} all tracks locked")
 
             if should_revive_soft:
                 is_first_frame = (self._soft_recovery_frames == 60)
@@ -643,9 +657,15 @@ class TrackerCore:
             # so we pass ALL tracks (revived ones are already locked).
             normal_track_objs = [t for t in track_objs if t.track_id not in revived_tids]
 
+            in_any_recovery = (
+                self._soft_recovery_frames > 0
+                or self.identity.in_scene_recovery
+                or self._soft_collapse
+            )
             tid_to_pid, normal_meta = self.identity.assign_tracks(
                 normal_track_objs, embeddings, positions,
                 memory_ok_tids=memory_ok_tids,
+                allow_new_assignments=not in_any_recovery,
             )
             meta_by_tid.update(normal_meta)
             self.identity.end_frame(video_frame)
@@ -782,9 +802,12 @@ def run_tracking(video_path, job_id, frame_stride=1, max_frames=None, device="cp
     tracker.save(job_id)
 
     # Final identity-lock summary (the real success metric)
-    summary = tracker.identity.locks.summary()
+    id_summary = tracker.identity.end_run_summary()
+    summary = id_summary  # end_run_summary merges lock summary
     valid = sum(1 for f in tracker.results for p in f.get("players", []) if p.get("identity_valid"))
     invalid = sum(1 for f in tracker.results for p in f.get("players", []) if not p.get("identity_valid"))
+    total_boxes = valid + invalid
+    valid_id_coverage = round(valid / max(total_boxes, 1), 3)
     print("=" * 60)
     print("[Identity Summary]")
     print(f"  identity_switches            = {summary['identity_switches']}")
@@ -792,14 +815,16 @@ def run_tracking(video_path, job_id, frame_stride=1, max_frames=None, device="cp
     print(f"  pid_takeover_count           = {summary['pid_takeover_count']}")
     print(f"  switches_blocked             = {summary['switches_blocked']}")
     print(f"  soft_recovery_rebinds_blocked= {summary['soft_recovery_rebinds_blocked']}")
-    print(f"  collapse_lock_creations      = {summary['collapse_lock_creations']}")
+    print(f"  collapse_lock_attempts       = {summary['collapse_lock_attempts']}  (blocked, not written)")
+    print(f"  collapse_lock_creations      = {summary['collapse_lock_creations']}  (must be 0)")
     print(f"  locks_created                = {summary['locks_created']}")
     print(f"  locks_expired                = {summary['locks_expired']}")
     print(f"  locks_live_at_end            = {summary['locks_live']}")
     print(f"  lock_retention_rate          = {summary['lock_retention_rate']}")
     print(f"  excessive_lock_churn         = {summary['excessive_lock_churn']}")
     print(f"  valid_identity_frames        = {valid}")
-    print(f"  uncertain_player_boxes       = {invalid}")
+    print(f"  unknown_boxes                = {invalid}")
+    print(f"  valid_id_coverage            = {valid_id_coverage}")
     if summary['excessive_lock_churn']:
         print(f"[IdentityWarning] excessive lock churn: {summary['locks_created']} locks created (target ≤40)")
     print("=" * 60)

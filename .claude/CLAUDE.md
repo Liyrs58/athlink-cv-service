@@ -94,6 +94,38 @@ Key points:
 - Wider pitch polygon margins (3m → 5m)
 - Stricter ReID stitching (0.40 → 0.30 threshold, team-gated)
 
+**Identity Validity Gate (latest):**
+
+Core invariant: P-IDs only emitted for LOCKED or REVIVED states. PROVISIONAL is internal only.
+
+Key changes made to enforce this:
+
+1. **`identity_locks.py`** — Hard block on Hungarian lock creation during collapse.
+   `try_create_lock` returns `(None, "blocked_collapse")` immediately when `in_collapse=True` and `source="hungarian"`. Previously only printed a warning and continued. `collapse_lock_creations` still counts for audit.
+
+2. **`tracker_core.py`** — `allow_new_assignments=False` passed to `assign_tracks` whenever `_soft_recovery_frames > 0 OR in_scene_recovery OR _soft_collapse`. This gates the entire Hungarian path during recovery windows; only locked pairs pass through, all others become UNKNOWN.
+
+3. **`identity_core.py`** — Boot eager-accept path (`_slot_cost` returning 0.30 for empty lost slots) disabled during any recovery/collapse flag. Previously this fired whenever `_recovery_frames_left > 0` regardless of mode, feeding cheap PROVISIONAL assignments through.
+
+4. **`tracker_core.py`** — Calls `identity.end_run_summary()` at end of run (which prints acceptance criteria). Added `unknown_boxes` and `valid_id_coverage` metrics.
+
+**Acceptance criteria (run-level):**
+- `collapse_lock_creations = 0`
+- `recovery_normal_assignments = 0` during recovery windows
+- `locks_created <= 40`
+- `lock_retention_rate >= 0.65`
+- `unknown_boxes` may increase — expected and acceptable
+- `identity_switches=0` alone is NOT a success signal
+
+**Expected log lines after fix:**
+```
+[RecoveryAssign] F240 locked=9 revived=3 normal=0 blocked=6
+[CollapseBlock] Hungarian lock BLOCKED during collapse frame=... tid=... pid=...
+[IdentityMetrics]
+  collapse_lock_creations      = 0  OK
+  recovery_normal_assignments  = 0  OK
+```
+
 **Expected Outcomes:**
 - Unique IDs: 26 → ≤18 (for 14 visible players)
 - ID switches: < 5 per 10-second clip

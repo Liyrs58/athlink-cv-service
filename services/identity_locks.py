@@ -47,7 +47,8 @@ class IdentityLockManager:
         self.locks_expired: int = 0           # stale TTL expiry only
         self.id_rebind_count: int = 0         # tid changed its pid
         self.pid_takeover_count: int = 0      # pid stolen from a live tid
-        self.collapse_lock_creations: int = 0 # locks created while collapse flag was set (must be 0)
+        self.collapse_lock_attempts: int = 0  # hungarian attempts while collapse (blocked before write)
+        self.collapse_lock_creations: int = 0  # locks actually written during collapse (must be 0)
         self.soft_recovery_rebinds_blocked: int = 0
         self._switch_log: List[Tuple] = []    # (frame, pid, old_tid, new_tid, reason)
 
@@ -142,6 +143,12 @@ class IdentityLockManager:
             self.refresh_lock(tid, frame_id, confidence)
             return self._tid_to_lock[tid], "refreshed"
 
+        # Hard block: collapse + hungarian — count attempt but write nothing
+        if self.in_collapse and source == "hungarian":
+            self.collapse_lock_attempts += 1
+            print(f"[CollapseBlock] frame={frame_id} tid={tid} pid={pid} BLOCKED (not written)")
+            return None, "blocked_collapse"
+
         # Create fresh
         eff_ttl = ttl if ttl is not None else (
             LOCK_REVIVED_TTL if source == "revived" else LOCK_DEFAULT_TTL
@@ -154,11 +161,6 @@ class IdentityLockManager:
         self._tid_to_lock[tid] = lk
         self._pid_to_tid[pid] = tid
         self.locks_created += 1
-
-        if self.in_collapse and source == "hungarian":
-            self.collapse_lock_creations += 1
-            print(f"[CollapseWarning] Hungarian lock created during collapse! "
-                  f"frame={frame_id} tid={tid} pid={pid}")
 
         print(
             f"[IDLock] frame={frame_id} tid={tid} pid={pid} "
@@ -278,6 +280,7 @@ class IdentityLockManager:
             "pid_takeover_count": self.pid_takeover_count,
             "switches_blocked": self.id_switches_blocked,
             "soft_recovery_rebinds_blocked": self.soft_recovery_rebinds_blocked,
+            "collapse_lock_attempts": self.collapse_lock_attempts,
             "collapse_lock_creations": self.collapse_lock_creations,
             "locks_created": self.locks_created,
             "locks_expired": self.locks_expired,
