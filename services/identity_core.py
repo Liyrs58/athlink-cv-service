@@ -29,11 +29,18 @@ from typing import Dict, List, Optional, Sequence, Set, Tuple
 import numpy as np
 from scipy.optimize import linear_sum_assignment
 
-from services.identity_locks import (
-    IdentityLockManager,
-    MEMORY_UPDATE_MIN_STABLE,
-)
-from services.pitch_geometry import assignment_position_cost
+try:
+    from services.identity_locks import (
+        IdentityLockManager,
+        MEMORY_UPDATE_MIN_STABLE,
+    )
+    from services.pitch_geometry import assignment_position_cost
+except ModuleNotFoundError:
+    from identity_locks import (  # type: ignore[no-redef]
+        IdentityLockManager,
+        MEMORY_UPDATE_MIN_STABLE,
+    )
+    from pitch_geometry import assignment_position_cost  # type: ignore[no-redef]
 
 
 DORMANT_TTL = 180
