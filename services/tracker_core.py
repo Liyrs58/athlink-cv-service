@@ -74,15 +74,37 @@ class ReIDExtractor:
             return
         try:
             import torchreid
+
+            # Load raw checkpoint and unwrap if needed
+            ckpt = torch.load(self.OSNET_PATH, map_location="cpu")
+            state_dict = ckpt.get("state_dict", ckpt) if isinstance(ckpt, dict) else ckpt
+
+            # Strip "module." prefix (DataParallel checkpoints)
+            state_dict = {k.replace("module.", ""): v for k, v in state_dict.items()}
+
+            # Detect actual num_classes from checkpoint classifier head
+            num_classes = 1000
+            if "classifier.weight" in state_dict:
+                num_classes = state_dict["classifier.weight"].shape[0]
+            elif "classifier.0.weight" in state_dict:
+                num_classes = state_dict["classifier.0.weight"].shape[0]
+            print(f"[ReID] OSNet checkpoint num_classes={num_classes} (classifier head will be ignored for inference)")
+
+            # Build model with matching num_classes so there's no shape error,
+            # then we swap the head with Identity to extract backbone features only.
             self.model = torchreid.models.build_model(
                 name="osnet_x1_0",
-                num_classes=1000,
+                num_classes=num_classes,
                 pretrained=False,
             )
-            state = torch.load(self.OSNET_PATH, map_location="cpu")
-            # torchreid checkpoint may be wrapped
-            state_dict = state.get("state_dict", state)
-            self.model.load_state_dict(state_dict, strict=False)
+            missing, unexpected = self.model.load_state_dict(state_dict, strict=False)
+            if missing:
+                print(f"[ReID] OSNet missing keys (non-classifier): {missing[:3]}")
+
+            # Replace classifier with Identity so forward() returns 512-D features
+            if hasattr(self.model, "classifier"):
+                self.model.classifier = torch.nn.Identity()
+
             self.model.to(self.device)
             self.model.eval()
             self.transform = T.Compose([
@@ -93,7 +115,7 @@ class ReIDExtractor:
             ])
             self.mode = "OSNet"
             self.feat_dim = 512
-            print(f"[ReID] OSNet loaded from {self.OSNET_PATH} — high-quality person ReID active")
+            print(f"[ReID] OSNet loaded — classifier head replaced with Identity, backbone active")
         except Exception as e:
             print(f"[ReID] OSNet load failed: {e}")
             self.model = None
