@@ -36,6 +36,10 @@ try:
     )
     from services.pitch_geometry import assignment_position_cost
 except ModuleNotFoundError:
+    import os as _os, sys as _sys
+    _services_dir = _os.path.join(_os.path.dirname(__file__))
+    if _services_dir not in _sys.path:
+        _sys.path.insert(0, _services_dir)
     from identity_locks import (  # type: ignore[no-redef]
         IdentityLockManager,
         MEMORY_UPDATE_MIN_STABLE,
