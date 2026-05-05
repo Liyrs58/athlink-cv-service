@@ -146,6 +146,10 @@ class IdentityCore:
     # Single source of truth for restricted identity mode
     # ------------------------------------------------------------------
 
+    def _recovery_lock_protected(self, lock) -> bool:
+        """True when restricted and the existing lock was freshly revived — must not be stolen."""
+        return self._identity_restricted and lock is not None and lock.source == "revived"
+
     @property
     def _identity_restricted(self) -> bool:
         """
@@ -554,6 +558,11 @@ class IdentityCore:
             existing_tid = self.locks.get_tid_for_pid(pid)
             if existing_tid is not None and existing_tid != tid:
                 existing_lk = self.locks.get_lock(existing_tid)
+                if self._recovery_lock_protected(existing_lk):
+                    print(f"[SceneReviveReject] pid={pid} old_tid={existing_tid} "
+                          f"new_tid={tid} reason=recovery_lock_protected")
+                    self.ambiguous_rejects += 1
+                    continue
                 if existing_lk and existing_lk.stable_count >= STABLE_PROTECT_THRESHOLD:
                     print(f"[SceneReviveReject] pid={pid} old_tid={existing_tid} "
                           f"new_tid={tid} reason=stable_lock_protected")
@@ -659,6 +668,12 @@ class IdentityCore:
             existing_tid = self.locks.get_tid_for_pid(pid)
             if existing_tid is not None and existing_tid != tid:
                 existing_lk = self.locks.get_lock(existing_tid)
+                if self._recovery_lock_protected(existing_lk):
+                    print(f"[SoftReviveReject] pid={pid} old_tid={existing_tid} "
+                          f"new_tid={tid} reason=recovery_lock_protected")
+                    self.locks.soft_recovery_rebinds_blocked += 1
+                    self.ambiguous_rejects += 1
+                    continue
                 if existing_lk and existing_lk.stable_count >= STABLE_PROTECT_THRESHOLD:
                     print(f"[SoftReviveReject] pid={pid} old_tid={existing_tid} "
                           f"new_tid={tid} reason=stable_lock_protected stable={existing_lk.stable_count}")
@@ -718,13 +733,17 @@ class IdentityCore:
             if existing_lk and existing_lk.stable_count >= STABLE_PROTECT_THRESHOLD:
                 allow_over = False
 
-        self.locks.try_create_lock(
+        lk_result, lk_status = self.locks.try_create_lock(
             tid=tid, pid=pid, source="revived",
             frame_id=self.frame_id, confidence=cost,
             allow_takeover=allow_over,
             allow_rebind=allow_over,
         )
-        print(f"[RevivalLock] frame={self.frame_id} tid={tid} pid={pid} ttl=90 source={source}")
+        if lk_result is not None:
+            print(f"[RevivalLock] frame={self.frame_id} tid={tid} pid={pid} ttl=90 source={source}")
+        else:
+            print(f"[RevivalLockBlocked] frame={self.frame_id} tid={tid} pid={pid} "
+                  f"source={source} status={lk_status}")
 
     # ------------------------------------------------------------------
     # Helpers

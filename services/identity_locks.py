@@ -144,6 +144,15 @@ class IdentityLockManager:
                     f"dormant_tid={existing_tid_for_pid} new_tid={tid} BLOCKED (restricted)"
                 )
                 return None, "blocked_dormant"
+            if existing_lk and existing_lk.source == "revived" and restricted:
+                # Freshly revived lock cannot be stolen while identity is restricted
+                self.restricted_lock_attempts += 1
+                self.id_switches_blocked += 1
+                print(
+                    f"[RecoveryTakeoverBlock] frame={frame_id} pid={pid} "
+                    f"revived_tid={existing_tid_for_pid} new_tid={tid} BLOCKED (restricted)"
+                )
+                return None, "blocked_recovery_takeover"
             if not allow_takeover:
                 return None, "blocked_takeover"
             self._record_switch_internal(
