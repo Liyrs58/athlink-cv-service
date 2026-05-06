@@ -129,10 +129,17 @@ while True:
             x1, y1, x2, y2 = map(int, bbox)
             identity_valid = bool(p.get('identity_valid', False))
             source = p.get('assignment_source', 'unassigned')
-            raw_tid = p.get('rawTrackId', p.get('trackId', '?'))
+            assignment_pending = bool(p.get('assignment_pending', False))
             display_id = p.get('displayId')
-            if not display_id:
-                display_id = f"P{p.get('trackId', '?')}" if identity_valid else f"U T{raw_tid}"
+            if isinstance(display_id, str) and display_id.startswith('U T'):
+                display_id = None
+            if not identity_valid:
+                if isinstance(display_id, int) or (isinstance(display_id, str) and display_id.isdigit()):
+                    display_id = None
+            if not display_id and identity_valid:
+                display_id = f"P{p.get('trackId', '?')}"
+            elif not display_id and assignment_pending:
+                display_id = "?"
             state = p.get('gameState', 'play')
 
             # Color by identity state, not raw tracker state.
@@ -144,7 +151,8 @@ while True:
                 color = (0, 255, 0)  # Green
 
             cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-            cv2.putText(frame, display_id, (x1, max(y1-5, 0)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+            if display_id:
+                cv2.putText(frame, display_id, (x1, max(y1-5, 0)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
 
     out.write(frame)
     frame_idx += 1

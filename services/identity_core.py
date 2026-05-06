@@ -51,7 +51,13 @@ DORMANT_TTL = 180
 MAX_SLOTS = 22
 COST_REJECT_THRESHOLD = 0.72
 REVIVAL_COST_THRESHOLD = 0.60
-REVIVAL_MARGIN_MIN = 0.05
+SOFT_REVIVE_COST_MAX = 0.20
+SOFT_REVIVE_AUTO_ACCEPT_COST = 0.10
+SOFT_REVIVE_MARGIN_MIN = 0.015
+SCENE_REVIVE_WINDOW = 90
+SCENE_REVIVE_COST_MAX = 0.25
+SCENE_REVIVE_MARGIN_MIN = 0.010
+SCENE_REVIVE_FORCE_COST_MAX = 0.50
 LOW_CONFIDENCE_THRESHOLD = 0.55
 EMB_ALPHA = 0.25
 STABLE_PROTECT_THRESHOLD = 10
@@ -174,6 +180,30 @@ class IdentityCore:
         if self._recovery_frames_left > 0:
             reasons.append(f"recovery_frames_left={self._recovery_frames_left}")
         return ",".join(reasons) if reasons else "none"
+
+    def get_scene_revive_thresholds(self, max_window: int = SCENE_REVIVE_WINDOW) -> Tuple[float, float]:
+        """Progressively relax scene revival as the post-reset window approaches expiry."""
+        if self._scene_reset_frame < 0:
+            progress = 0.0
+        else:
+            progress = max(0.0, min(1.0, (self.frame_id - self._scene_reset_frame) / float(max_window)))
+
+        if progress < 0.33:
+            return 0.18, 0.020
+        if progress < 0.66:
+            return 0.22, 0.012
+        return 0.30, 0.005
+
+    @staticmethod
+    def _revive_margin_ok(cost: float, margin: Optional[float], cost_max: float,
+                          margin_min: float, auto_accept_cost: float = SOFT_REVIVE_AUTO_ACCEPT_COST) -> Tuple[bool, str]:
+        if cost > cost_max:
+            return False, "cost_too_high"
+        if cost < auto_accept_cost:
+            return True, "excellent"
+        if margin is not None and margin < margin_min:
+            return False, "ambiguous"
+        return True, "margin_ok"
 
     # ------------------------------------------------------------------
     # Scene reset
@@ -496,40 +526,20 @@ class IdentityCore:
             print(f"[SceneReviveFail] frame={self.frame_id} reason=all_embeddings_missing")
             return {}, {}
 
-        track_ids = [int(t.track_id) for t in tracks]
-        snap_pids = list(snap.keys())
+        cost, track_ids, snap_pids = self._snapshot_cost_matrix(
+            snap, tracks, embeddings, positions,
+            emb_weight=0.75, pos_weight=0.25,
+        )
         n_t, n_s = len(track_ids), len(snap_pids)
-        cost = np.full((n_t, n_s), 1e3, dtype=np.float32)
-
-        for i, tid in enumerate(track_ids):
-            t_emb = embeddings.get(tid)
-            t_pitch = self.pitch_positions.get(tid)
-            t_pos = positions.get(tid)
-            t_team = self.team_labels.get(tid)
-            for j, pid in enumerate(snap_pids):
-                s = snap[pid]
-                if (t_team is not None and s.get("team_id") is not None
-                        and t_team != s["team_id"]):
-                    cost[i, j] = 1e3
-                    continue
-                emb_c, pos_c = 0.5, 0.5
-                if t_emb is not None and s["embedding"] is not None:
-                    e = t_emb.astype(np.float32)
-                    n = np.linalg.norm(e)
-                    if n > 0: e /= n
-                    cos = float(np.clip(np.dot(e, s["embedding"]), -1.0, 1.0))
-                    emb_c = 1.0 - (cos + 1.0) * 0.5
-                if t_pitch is not None and s.get("pitch") is not None:
-                    pos_c = assignment_position_cost(s["pitch"], t_pitch)
-                elif t_pos is not None and s["position"] is not None:
-                    dx = float(t_pos[0] - s["position"][0])
-                    dy = float(t_pos[1] - s["position"][1])
-                    pos_c = min((dx * dx + dy * dy) ** 0.5 / 300.0, 1.0)
-                cost[i, j] = 0.75 * emb_c + 0.25 * pos_c
+        cost_max, margin_min = self.get_scene_revive_thresholds()
 
         r_idx, c_idx = linear_sum_assignment(cost)
         accepted = 0
         min_cost = float(cost[r_idx, c_idx].min()) if len(r_idx) else 999.0
+        reject_reasons: Dict[str, int] = {}
+
+        def note_reject(reason: str) -> None:
+            reject_reasons[reason] = reject_reasons.get(reason, 0) + 1
 
         pairs = sorted(zip(r_idx, c_idx), key=lambda rc: cost[rc[0], rc[1]])
         used_tids: Set[int] = set()
@@ -538,6 +548,7 @@ class IdentityCore:
         for r, c in pairs:
             cst = float(cost[r, c])
             if cst >= REVIVAL_COST_THRESHOLD:
+                note_reject("costs_too_high")
                 continue
             tid = track_ids[r]
             pid = snap_pids[c]
@@ -546,14 +557,19 @@ class IdentityCore:
 
             row_costs = cost[r, :]
             valid_row = row_costs[row_costs < 1e2]
+            margin = None
             if len(valid_row) >= 2:
                 sorted_row = np.sort(valid_row)
                 margin = float(sorted_row[1] - sorted_row[0])
-                if margin < REVIVAL_MARGIN_MIN:
-                    print(f"[SceneReviveReject] tid={tid} pid={pid} cost={cst:.3f} "
-                          f"margin={margin:.3f} reason=ambiguous")
+            ok, reason = self._revive_margin_ok(cst, margin, cost_max, margin_min)
+            if not ok:
+                note_reject(reason)
+                if reason == "ambiguous":
                     self.ambiguous_rejects += 1
-                    continue
+                margin_s = f"{margin:.3f}" if margin is not None else "n/a"
+                print(f"[SceneReviveReject] tid={tid} pid={pid} cost={cst:.3f} "
+                      f"margin={margin_s} reason={reason} cost_max={cost_max:.3f}")
+                continue
 
             existing_tid = self.locks.get_tid_for_pid(pid)
             if existing_tid is not None and existing_tid != tid:
@@ -561,11 +577,13 @@ class IdentityCore:
                 if self._recovery_lock_protected(existing_lk):
                     print(f"[SceneReviveReject] pid={pid} old_tid={existing_tid} "
                           f"new_tid={tid} reason=recovery_lock_protected")
+                    note_reject("recovery_lock_protected")
                     self.ambiguous_rejects += 1
                     continue
                 if existing_lk and existing_lk.stable_count >= STABLE_PROTECT_THRESHOLD:
                     print(f"[SceneReviveReject] pid={pid} old_tid={existing_tid} "
                           f"new_tid={tid} reason=stable_lock_protected")
+                    note_reject("stable_lock_protected")
                     continue
 
             revived[tid] = pid
@@ -582,12 +600,69 @@ class IdentityCore:
             self.revived_count += 1
 
         if accepted == 0:
-            print(f"[SceneReviveFail] frame={self.frame_id} reason=costs_too_high "
+            fail_reason = "costs_too_high"
+            if reject_reasons:
+                fail_reason = max(reject_reasons.items(), key=lambda kv: kv[1])[0]
+            print(f"[SceneReviveFail] frame={self.frame_id} reason={fail_reason} "
                   f"n_tracks={n_t} n_snap={n_s} min_cost={min_cost:.3f}")
         else:
             print(f"[Identity] Revival: {accepted}/{n_t} from scene snapshot")
 
         # Do NOT clear bench_snapshot here — tracker_core keeps retrying for 90 frames
+        return revived, meta
+
+    def force_commit_remaining_scene_slots(
+        self,
+        tracks: Sequence[object],
+        embeddings: Dict[int, np.ndarray],
+        positions: Dict[int, Tuple[float, float]],
+    ) -> Tuple[Dict[int, str], Dict[int, AssignmentMeta]]:
+        """Last-resort scene recovery before the 90-frame window exits."""
+        revived: Dict[int, str] = {}
+        meta: Dict[int, AssignmentMeta] = {}
+        remaining_snap = {
+            pid: snap
+            for pid, snap in self._bench_snapshot.items()
+            if not self.locks.is_pid_locked(pid)
+            and (self._slot_by_pid(pid) is None or not self._slot_by_pid(pid).seen_this_frame)
+        }
+        if not remaining_snap or len(tracks) == 0:
+            print(f"[ForceCommit] frame={self.frame_id} skipped remaining={len(remaining_snap)} tracks={len(tracks)}")
+            return revived, meta
+
+        cost, track_ids, snap_pids = self._snapshot_cost_matrix(
+            remaining_snap, tracks, embeddings, positions,
+            emb_weight=0.75, pos_weight=0.25,
+        )
+        r_idx, c_idx = linear_sum_assignment(cost)
+        used_tids: Set[int] = set()
+        used_pids: Set[str] = set()
+
+        for r, c in sorted(zip(r_idx, c_idx), key=lambda rc: cost[rc[0], rc[1]]):
+            cst = float(cost[r, c])
+            if cst > SCENE_REVIVE_FORCE_COST_MAX:
+                continue
+            tid = track_ids[r]
+            pid = snap_pids[c]
+            if tid in used_tids or pid in used_pids:
+                continue
+            existing_lk = self.locks.get_lock(tid)
+            if existing_lk is not None and existing_lk.pid != pid:
+                continue
+
+            revived[tid] = pid
+            meta[tid] = AssignmentMeta(
+                pid=pid, source="revived",
+                identity_state=IdentityState.REVIVED,
+                confidence=max(0.0, 1.0 - cst),
+                identity_valid=True,
+            )
+            self._apply_revival(tid, pid, positions, source="force_scene", cost=cst)
+            used_tids.add(tid)
+            used_pids.add(pid)
+            self.revived_count += 1
+            print(f"[ForceCommit] frame={self.frame_id} pid={pid} tid={tid} cost={cst:.3f}")
+
         return revived, meta
 
     def revive_from_soft_snapshot(
@@ -657,13 +732,19 @@ class IdentityCore:
 
             row_costs = cost[r, :]
             valid_row = row_costs[row_costs < 1e2]
+            margin = None
             if len(valid_row) >= 2:
                 margin = float(np.sort(valid_row)[1] - np.sort(valid_row)[0])
-                if margin < REVIVAL_MARGIN_MIN:
-                    print(f"[SoftReviveReject] tid={tid} pid={pid} cost={cst:.3f} "
-                          f"margin={margin:.3f} reason=ambiguous")
+            ok, reason = self._revive_margin_ok(
+                cst, margin, SOFT_REVIVE_COST_MAX, SOFT_REVIVE_MARGIN_MIN
+            )
+            if not ok:
+                if reason == "ambiguous":
                     self.ambiguous_rejects += 1
-                    continue
+                margin_s = f"{margin:.3f}" if margin is not None else "n/a"
+                print(f"[SoftReviveReject] tid={tid} pid={pid} cost={cst:.3f} "
+                      f"margin={margin_s} reason={reason}")
+                continue
 
             existing_tid = self.locks.get_tid_for_pid(pid)
             if existing_tid is not None and existing_tid != tid:
@@ -706,11 +787,51 @@ class IdentityCore:
         if is_first_recovery_frame:
             debug_costs.sort(key=lambda x: x["cost"])
             for d in debug_costs[:8]:
-                accepted = d["cost"] < REVIVAL_COST_THRESHOLD
+                accepted = d["cost"] <= SOFT_REVIVE_COST_MAX
                 print(f"[SoftReviveCost] tid={d['tid']} pid={d['pid']} "
                       f"cost={d['cost']:.3f} emb={d['emb']:.3f} pos={d['pos']:.3f} "
                       f"accepted={accepted}")
         return revived, meta
+
+    def _snapshot_cost_matrix(
+        self,
+        snap: Dict[str, dict],
+        tracks: Sequence[object],
+        embeddings: Dict[int, np.ndarray],
+        positions: Dict[int, Tuple[float, float]],
+        emb_weight: float,
+        pos_weight: float,
+    ) -> Tuple[np.ndarray, List[int], List[str]]:
+        track_ids = [int(t.track_id) for t in tracks]
+        snap_pids = list(snap.keys())
+        cost = np.full((len(track_ids), len(snap_pids)), 1e3, dtype=np.float32)
+
+        for i, tid in enumerate(track_ids):
+            t_emb = embeddings.get(tid)
+            t_pitch = self.pitch_positions.get(tid)
+            t_pos = positions.get(tid)
+            t_team = self.team_labels.get(tid)
+            for j, pid in enumerate(snap_pids):
+                s = snap[pid]
+                if (t_team is not None and s.get("team_id") is not None
+                        and t_team != s["team_id"]):
+                    continue
+                emb_c, pos_c = 0.5, 0.5
+                if t_emb is not None and s["embedding"] is not None:
+                    e = t_emb.astype(np.float32)
+                    n = np.linalg.norm(e)
+                    if n > 0:
+                        e /= n
+                    cos = float(np.clip(np.dot(e, s["embedding"]), -1.0, 1.0))
+                    emb_c = 1.0 - (cos + 1.0) * 0.5
+                if t_pitch is not None and s.get("pitch") is not None:
+                    pos_c = assignment_position_cost(s["pitch"], t_pitch)
+                elif t_pos is not None and s["position"] is not None:
+                    dx = float(t_pos[0] - s["position"][0])
+                    dy = float(t_pos[1] - s["position"][1])
+                    pos_c = min((dx * dx + dy * dy) ** 0.5 / 300.0, 1.0)
+                cost[i, j] = emb_weight * emb_c + pos_weight * pos_c
+        return cost, track_ids, snap_pids
 
     def _apply_revival(
         self,

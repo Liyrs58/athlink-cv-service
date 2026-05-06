@@ -296,25 +296,29 @@ def _draw_players(frame, players, include_minimap: bool, frame_w: int, frame_h: 
             cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
 
         display_id = p.get("displayId")
-        if not display_id:
-            if p.get("identity_valid", False):
-                display_id = p.get("playerId") or f"P{track_id}"
-            elif "rawTrackId" in p:
-                display_id = f"U T{p['rawTrackId']}"
-            else:
-                display_id = f"T{track_id}"
-        label = str(display_id)
+        identity_valid = p.get("identity_valid", False)
+        if isinstance(display_id, str) and display_id.startswith("U T"):
+            display_id = None
+        if not identity_valid:
+            if isinstance(display_id, int) or (isinstance(display_id, str) and display_id.isdigit()):
+                display_id = None
+        if not display_id and identity_valid:
+            display_id = p.get("playerId") or f"P{track_id}"
+        elif not display_id and p.get("assignment_pending", False):
+            display_id = "?"
+        label = str(display_id) if display_id else None
         font_scale = 0.45
         thickness  = 1
-        (lw, lh), baseline = cv2.getTextSize(label, FONT, font_scale, thickness)
-        label_x = x1
-        label_y = max(y1 - 4, lh + 2)
-        cv2.rectangle(frame,
-                      (label_x, label_y - lh - baseline),
-                      (label_x + lw + 2, label_y + baseline),
-                      color, -1)
-        cv2.putText(frame, label, (label_x + 1, label_y),
-                    FONT, font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
+        if label:
+            (lw, lh), baseline = cv2.getTextSize(label, FONT, font_scale, thickness)
+            label_x = x1
+            label_y = max(y1 - 4, lh + 2)
+            cv2.rectangle(frame,
+                          (label_x, label_y - lh - baseline),
+                          (label_x + lw + 2, label_y + baseline),
+                          color, -1)
+            cv2.putText(frame, label, (label_x + 1, label_y),
+                        FONT, font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
 
     if include_minimap:
         frame = _draw_minimap(frame, players, frame_w, frame_h)

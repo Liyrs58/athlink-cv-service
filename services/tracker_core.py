@@ -603,9 +603,7 @@ class TrackerCore:
 
             if should_revive_scene:
                 self._scene_revival_frames_left -= 1
-                if self._scene_revival_frames_left <= 0:
-                    self._needs_scene_revival = False
-                    print(f"[SceneRevivalExpired] frame={video_frame} giving up after 90 frames")
+                scene_window_expired = self._scene_revival_frames_left <= 0
                 # Only attempt revival for tracks not yet locked
                 unlocked_for_revival = [
                     t for t in track_objs
@@ -620,10 +618,25 @@ class TrackerCore:
                     revived_tids.update(revived.keys())
                     if revived:
                         print(f"[SceneRevival] frame={video_frame} revived={len(revived)} remaining_window={self._scene_revival_frames_left}")
-                else:
+                elif not scene_window_expired:
                     # All tracks are locked — revival complete
                     self._needs_scene_revival = False
                     print(f"[SceneRevivalDone] frame={video_frame} all tracks locked")
+                if scene_window_expired:
+                    still_unlocked = [
+                        t for t in track_objs
+                        if int(t.track_id) not in revived_tids
+                        and not self.identity.locks.is_tid_locked(int(t.track_id))
+                    ]
+                    forced, force_meta = self.identity.force_commit_remaining_scene_slots(
+                        still_unlocked, embeddings, positions
+                    )
+                    self.id_remap.update({tid: int(pid[1:]) for tid, pid in forced.items()})
+                    meta_by_tid.update(force_meta)
+                    revived_tids.update(forced.keys())
+                    self._needs_scene_revival = False
+                    self.identity.in_scene_recovery = False
+                    print(f"[SceneRevivalExpired] frame={video_frame} forced={len(forced)} commits before exit")
 
             if should_revive_soft:
                 is_first_frame = (self._soft_recovery_frames == 60)
@@ -705,6 +718,7 @@ class TrackerCore:
 
         if save:
             players = []
+            assignment_pending = bool(self.identity._identity_restricted)
             for tr in player_tracks:
                 tid = tr.track_id
                 meta = meta_by_tid.get(tid)
@@ -725,13 +739,14 @@ class TrackerCore:
                     identity_valid = False
                     identity_confidence = float(meta.confidence) if meta else 0.0
                     player_id = None
-                    display_id = f"U T{int(tid)}"
+                    display_id = "?" if assignment_pending else None
 
                 players.append({
                     "trackId": out_pid if out_pid is not None else int(tid),
                     "rawTrackId": int(tid),
                     "playerId": player_id,
                     "displayId": display_id,
+                    "assignment_pending": assignment_pending and not identity_valid,
                     "bbox": [float(x1), float(y1), float(x2), float(y2)],
                     "confidence": float(tr.score),
                     "class": int(tr.cls),

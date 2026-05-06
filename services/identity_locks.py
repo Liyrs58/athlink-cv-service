@@ -20,6 +20,7 @@ LOCK_DEFAULT_TTL = 60          # frames a lock survives absent track in normal p
 LOCK_REVIVED_TTL = 90          # revivals get a longer grace
 LOCK_DORMANT_TTL = 150         # frames a dormant lock reserves pid before true expiry
 MEMORY_UPDATE_MIN_STABLE = 5   # don't write embedding until lock is this stable
+RECENT_DORMANT_REVIVE_FRAMES = 60
 
 
 @dataclass
@@ -33,6 +34,7 @@ class IdentityLock:
     ttl: int = LOCK_DEFAULT_TTL
     created_frame: int = -1
     dormant: bool = False       # True → pid reserved but track absent; cannot be stolen
+    dormant_since_frame: int = -1
 
 
 class IdentityLockManager:
@@ -144,6 +146,25 @@ class IdentityLockManager:
                     f"dormant_tid={existing_tid_for_pid} new_tid={tid} BLOCKED (restricted)"
                 )
                 return None, "blocked_dormant"
+            if (existing_lk and existing_lk.dormant and not restricted
+                    and (existing_pid_for_tid is None or existing_pid_for_tid.pid == pid)
+                    and 0 <= frame_id - existing_lk.dormant_since_frame <= RECENT_DORMANT_REVIVE_FRAMES):
+                self._tid_to_lock.pop(existing_tid_for_pid, None)
+                existing_lk.track_id = tid
+                existing_lk.source = source
+                existing_lk.confidence = confidence
+                existing_lk.stable_count = 1
+                existing_lk.last_seen_frame = frame_id
+                existing_lk.ttl = ttl if ttl is not None else (
+                    LOCK_REVIVED_TTL if source == "revived" else LOCK_DEFAULT_TTL
+                )
+                existing_lk.dormant = False
+                existing_lk.dormant_since_frame = -1
+                self._tid_to_lock[tid] = existing_lk
+                self._pid_to_tid[pid] = tid
+                print(f"[IDLockRevive] frame={frame_id} pid={pid} tid={tid} "
+                      f"old_tid={existing_tid_for_pid} reason=recent_dormant")
+                return existing_lk, "revived_dormant"
             if existing_lk and existing_lk.source == "revived" and restricted:
                 # Freshly revived lock cannot be stolen while identity is restricted
                 self.restricted_lock_attempts += 1
@@ -233,6 +254,7 @@ class IdentityLockManager:
         lk.stable_count += 1
         lk.last_seen_frame = frame_id
         lk.dormant = False  # track seen → no longer dormant
+        lk.dormant_since_frame = -1
         if confidence is not None:
             lk.confidence = confidence
         lk.ttl = LOCK_REVIVED_TTL if lk.source == "revived" else LOCK_DEFAULT_TTL
@@ -295,6 +317,7 @@ class IdentityLockManager:
                 if restricted and not lk.dormant:
                     # Convert to dormant: give it DORMANT_TTL more frames
                     lk.dormant = True
+                    lk.dormant_since_frame = frame_id
                     lk.ttl = LOCK_DORMANT_TTL
                     self.locks_dormanted += 1
                     print(

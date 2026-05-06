@@ -4,10 +4,10 @@ Render annotated video.
 Box colour communicates IDENTITY confidence, not team:
   - GREEN   : locked or hungarian-stable identity (identity_valid=True, source != revived)
   - YELLOW  : revived from snapshot, not yet promoted to lock
-  - GREY    : unassigned / uncertain — shown as T<raw_track_id>
+  - GREY    : unassigned / uncertain — no internal tracker id is shown
 
 Label format:
-  P7 locked     P7 revived     P7 hungarian     U T42
+  P7 locked     P7 revived     P7 hungarian     ?
 """
 
 import cv2
@@ -31,17 +31,24 @@ def _color_for(p):
 
 def _label_for(p):
     display_id = p.get("displayId")
+    identity_valid = p.get("identity_valid", False)
+    if isinstance(display_id, str) and display_id.startswith("U T"):
+        display_id = None
+    if not identity_valid:
+        if isinstance(display_id, int) or (isinstance(display_id, str) and display_id.isdigit()):
+            display_id = None
     if display_id:
         src = p.get("assignment_source", "")
-        if p.get("identity_valid", False) and src:
+        if identity_valid and src:
             return f"{display_id} {src}"
         return str(display_id)
-    if p.get("identity_valid", False):
+    if identity_valid:
         pid = p.get("playerId") or f"P{p.get('trackId', '?')}"
         src = p.get("assignment_source", "?")
         return f"{pid} {src}"
-    raw = p.get("rawTrackId", p.get("trackId", "?"))
-    return f"U T{raw}"
+    if p.get("assignment_pending", False):
+        return "?"
+    return None
 
 
 def draw_annotations(frame, players, frame_idx, summary_overlay=None):
@@ -53,10 +60,11 @@ def draw_annotations(frame, players, frame_idx, summary_overlay=None):
         color = _color_for(p)
         cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
         label = _label_for(p)
-        cv2.putText(
-            frame, label, (x1, max(y1 - 5, 0)),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2,
-        )
+        if label:
+            cv2.putText(
+                frame, label, (x1, max(y1 - 5, 0)),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2,
+            )
 
     cv2.putText(
         frame, f"F{frame_idx}", (10, 25),

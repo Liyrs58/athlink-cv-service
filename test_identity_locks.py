@@ -131,6 +131,86 @@ def test_recovery_lock_protected_helper():
     print("PASS test_recovery_lock_protected_helper")
 
 
+def test_low_cost_soft_revive_bypasses_tight_margin():
+    class FakeTrack:
+        def __init__(self, tid): self.track_id = tid
+
+    import numpy as np
+    ic = IdentityCore()
+    emb = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+    ic.frame_id = 240
+    ic.in_soft_recovery = True
+    ic._soft_snapshot = {
+        "P1": {"embedding": emb.copy(), "position": (0.5, 0.5), "pitch": None, "team_id": None, "last_seen": 150},
+        "P2": {"embedding": emb.copy(), "position": (0.5, 0.5), "pitch": None, "team_id": None, "last_seen": 150},
+    }
+
+    revived, meta = ic.revive_from_soft_snapshot(
+        [FakeTrack(44)], {44: emb.copy()}, {44: (0.5, 0.5)}
+    )
+
+    assert revived, "Excellent soft-revive cost should bypass tiny ambiguity margin"
+    assert next(iter(meta.values())).identity_valid is True
+    print("PASS test_low_cost_soft_revive_bypasses_tight_margin")
+
+
+def test_force_commit_remaining_scene_slot():
+    class FakeTrack:
+        def __init__(self, tid): self.track_id = tid
+
+    import numpy as np
+    ic = IdentityCore()
+    emb = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+    ic.frame_id = 910
+    ic.in_scene_recovery = True
+    ic._scene_reset_frame = 819
+    ic._bench_snapshot = {
+        "P1": {"embedding": emb.copy(), "position": (0.5, 0.5), "pitch": None, "team_id": None, "last_seen": 818}
+    }
+
+    forced, meta = ic.force_commit_remaining_scene_slots(
+        [FakeTrack(130)], {130: emb.copy()}, {130: (0.5, 0.5)}
+    )
+
+    assert forced == {130: "P1"}
+    assert meta[130].identity_valid is True
+    assert ic.locks.get_tid_for_pid("P1") == 130
+    assert ic.locks.identity_switches == 0
+    print("PASS test_force_commit_remaining_scene_slot")
+
+
+def test_renderer_never_labels_raw_tracker_ids():
+    from render_video import _label_for
+
+    assert _label_for({"identity_valid": False, "trackId": 130, "rawTrackId": 130}) is None
+    assert _label_for({"identity_valid": False, "displayId": "U T130"}) is None
+    assert _label_for({"identity_valid": False, "displayId": "130"}) is None
+    assert _label_for({"identity_valid": False, "displayId": 130}) is None
+    assert _label_for({"identity_valid": False, "assignment_pending": True}) == "?"
+    assert _label_for({"identity_valid": True, "playerId": "P7", "assignment_source": "locked"}) == "P7 locked"
+    print("PASS test_renderer_never_labels_raw_tracker_ids")
+
+
+def test_recent_dormant_lock_revives_without_new_churn():
+    m = make_manager(restricted=False)
+    lk = plant_revived_lock(m, tid=10, pid="P4", frame=100)
+    lk.dormant = True
+    lk.dormant_since_frame = 120
+    before_created = m.locks_created
+
+    revived, status = m.try_create_lock(
+        130, "P4", "hungarian", 150, 0.12,
+        allow_takeover=True, allow_rebind=True,
+    )
+
+    assert revived is not None
+    assert status == "revived_dormant"
+    assert m.get_tid_for_pid("P4") == 130
+    assert m.locks_created == before_created
+    assert m.identity_switches == 0
+    print("PASS test_recent_dormant_lock_revives_without_new_churn")
+
+
 # ── runner ───────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
@@ -138,4 +218,8 @@ if __name__ == "__main__":
     test_revived_lock_takeover_allowed_after_recovery()
     test_scene_revival_rejects_recovery_lock_protected()
     test_recovery_lock_protected_helper()
+    test_low_cost_soft_revive_bypasses_tight_margin()
+    test_force_commit_remaining_scene_slot()
+    test_renderer_never_labels_raw_tracker_ids()
+    test_recent_dormant_lock_revives_without_new_churn()
     print("\nAll tests PASS")
