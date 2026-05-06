@@ -30,10 +30,16 @@ def _color_for(p):
 
 
 def _label_for(p):
+    display_id = p.get("displayId")
+    if display_id:
+        src = p.get("assignment_source", "")
+        if p.get("identity_valid", False) and src:
+            return f"{display_id} {src}"
+        return str(display_id)
     if p.get("identity_valid", False):
-        pid = p.get("trackId", "?")
+        pid = p.get("playerId") or f"P{p.get('trackId', '?')}"
         src = p.get("assignment_source", "?")
-        return f"P{pid} {src}"
+        return f"{pid} {src}"
     raw = p.get("rawTrackId", p.get("trackId", "?"))
     return f"U T{raw}"
 

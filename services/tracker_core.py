@@ -716,16 +716,22 @@ class TrackerCore:
                     source = meta.source
                     identity_valid = True
                     identity_confidence = float(meta.confidence)
+                    player_id = meta.pid
+                    display_id = meta.pid
                 else:
                     # Uncertain — render as raw track (T<id>), no P-id
                     out_pid = None
                     source = "unassigned"
                     identity_valid = False
                     identity_confidence = float(meta.confidence) if meta else 0.0
+                    player_id = None
+                    display_id = f"U T{int(tid)}"
 
                 players.append({
                     "trackId": out_pid if out_pid is not None else int(tid),
                     "rawTrackId": int(tid),
+                    "playerId": player_id,
+                    "displayId": display_id,
                     "bbox": [float(x1), float(y1), float(x2), float(y2)],
                     "confidence": float(tr.score),
                     "class": int(tr.cls),

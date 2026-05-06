@@ -295,7 +295,15 @@ def _draw_players(frame, players, include_minimap: bool, frame_w: int, frame_h: 
             # Confirmed detection: solid rectangle
             cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
 
-        label = f"T{track_id}"
+        display_id = p.get("displayId")
+        if not display_id:
+            if p.get("identity_valid", False):
+                display_id = p.get("playerId") or f"P{track_id}"
+            elif "rawTrackId" in p:
+                display_id = f"U T{p['rawTrackId']}"
+            else:
+                display_id = f"T{track_id}"
+        label = str(display_id)
         font_scale = 0.45
         thickness  = 1
         (lw, lh), baseline = cv2.getTextSize(label, FONT, font_scale, thickness)

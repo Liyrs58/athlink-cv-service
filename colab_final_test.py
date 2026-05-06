@@ -127,19 +127,24 @@ while True:
         bbox = p.get('bbox')
         if bbox and len(bbox) == 4:
             x1, y1, x2, y2 = map(int, bbox)
-            tid = p.get('trackId', '?')
+            identity_valid = bool(p.get('identity_valid', False))
+            source = p.get('assignment_source', 'unassigned')
+            raw_tid = p.get('rawTrackId', p.get('trackId', '?'))
+            display_id = p.get('displayId')
+            if not display_id:
+                display_id = f"P{p.get('trackId', '?')}" if identity_valid else f"U T{raw_tid}"
             state = p.get('gameState', 'play')
 
-            # Color by state
-            if state == 'bench_shot':
+            # Color by identity state, not raw tracker state.
+            if state == 'bench_shot' or not identity_valid:
                 color = (128, 128, 128)  # Gray
-            elif state == 'play':
-                color = (0, 255, 0)  # Green
+            elif source == 'revived':
+                color = (0, 220, 255)  # Yellow
             else:
-                color = (0, 165, 255)  # Orange
+                color = (0, 255, 0)  # Green
 
             cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-            cv2.putText(frame, f"T{tid}", (x1, max(y1-5, 0)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+            cv2.putText(frame, display_id, (x1, max(y1-5, 0)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
 
     out.write(frame)
     frame_idx += 1
