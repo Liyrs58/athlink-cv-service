@@ -124,6 +124,8 @@ app.include_router(analytics_overlay_router, prefix="/api/v1/analytics-overlay",
 app.include_router(conversation_router, prefix="/api/v1", tags=["conversation"])
 app.include_router(oracle_router, prefix="/api/v1", tags=["oracle"])
 app.include_router(stream_router, prefix="/api/v1", tags=["stream"])
+from routes.report import router as match_report_router  # noqa: E402
+app.include_router(match_report_router, prefix="/api/v1", tags=["match-report"])
 
 @app.get("/health")
 async def root():

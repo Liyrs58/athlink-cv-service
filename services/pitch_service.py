@@ -554,6 +554,14 @@ def map_pitch(
     output_dir.mkdir(parents=True, exist_ok=True)
     output_path = str(output_dir / "pitch_map.json")
 
+    # Serialise per-frame homography matrices (image -> world, metres) so
+    # downstream renderers can invert them and project world points back.
+    homographies_serialised = {
+        str(fi): np.asarray(H, dtype=float).tolist()
+        for fi, H in frame_homographies.items()
+        if H is not None
+    } if calibration_valid else {}
+
     result = {
         "jobId": job_id,
         "framesProcessed": frames_checked,
@@ -561,6 +569,9 @@ def map_pitch(
         "calibration_valid": calibration_valid,
         "calibration_failed": not calibration_valid,
         "players": players,
+        "homographies": homographies_serialised,  # frameIndex -> 3x3 image->world H
+        "frameSize": {"width": int(frame_w), "height": int(frame_h)},
+        "pitchSize": {"width": float(PITCH_WIDTH), "height": float(PITCH_HEIGHT)},
         "outputPath": output_path,
     }
 

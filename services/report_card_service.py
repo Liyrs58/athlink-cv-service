@@ -514,8 +514,129 @@ def generate_team_report(job_id: str, team: int) -> bytes:
     # Also save to file
     output_dir = Path(f"temp/{job_id}/reports")
     output_dir.mkdir(parents=True, exist_ok=True)
-    
+
     with open(output_dir / f"team_{team}.pdf", "wb") as f:
         f.write(buffer.getvalue())
-    
+
     return buffer.getvalue()
+
+
+def build_match_pdf(job_id: str, output_path: str) -> str:
+    """Render a single-page PDF summary from match_report.json.
+
+    Lightweight, mood-board-aligned: header, quality metrics row, two-team metrics
+    row, top players list, events count. No charts (heatmap/per-player pages are
+    generated separately via generate_player_report).
+    """
+    report_path = Path(f"temp/{job_id}/match_report.json")
+    if not report_path.exists():
+        from services.match_report_service import build_match_report as _build
+        _build(job_id)
+    with open(report_path) as f:
+        report = json.load(f)
+
+    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+    c = canvas.Canvas(output_path, pagesize=A4)
+
+    # Header
+    c.setFillColor(black)
+    c.setFont("Helvetica-Bold", 18)
+    c.drawString(MARGIN, PAGE_HEIGHT - MARGIN - 8, "AthLink CV — Match Report")
+    c.setFont("Helvetica", 10)
+    c.setFillColor(grey)
+    c.drawString(MARGIN, PAGE_HEIGHT - MARGIN - 24, f"Job: {report.get('jobId', job_id)}")
+
+    # Quality strip
+    y = PAGE_HEIGHT - MARGIN - 60
+    quality = report.get("quality", {}) or {}
+    c.setFillColor(black)
+    c.setFont("Helvetica-Bold", 11)
+    c.drawString(MARGIN, y, "Tracking quality")
+    y -= 14
+    c.setFont("Helvetica", 9)
+    quality_lines = [
+        ("Stable IDs", quality.get("stableIds")),
+        ("Track resurrection", quality.get("trackResurrection")),
+        ("ID switches /min", quality.get("lowIdSwitchesPerMin")),
+        ("Pitch detection", quality.get("pitchDetectionCoverage")),
+        ("Match confidence", quality.get("matchConfidence")),
+        ("Valid ID coverage", quality.get("validIdCoverage")),
+        ("Unique IDs", quality.get("uniqueIds")),
+        ("Unknown boxes", quality.get("unknownBoxes")),
+    ]
+    for label, val in quality_lines:
+        if val is None:
+            display = "—"
+        elif isinstance(val, float):
+            display = f"{val:.3f}"
+        else:
+            display = str(val)
+        c.drawString(MARGIN + 10, y, f"{label}: {display}")
+        y -= 12
+
+    # Teams + metrics block
+    y -= 10
+    teams = report.get("teams", {}) or {}
+    metrics = report.get("metrics", {}) or {}
+    c.setFont("Helvetica-Bold", 11)
+    c.drawString(MARGIN, y, "Teams")
+    y -= 14
+    c.setFont("Helvetica", 9)
+    home, away = teams.get("home", {}), teams.get("away", {})
+    c.drawString(
+        MARGIN + 10, y,
+        f"Home — players={home.get('playerCount', 0)} formation={home.get('formation') or '—'} "
+        f"conf={home.get('formationConfidence') or '—'}"
+    )
+    y -= 12
+    c.drawString(
+        MARGIN + 10, y,
+        f"Away — players={away.get('playerCount', 0)} formation={away.get('formation') or '—'} "
+        f"conf={away.get('formationConfidence') or '—'}"
+    )
+    y -= 18
+    c.setFont("Helvetica-Bold", 11)
+    c.drawString(MARGIN, y, "Metrics (Home / Away)")
+    y -= 14
+    c.setFont("Helvetica", 9)
+    rows = [
+        ("Possession %", metrics.get("possessionPct")),
+        ("Pass accuracy", metrics.get("passAccuracy")),
+        ("Pressures", metrics.get("pressures")),
+        ("Distance covered (km)", metrics.get("distanceCoveredKm")),
+        ("Sprints", metrics.get("sprints")),
+        ("xG", metrics.get("expectedGoals")),
+        ("Big chances", metrics.get("bigChances")),
+        ("Shot accuracy", metrics.get("shotAccuracy")),
+        ("Turnovers won", metrics.get("turnoversWon")),
+    ]
+    for label, vals in rows:
+        if not vals or len(vals) != 2:
+            continue
+        c.drawString(MARGIN + 10, y, f"{label}: {vals[0]} / {vals[1]}")
+        y -= 12
+
+    # Players (top 8)
+    y -= 8
+    c.setFont("Helvetica-Bold", 11)
+    c.drawString(MARGIN, y, "Players (top 8 by distance)")
+    y -= 14
+    c.setFont("Helvetica", 9)
+    players = report.get("players", []) or []
+    sorted_players = sorted(players, key=lambda p: -(p.get("distanceM") or 0))[:8]
+    for p in sorted_players:
+        c.drawString(
+            MARGIN + 10, y,
+            f"{p.get('playerId', '?'):<6} {p.get('team') or '—':<6}  "
+            f"distance={p.get('distanceM', 0):.1f}m  sprints={p.get('sprints', 0)}  "
+            f"top={p.get('topSpeedKmh', 0):.1f} km/h"
+        )
+        y -= 12
+
+    # Events count
+    y -= 8
+    n_events = len(report.get("events", []) or [])
+    c.drawString(MARGIN, y, f"Events captured: {n_events}")
+
+    c.save()
+    return output_path
