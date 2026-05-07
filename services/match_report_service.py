@@ -218,86 +218,135 @@ def _teams_block(formation_data: Optional[dict], team_data: Optional[dict]) -> D
     return {"home": home, "away": away}
 
 
+def _as_dict(x: Any) -> dict:
+    return x if isinstance(x, dict) else {}
+
+
+def _as_list_of_dicts(x: Any) -> List[dict]:
+    if not isinstance(x, list):
+        return []
+    return [item for item in x if isinstance(item, dict)]
+
+
+def _all_events(events_data: Any) -> List[dict]:
+    """Return a single list of dict events from any of the known shapes."""
+    out: List[dict] = []
+    if isinstance(events_data, list):
+        out.extend(it for it in events_data if isinstance(it, dict))
+        return out
+    if not isinstance(events_data, dict):
+        return out
+    # Flat top-level "events"
+    out.extend(_as_list_of_dicts(events_data.get("events")))
+    # Per-type buckets
+    for key in ("pass_events", "shot_events", "tackle_events", "turnover_events", "carry_events"):
+        for e in _as_list_of_dicts(events_data.get(key)):
+            if "type" not in e:
+                e = {**e, "type": key.replace("_events", "")}
+            out.append(e)
+    return out
+
+
 def _metrics_block(
-    pass_data: Optional[dict],
-    pressing_data: Optional[dict],
-    xg_data: Optional[dict],
-    heatmap_data: Optional[dict],
-    events_data: Optional[dict],
+    pass_data: Optional[Any],
+    pressing_data: Optional[Any],
+    xg_data: Optional[Any],
+    heatmap_data: Optional[Any],
+    events_data: Optional[Any],
 ) -> Dict[str, Any]:
-    def _pair(d: Optional[dict], key_a: str, key_b: str = None, default=0):
-        if not d:
-            return [default, default]
-        a = d.get(key_a, default) if d else default
-        b = d.get(key_b or key_a, default) if d else default
-        if isinstance(a, list) and len(a) == 2:
-            return [a[0], a[1]]
-        return [a, b]
+    pass_data = _as_dict(pass_data)
+    pressing_data = _as_dict(pressing_data)
+    xg_data = _as_dict(xg_data)
+    heatmap_data = _as_dict(heatmap_data)
+    events = _all_events(events_data)
 
     possession = [0.0, 0.0]
-    if events_data:
-        f0 = events_data.get("possession_frames_team_0") or events_data.get("possession_team_0")
-        f1 = events_data.get("possession_frames_team_1") or events_data.get("possession_team_1")
+    ed = _as_dict(events_data)
+    f0 = ed.get("possession_frames_team_0") or ed.get("possession_team_0")
+    f1 = ed.get("possession_frames_team_1") or ed.get("possession_team_1")
+    try:
+        f0, f1 = float(f0 or 0), float(f1 or 0)
+        tot = f0 + f1
+        if tot > 0:
+            possession = [round(f0 / tot, 3), round(f1 / tot, 3)]
+    except Exception:
+        pass
+
+    pass_acc = [0.0, 0.0]
+    for i, key in enumerate(("team_0", "team_1")):
+        blk = _as_dict(pass_data.get(key))
         try:
-            f0, f1 = float(f0 or 0), float(f1 or 0)
-            tot = f0 + f1
-            if tot > 0:
-                possession = [round(f0 / tot, 3), round(f1 / tot, 3)]
+            pass_acc[i] = round(float(blk.get("completion_pct") or blk.get("completionPct") or 0.0), 3)
+        except Exception:
+            pass
+    if pass_acc == [0.0, 0.0] and events:
+        # Derive from event list: completed passes / total passes per team
+        passes_by_team: Dict[int, List[dict]] = defaultdict(list)
+        for e in events:
+            if str(e.get("type")) != "pass":
+                continue
+            t = e.get("teamId", e.get("team_id"))
+            if t in (0, 1):
+                passes_by_team[int(t)].append(e)
+        for t, lst in passes_by_team.items():
+            if not lst:
+                continue
+            done = sum(1 for e in lst if e.get("completed", e.get("success", True)))
+            pass_acc[t] = round(done / len(lst), 3)
+
+    pressures = [0, 0]
+    for i, key in enumerate(("team_0", "team_1")):
+        blk = _as_dict(pressing_data.get(key))
+        try:
+            pressures[i] = int(blk.get("pressures") or blk.get("count") or 0)
         except Exception:
             pass
 
-    pass_acc = [0.0, 0.0]
-    if pass_data:
-        for i, key in enumerate(("team_0", "team_1")):
-            blk = pass_data.get(key) or {}
-            try:
-                pass_acc[i] = round(float(blk.get("completion_pct") or blk.get("completionPct") or 0.0), 3)
-            except Exception:
-                pass
-
-    pressures = [0, 0]
-    if pressing_data:
-        for i, key in enumerate(("team_0", "team_1")):
-            blk = pressing_data.get(key) or {}
-            try:
-                pressures[i] = int(blk.get("pressures") or blk.get("count") or 0)
-            except Exception:
-                pass
-
     distance = [0.0, 0.0]
     sprints = [0, 0]
-    if heatmap_data:
-        for player in heatmap_data.get("players", []):
-            team = int(player.get("teamId", -1)) if "teamId" in player else -1
-            if team in (0, 1):
-                try:
-                    distance[team] += float(player.get("distance") or 0.0)
-                    sprints[team] += int(player.get("sprint_count") or 0)
-                except Exception:
-                    pass
-        distance = [round(distance[0] / 1000.0, 2), round(distance[1] / 1000.0, 2)]
+    for player in _as_list_of_dicts(heatmap_data.get("players")):
+        try:
+            team = int(player.get("teamId", -1))
+        except Exception:
+            team = -1
+        if team in (0, 1):
+            try:
+                distance[team] += float(player.get("distance") or 0.0)
+                sprints[team] += int(player.get("sprint_count") or 0)
+            except Exception:
+                pass
+    distance = [round(distance[0] / 1000.0, 2), round(distance[1] / 1000.0, 2)]
 
     xg_pair = [0.0, 0.0]
     big_chances = [0, 0]
     shot_acc = [0.0, 0.0]
-    if xg_data:
-        shots_by_team: Dict[int, List[dict]] = defaultdict(list)
-        for s in xg_data.get("shots", []):
+    shots_by_team: Dict[int, List[dict]] = defaultdict(list)
+    for s in _as_list_of_dicts(xg_data.get("shots")):
+        try:
             t = int(s.get("teamId", s.get("team_id", -1)))
-            if t in (0, 1):
-                shots_by_team[t].append(s)
-        for t, shots in shots_by_team.items():
+        except Exception:
+            t = -1
+        if t in (0, 1):
+            shots_by_team[t].append(s)
+    for t, shots in shots_by_team.items():
+        try:
             xg_pair[t] = round(sum(float(s.get("xg") or 0.0) for s in shots), 2)
             big_chances[t] = sum(1 for s in shots if float(s.get("xg") or 0.0) >= 0.15)
             on_target = sum(1 for s in shots if s.get("on_target"))
             shot_acc[t] = round(on_target / max(len(shots), 1), 3)
+        except Exception:
+            pass
 
     turnovers = [0, 0]
-    if events_data:
-        for e in events_data.get("turnover_events", []) or []:
-            t = e.get("teamId", e.get("team_id"))
-            if t in (0, 1):
+    for e in events:
+        if str(e.get("type")) != "turnover":
+            continue
+        t = e.get("teamId", e.get("team_id"))
+        if t in (0, 1):
+            try:
                 turnovers[int(t)] += 1
+            except Exception:
+                pass
 
     return {
         "possessionPct": possession,
@@ -312,47 +361,52 @@ def _metrics_block(
     }
 
 
-def _players_block(heatmap_data: Optional[dict], team_data: Optional[dict]) -> List[dict]:
+def _players_block(heatmap_data: Any, team_data: Any) -> List[dict]:
     team_map: Dict[int, str] = {}
-    if team_data:
-        for entry in _team_entries(team_data):
-            tid = entry.get("trackId") or entry.get("track_id")
-            t = entry.get("teamId", entry.get("team_id"))
-            if tid is not None and t in (0, 1):
-                team_map[int(tid)] = "home" if t == 0 else "away"
+    for entry in _team_entries(team_data):
+        tid = entry.get("trackId") or entry.get("track_id")
+        t = entry.get("teamId", entry.get("team_id"))
+        if tid is not None and t in (0, 1):
+            try:
+                team_map[int(tid)] = "home" if int(t) == 0 else "away"
+            except Exception:
+                continue
 
     out: List[dict] = []
-    if not heatmap_data:
-        return out
-    for p in heatmap_data.get("players", []):
-        tid = p.get("trackId") or p.get("playerId")
-        out.append({
-            "playerId": p.get("playerId") or (f"P{tid}" if tid is not None else None),
-            "team": team_map.get(int(tid)) if tid is not None else None,
-            "name": None,
-            "distanceM": round(float(p.get("distance") or 0.0), 1),
-            "sprints": int(p.get("sprint_count") or 0),
-            "topSpeedKmh": round(float(p.get("top_speed_kmh") or 0.0), 2),
-        })
+    heatmap_data = _as_dict(heatmap_data)
+    for p in _as_list_of_dicts(heatmap_data.get("players")):
+        try:
+            tid = p.get("trackId") or p.get("playerId")
+            out.append({
+                "playerId": p.get("playerId") or (f"P{tid}" if tid is not None else None),
+                "team": team_map.get(int(tid)) if tid is not None else None,
+                "name": None,
+                "distanceM": round(float(p.get("distance") or 0.0), 1),
+                "sprints": int(p.get("sprint_count") or 0),
+                "topSpeedKmh": round(float(p.get("top_speed_kmh") or 0.0), 2),
+            })
+        except Exception:
+            continue
     return out
 
 
-def _events_block(events_data: Optional[dict], fps: float) -> List[dict]:
-    if not events_data:
-        return []
+def _events_block(events_data: Any, fps: float) -> List[dict]:
     out: List[dict] = []
-    for key in ("pass_events", "shot_events", "tackle_events", "turnover_events"):
-        for e in events_data.get(key, []) or []:
-            frame = e.get("frame") or e.get("frameIndex")
-            if frame is None:
-                continue
-            ts = round(float(frame) / fps, 2) if fps else 0.0
-            out.append({
-                "frame": int(frame),
-                "timestampSec": ts,
-                "type": key.replace("_events", ""),
-                "team": e.get("teamId", e.get("team_id")),
-            })
+    for e in _all_events(events_data):
+        frame = e.get("frame") or e.get("frameIndex")
+        if frame is None:
+            continue
+        try:
+            f = int(frame)
+        except Exception:
+            continue
+        ts = round(float(f) / fps, 2) if fps else 0.0
+        out.append({
+            "frame": f,
+            "timestampSec": ts,
+            "type": str(e.get("type") or "event"),
+            "team": e.get("teamId", e.get("team_id")),
+        })
     out.sort(key=lambda x: x["frame"])
     return out
 
