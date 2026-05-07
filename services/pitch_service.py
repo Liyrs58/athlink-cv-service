@@ -189,11 +189,58 @@ def _base_job_id(job_id: str) -> str:
 # Data loading helpers
 # ---------------------------------------------------------------------------
 
+def _frames_to_tracks_schema(frames: List[Dict]) -> Dict:
+    """Convert tracker_core's frames[].players[] schema to legacy tracks[].trajectory[].
+    Used when pitch_service is given a track_results.json produced by tracker_core
+    (which writes per-frame players) instead of tracking_service (per-track trajectories)."""
+    tracks_by_id: Dict[int, Dict] = {}
+    ball_traj: List[Dict] = []
+    for f in frames:
+        fi = f.get("frameIndex")
+        for p in f.get("players", []) or []:
+            if p.get("is_official"):
+                continue
+            tid = p.get("rawTrackId") or p.get("trackId")
+            if tid is None:
+                continue
+            tid = int(tid)
+            bbox = p.get("bbox")
+            if not bbox or len(bbox) != 4:
+                continue
+            entry = tracks_by_id.setdefault(tid, {
+                "trackId": tid,
+                "teamId": -1,
+                "trajectory": [],
+            })
+            entry["trajectory"].append({
+                "frameIndex": int(fi),
+                "bbox": [float(b) for b in bbox],
+                "confidence": float(p.get("confidence", 0.0) or 0.0),
+            })
+        # Ball detections may be embedded under a separate key
+        for b in f.get("ball", []) or []:
+            bbox = b.get("bbox")
+            if bbox and len(bbox) == 4:
+                cx = (float(bbox[0]) + float(bbox[2])) / 2.0
+                cy = (float(bbox[1]) + float(bbox[3])) / 2.0
+                ball_traj.append({
+                    "frameIndex": int(fi), "x": cx, "y": cy,
+                    "source": b.get("source", "yolo"),
+                    "confidence": float(b.get("confidence", 0.5) or 0.5),
+                })
+    out = {"tracks": list(tracks_by_id.values())}
+    if ball_traj:
+        out["ball_trajectory"] = ball_traj
+    return out
+
+
 def _load_tracking(job_id: str) -> Optional[Dict]:
     """
     Load tracking data containing player trajectories.
     Tries the given job_id first, then the base job_id (strips known suffixes).
     Within each folder, tries track_results.json then team_results.json.
+    Accepts either the legacy tracks[].trajectory[] schema or the new
+    tracker_core frames[].players[] schema (auto-converted).
     """
     candidates = [job_id]
     base = _base_job_id(job_id)
@@ -208,10 +255,20 @@ def _load_tracking(job_id: str) -> Optional[Dict]:
                 print(f"[pitch_service] found: {path.resolve()}")
                 with open(path) as f:
                     data = json.load(f)
-                # Only accept files that have trajectory data
+
+                # Schema A: legacy tracks[].trajectory[]
                 tracks = data.get("tracks", data if isinstance(data, list) else [])
                 if tracks and isinstance(tracks[0], dict) and "trajectory" in tracks[0]:
                     return data
+
+                # Schema B: new tracker_core frames[].players[]
+                frames = data.get("frames")
+                if frames and isinstance(frames, list) and frames and "players" in frames[0]:
+                    converted = _frames_to_tracks_schema(frames)
+                    if converted["tracks"]:
+                        print(f"[pitch_service] converted frames schema -> {len(converted['tracks'])} tracks")
+                        return converted
+
                 print(f"[pitch_service] skipping {filename} — no trajectory data")
 
     print(f"[pitch_service] no tracking data found for job '{job_id}'")
