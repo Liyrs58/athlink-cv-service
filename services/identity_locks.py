@@ -16,9 +16,9 @@ from typing import Dict, List, Optional, Set, Tuple
 
 
 STABLE_PROMOTE_FRAMES = 5      # Hungarian must agree this many consecutive frames to lock
-LOCK_DEFAULT_TTL = 60          # frames a lock survives absent track in normal play
-LOCK_REVIVED_TTL = 90          # revivals get a longer grace
-LOCK_DORMANT_TTL = 150         # frames a dormant lock reserves pid before true expiry
+LOCK_DEFAULT_TTL = 150         # frames a lock survives absent track in normal play
+LOCK_REVIVED_TTL = 210         # revivals get a longer grace
+LOCK_DORMANT_TTL = 300         # frames a dormant lock reserves pid before true expiry
 MEMORY_UPDATE_MIN_STABLE = 5   # don't write embedding until lock is this stable
 RECENT_DORMANT_REVIVE_FRAMES = 60
 

@@ -46,7 +46,7 @@ class ReIDExtractor:
 
     OSNet weights: /content/osnet_x1_0_msmt17.pt (upload to Colab)
     """
-    OSNET_PATH = "/content/osnet_x1_0_msmt17.pt"
+    OSNET_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "models", "osnet_x1_0_msmt17.pt")
 
     def __init__(self, device="cpu"):
         self.device = "cuda" if "cuda" in str(device) else "cpu"
@@ -207,7 +207,7 @@ class TrackerCore:
         self._in_freeze_segment = False
 
         # Scene state tracking
-        self._active_baseline = 0
+        self._active_baseline = 18.0  # sensible default; updated from real data after frame 1
         self._track_history = []
         self._soft_collapse = False
         self._soft_recovery_frames = 0
