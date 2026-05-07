@@ -219,6 +219,7 @@ class TrackerCore:
         self._streak_collapse = 0
         self._streak_recover = 0
         self._transition_frame = -1
+        self._frames_in_collapse = 0  # phase 2 telemetry: feeds match_report.quality.softCollapseFraction
 
         # Officials tracking for output
         self._officials_this_frame = []
@@ -478,29 +479,41 @@ class TrackerCore:
                     pass
 
         # ── SOFT-STATE TRACKING & COLLAPSE LOGIC ──
+        # Camera-aware baseline: rolling median of player-only counts (excludes officials).
+        # Adapts both up (wide shots) and down (broadcast zoom-in to box).
         if is_play and not is_overlay:
-            current_count = len(assignable_tracks)
-            
-            # Maintain rolling baseline from strong play frames only
-            if current_count >= 18 and not self._soft_collapse:
+            n_officials = len(self._officials_this_frame) if self._officials_this_frame else 0
+            current_count = max(0, len(assignable_tracks) - 0)  # assignable already excludes officials
+            _ = n_officials  # kept for future expected-count subtraction if assignable changes
+
+            # Always feed the rolling window (no gate on >=18 — that's what trapped the baseline high).
+            if not self._soft_collapse:
                 self._track_history.append(current_count)
                 if len(self._track_history) > 30:
                     self._track_history.pop(0)
-                self._active_baseline = max(18.0, float(sum(self._track_history)) / len(self._track_history))
-                
+                # Median = robust to brief detection drops, adapts to broadcast zoom.
+                sorted_hist = sorted(self._track_history)
+                mid = len(sorted_hist) // 2
+                if len(sorted_hist) % 2 == 0 and len(sorted_hist) >= 2:
+                    median_count = (sorted_hist[mid - 1] + sorted_hist[mid]) / 2.0
+                else:
+                    median_count = float(sorted_hist[mid])
+                # Floor at 8 (small-side coverage); no upper cap.
+                self._active_baseline = max(8.0, median_count)
+
             if self._active_baseline > 0:
                 # Trigger SoftCollapse if dropped below 65% for 3+ consecutive frames
                 if current_count <= 0.65 * self._active_baseline:
                     self._streak_collapse += 1
                 else:
                     self._streak_collapse = 0
-                    
+
                 # Trigger SoftRecovery if recovered above 80%
                 if current_count >= 0.80 * self._active_baseline:
                     self._streak_recover += 1
                 else:
                     self._streak_recover = 0
-                    
+
                 if self._streak_collapse >= 3 and not self._soft_collapse:
                     saved = self.identity.snapshot_soft(video_frame)
                     self._soft_collapse = True
@@ -519,6 +532,10 @@ class TrackerCore:
                     self._streak_recover = 0
                     snap_len = len(self.identity._soft_snapshot) if hasattr(self.identity, '_soft_snapshot') and self.identity._soft_snapshot else 0
                     print(f"[SoftRecovery] Frame {video_frame}: current={current_count} baseline={self._active_baseline:.1f} snapshot_slots={snap_len} revived=candidates → entering recovery mode")
+
+        # Track frames-in-collapse for match_report.json telemetry (phase 2)
+        if self._soft_collapse:
+            self._frames_in_collapse = getattr(self, "_frames_in_collapse", 0) + 1
 
         # Periodic telemetry
         if is_play and video_frame % 30 == 0:
@@ -768,29 +785,22 @@ class TrackerCore:
                     "is_official": False,
                 })
 
+            officials_list = []
             for ofc in self._officials_this_frame:
                 ox1, oy1, ox2, oy2 = ofc.bbox
-                players.append({
+                officials_list.append({
                     "trackId": int(ofc.track_id),
                     "rawTrackId": int(ofc.track_id),
-                    "playerId": None,
-                    "displayId": None,
-                    "assignment_pending": False,
                     "bbox": [float(ox1), float(oy1), float(ox2), float(oy2)],
                     "confidence": float(ofc.score),
                     "class": int(ofc.cls),
-                    "gameState": state.value,
-                    "analysis_valid": True,
-                    "crop_quality": 1.0,
-                    "identity_valid": False,
-                    "assignment_source": "official",
-                    "identity_confidence": 0.0,
                     "is_official": True,
                 })
 
             self.results.append({
                 "frameIndex": int(video_frame),
                 "players": players,
+                "officials": officials_list,
                 "detection_count": len(dets),
                 "track_count": n_tracks,
                 "officials_filtered": len(self._officials_this_frame),

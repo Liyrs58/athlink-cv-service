@@ -62,7 +62,7 @@ class RoleFilter:
         self.black_ratio_thresh = cfg.get("black_ratio_thresh", 0.55)
         self.team_exclusion_dist = cfg.get("team_exclusion_dist", 0.40)
         self.edge_margin_frac = cfg.get("edge_margin_frac", 0.08)
-        self.min_frames_to_filter = cfg.get("min_frames_to_filter", 5)
+        self.min_frames_to_filter = cfg.get("min_frames_to_filter", 3)
         self.referee_confidence_thresh = cfg.get("referee_confidence_thresh", 0.70)
         self.log_interval = cfg.get("log_interval", 30)
 

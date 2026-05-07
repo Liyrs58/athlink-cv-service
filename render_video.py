@@ -1,74 +1,121 @@
 """
-Render annotated video.
+Render annotated video — UEFA-style overlay.
 
-Box colour communicates IDENTITY confidence, not team:
-  - GREEN   : locked or hungarian-stable identity (identity_valid=True, source != revived)
-  - YELLOW  : revived from snapshot, not yet promoted to lock
-  - GREY    : unassigned / uncertain — no internal tracker id is shown
+Box colour communicates TEAM, not identity confidence.
+Stroke style communicates identity confidence:
+  - SOLID  : locked (high confidence)
+  - DASHED : revived / hungarian (medium)
+  - DOTTED : unassigned / pending (low)
 
-Label format:
-  P7 locked     P7 revived     P7 hungarian     ?
+Officials are drawn as thin orange boxes with no label so they don't clutter the identity scene.
 """
 
 import cv2
 import json
 from pathlib import Path  # noqa: F401
 
-GREEN = (0, 200, 0)
-YELLOW = (0, 220, 255)
-GREY = (128, 128, 128)
-RED = (0, 0, 255)
-ORANGE = (0, 165, 255)
+# Team palette (BGR) — picked to read well on green grass
+TEAM_HOME = (255, 99, 29)   # blue (matches mood board)
+TEAM_AWAY = (37, 197, 34)   # green (matches mood board)
+TEAM_FALLBACK = (200, 200, 200)
+REF_COLOR = (0, 165, 255)   # thin orange
 
 
-def _color_for(p):
+def _team_color(p, team_map):
+    """Resolve a per-track team colour from team_results.json mapping."""
     if p.get("is_official", False):
-        return ORANGE
-    if not p.get("identity_valid", False):
-        return GREY
+        return REF_COLOR
+    tid = p.get("rawTrackId") or p.get("trackId")
+    team = team_map.get(int(tid)) if tid is not None else None
+    if team in (0, "0", "home"):
+        return TEAM_HOME
+    if team in (1, "1", "away"):
+        return TEAM_AWAY
+    return TEAM_FALLBACK
+
+
+def _stroke_for(p):
+    """Return ("solid"|"dashed"|"dotted", thickness) based on identity confidence."""
+    if p.get("is_official", False):
+        return "solid", 1
     src = p.get("assignment_source", "")
-    if src == "revived":
-        return YELLOW
-    return GREEN
+    if src == "locked":
+        return "solid", 2
+    if src in ("revived", "hungarian"):
+        return "dashed", 2
+    return "dotted", 1
+
+
+def _draw_rect(frame, x1, y1, x2, y2, color, style, thickness):
+    if style == "solid":
+        cv2.rectangle(frame, (x1, y1), (x2, y2), color, thickness)
+        return
+    # dashed / dotted: draw segments along each edge
+    seg_len = 6 if style == "dashed" else 2
+    gap = 4 if style == "dashed" else 4
+
+    def _line(p, q):
+        # Bresenham-style stepping along p->q with seg_len/gap pattern
+        x_a, y_a = p
+        x_b, y_b = q
+        dx = x_b - x_a
+        dy = y_b - y_a
+        length = max(abs(dx), abs(dy))
+        if length == 0:
+            return
+        sx = dx / length
+        sy = dy / length
+        i = 0
+        while i < length:
+            j = min(i + seg_len, length)
+            cv2.line(
+                frame,
+                (int(x_a + sx * i), int(y_a + sy * i)),
+                (int(x_a + sx * j), int(y_a + sy * j)),
+                color, thickness,
+            )
+            i = j + gap
+
+    _line((x1, y1), (x2, y1))
+    _line((x2, y1), (x2, y2))
+    _line((x2, y2), (x1, y2))
+    _line((x1, y2), (x1, y1))
 
 
 def _label_for(p):
     if p.get("is_official", False):
-        return "REF"
-    display_id = p.get("displayId")
-    identity_valid = p.get("identity_valid", False)
-    if isinstance(display_id, str) and display_id.startswith("U T"):
-        display_id = None
-    if not identity_valid:
-        if isinstance(display_id, int) or (isinstance(display_id, str) and display_id.isdigit()):
-            display_id = None
-    if display_id:
-        src = p.get("assignment_source", "")
-        if identity_valid and src:
-            return f"{display_id} {src}"
-        return str(display_id)
-    if identity_valid:
-        pid = p.get("playerId") or f"P{p.get('trackId', '?')}"
-        src = p.get("assignment_source", "?")
-        return f"{pid} {src}"
+        return None  # silent — refs get a thin box only
+    pid = p.get("playerId") or p.get("displayId")
+    if pid:
+        return str(pid)
+    if p.get("identity_valid", False):
+        tid = p.get("trackId", "?")
+        return f"P{tid}"
     if p.get("assignment_pending", False):
         return "?"
     return None
 
 
-def draw_annotations(frame, players, frame_idx, summary_overlay=None):
-    for p in players:
+def draw_annotations(frame, entries, frame_idx, team_map, summary_overlay=None):
+    for p in entries:
         bbox = p.get("bbox")
         if not bbox or len(bbox) != 4:
             continue
         x1, y1, x2, y2 = map(int, bbox)
-        color = _color_for(p)
-        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+        color = _team_color(p, team_map)
+        style, thickness = _stroke_for(p)
+        _draw_rect(frame, x1, y1, x2, y2, color, style, thickness)
         label = _label_for(p)
         if label:
+            # White pill with team-color text, drawn just below the bbox top
+            (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)
+            pad = 3
+            bx1, by1 = x1, max(y1 - th - 2 * pad, 0)
+            bx2, by2 = x1 + tw + 2 * pad, by1 + th + 2 * pad
+            cv2.rectangle(frame, (bx1, by1), (bx2, by2), color, -1)
             cv2.putText(
-                frame, label, (x1, max(y1 - 5, 0)),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2,
+                frame, label, (bx1 + pad, by2 - pad),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2,
             )
 
     cv2.putText(
@@ -81,6 +128,28 @@ def draw_annotations(frame, players, frame_idx, summary_overlay=None):
             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1,
         )
     return frame
+
+
+def _load_team_map(results_json):
+    """Find team_results.json next to track_results.json and build {trackId: team}."""
+    p = Path(results_json).parent.parent / "tracking" / "team_results.json"
+    if not p.exists():
+        # Sometimes results_json is already in tracking/, try sibling
+        p = Path(results_json).parent / "team_results.json"
+    if not p.exists():
+        return {}
+    try:
+        with open(p) as f:
+            data = json.load(f)
+        out = {}
+        for entry in data.get("tracks", []) or data.get("teams", []) or []:
+            tid = entry.get("trackId") or entry.get("track_id")
+            team = entry.get("teamId") if "teamId" in entry else entry.get("team_id")
+            if tid is not None:
+                out[int(tid)] = team
+        return out
+    except Exception:
+        return {}
 
 
 def render_video(video_path, results_json, output_path,
@@ -97,7 +166,16 @@ def render_video(video_path, results_json, output_path,
     with open(results_json) as f:
         data = json.load(f)
 
-    frames_data = {f["frameIndex"]: f["players"] for f in data.get("frames", [])}
+    team_map = _load_team_map(results_json)
+
+    # Combine players + officials per frame; officials get is_official tag preserved
+    frames_data = {}
+    for frec in data.get("frames", []):
+        idx = frec["frameIndex"]
+        entries = list(frec.get("players", []))
+        for o in frec.get("officials", []):
+            entries.append({**o, "is_official": True})
+        frames_data[idx] = entries
 
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     fps = cap.get(cv2.CAP_PROP_FPS)
@@ -115,16 +193,17 @@ def render_video(video_path, results_json, output_path,
         ret, frame = cap.read()
         if not ret:
             break
-        players = frames_data.get(frame_idx, [])
-        n_locked = sum(1 for p in players if p.get("assignment_source") == "locked")
-        n_revived = sum(1 for p in players if p.get("assignment_source") == "revived")
-        n_hung = sum(1 for p in players if p.get("assignment_source") == "hungarian")
-        n_unassigned = sum(1 for p in players if not p.get("identity_valid", False))
+        entries = frames_data.get(frame_idx, [])
+        n_locked = sum(1 for p in entries if p.get("assignment_source") == "locked")
+        n_revived = sum(1 for p in entries if p.get("assignment_source") == "revived")
+        n_hung = sum(1 for p in entries if p.get("assignment_source") == "hungarian")
+        n_unassigned = sum(1 for p in entries if not p.get("identity_valid", False) and not p.get("is_official", False))
+        n_refs = sum(1 for p in entries if p.get("is_official", False))
         overlay = (
             f"locked={n_locked} revived={n_revived} "
-            f"hungarian={n_hung} uncertain={n_unassigned}"
+            f"hungarian={n_hung} uncertain={n_unassigned} refs={n_refs}"
         )
-        annotated = draw_annotations(frame, players, frame_idx, overlay)
+        annotated = draw_annotations(frame, entries, frame_idx, team_map, overlay)
         out.write(annotated)
         if frame_dir and frame_idx in sample_set:
             cv2.imwrite(str(Path(frame_dir) / f"frame_{frame_idx:05d}.jpg"), annotated)
