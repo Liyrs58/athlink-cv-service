@@ -140,6 +140,11 @@ class ReIDExtractor:
             print(f"[ReID] ResNet50 failed: {e}")
             self.model = None
 
+    def _zero_tensor(self) -> torch.Tensor:
+        """Zero crop matching whatever Resize the active transform uses (OSNet 256x128 or ResNet 128x128)."""
+        h, w = self.transform.transforms[1].size
+        return torch.zeros(3, h, w)
+
     def extract(self, crops: list) -> list:
         """Returns list of L2-normalised numpy arrays, one per crop."""
         if self.model is None or not crops:
@@ -151,12 +156,12 @@ class ReIDExtractor:
             tensors = []
             for c in batch_crops:
                 if c is None or c.size == 0:
-                    tensors.append(torch.zeros(3, *self.transform.transforms[1].size[::-1]))
+                    tensors.append(self._zero_tensor())
                 else:
                     try:
                         tensors.append(self.transform(c))
                     except Exception:
-                        tensors.append(torch.zeros(3, 128, 128))
+                        tensors.append(self._zero_tensor())
             batch_tensor = torch.stack(tensors).to(self.device)
             with torch.no_grad():
                 feat = self.model(batch_tensor)
@@ -760,6 +765,27 @@ class TrackerCore:
                     "identity_valid": identity_valid,
                     "assignment_source": source,
                     "identity_confidence": identity_confidence,
+                    "is_official": False,
+                })
+
+            for ofc in self._officials_this_frame:
+                ox1, oy1, ox2, oy2 = ofc.bbox
+                players.append({
+                    "trackId": int(ofc.track_id),
+                    "rawTrackId": int(ofc.track_id),
+                    "playerId": None,
+                    "displayId": None,
+                    "assignment_pending": False,
+                    "bbox": [float(ox1), float(oy1), float(ox2), float(oy2)],
+                    "confidence": float(ofc.score),
+                    "class": int(ofc.cls),
+                    "gameState": state.value,
+                    "analysis_valid": True,
+                    "crop_quality": 1.0,
+                    "identity_valid": False,
+                    "assignment_source": "official",
+                    "identity_confidence": 0.0,
+                    "is_official": True,
                 })
 
             self.results.append({

@@ -18,9 +18,12 @@ GREEN = (0, 200, 0)
 YELLOW = (0, 220, 255)
 GREY = (128, 128, 128)
 RED = (0, 0, 255)
+ORANGE = (0, 165, 255)
 
 
 def _color_for(p):
+    if p.get("is_official", False):
+        return ORANGE
     if not p.get("identity_valid", False):
         return GREY
     src = p.get("assignment_source", "")
@@ -30,6 +33,8 @@ def _color_for(p):
 
 
 def _label_for(p):
+    if p.get("is_official", False):
+        return "REF"
     display_id = p.get("displayId")
     identity_valid = p.get("identity_valid", False)
     if isinstance(display_id, str) and display_id.startswith("U T"):
