@@ -790,13 +790,14 @@ def _run_tracking_impl(
     homography_found = False
 
     # FIX 4: Standalone BoT-SORT tracker for state-managed coasting
-    import boxmot
+    from boxmot.trackers.botsort import BoTSORT
     # ReID model initialization (OSNet) — FIX 1: Force x1_0 for better discrimination
     reid_model_path = Path("models/osnet_x1_0_msmt17.pt")
-    tracker = boxmot.BotSort(
-        reid_weights=reid_model_path,
+    tracker = BoTSORT(
+        model_weights=reid_model_path,
         device=_detect_device(),
         half=_use_half,
+        per_class=False,
     )
     logger.info(f"ReID model loaded: {reid_model_path}")
     print(f"✓ ReID model initialized: {reid_model_path}")
