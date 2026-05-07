@@ -12,7 +12,7 @@ Label format:
 
 import cv2
 import json
-from pathlib import Path
+from pathlib import Path  # noqa: F401
 
 GREEN = (0, 200, 0)
 YELLOW = (0, 220, 255)
@@ -78,7 +78,13 @@ def draw_annotations(frame, players, frame_idx, summary_overlay=None):
     return frame
 
 
-def render_video(video_path, results_json, output_path):
+def render_video(video_path, results_json, output_path,
+                 frame_dir=None, sample_frames=None, verbose=False, **_kwargs):
+    """
+    Render annotated video.
+    Optional frame_dir + sample_frames extracts JPGs at those frame indices.
+    Extra kwargs are accepted for forward-compat with notebook callers.
+    """
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
         raise FileNotFoundError(f"Video not found: {video_path}")
@@ -94,7 +100,12 @@ def render_video(video_path, results_json, output_path):
     h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     out = cv2.VideoWriter(str(output_path), fourcc, fps, (w, h))
 
+    sample_set = set(sample_frames or [])
+    if frame_dir and sample_set:
+        Path(frame_dir).mkdir(parents=True, exist_ok=True)
+
     frame_idx = 0
+    extracted = 0
     while True:
         ret, frame = cap.read()
         if not ret:
@@ -108,12 +119,19 @@ def render_video(video_path, results_json, output_path):
             f"locked={n_locked} revived={n_revived} "
             f"hungarian={n_hung} uncertain={n_unassigned}"
         )
-        frame = draw_annotations(frame, players, frame_idx, overlay)
-        out.write(frame)
+        annotated = draw_annotations(frame, players, frame_idx, overlay)
+        out.write(annotated)
+        if frame_dir and frame_idx in sample_set:
+            cv2.imwrite(str(Path(frame_dir) / f"frame_{frame_idx:05d}.jpg"), annotated)
+            extracted += 1
         frame_idx += 1
 
     cap.release()
     out.release()
+    if verbose:
+        print(f"[render_video] {frame_idx} frames written to {output_path}")
+        if extracted:
+            print(f"[render_video] {extracted} sample frames saved to {frame_dir}")
     print(f"Annotated video saved to {output_path}")
 
 

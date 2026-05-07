@@ -51,14 +51,14 @@ DORMANT_TTL = 180
 MAX_SLOTS = 22
 COST_REJECT_THRESHOLD = 0.72
 REVIVAL_COST_THRESHOLD = 0.60
-SOFT_REVIVE_COST_MAX = 0.20
-SOFT_REVIVE_AUTO_ACCEPT_COST = 0.10
-SOFT_REVIVE_MARGIN_MIN = 0.015
+SOFT_REVIVE_COST_MAX = 0.30
+SOFT_REVIVE_AUTO_ACCEPT_COST = 0.15
+SOFT_REVIVE_MARGIN_MIN = 0.005
 SCENE_REVIVE_WINDOW = 90
-SCENE_REVIVE_COST_MAX = 0.25
-SCENE_REVIVE_MARGIN_MIN = 0.010
-SCENE_REVIVE_FORCE_COST_MAX = 0.50
-RECOVERY_PATCH_ID = "reid-recovery-v2-freeze-snapshot-lock-relink"
+SCENE_REVIVE_COST_MAX = 0.30
+SCENE_REVIVE_MARGIN_MIN = 0.005
+SCENE_REVIVE_FORCE_COST_MAX = 0.35
+RECOVERY_PATCH_ID = "reid-recovery-v3-relax-revive-tighten-force"
 LOW_CONFIDENCE_THRESHOLD = 0.55
 EMB_ALPHA = 0.25
 STABLE_PROTECT_THRESHOLD = 10
@@ -161,8 +161,15 @@ class IdentityCore:
     # ------------------------------------------------------------------
 
     def _recovery_lock_protected(self, lock) -> bool:
-        """True when restricted and the existing lock was freshly revived — must not be stolen."""
-        return self._identity_restricted and lock is not None and lock.source == "revived"
+        """
+        True when restricted AND the existing lock was FRESHLY revived (stable<30) —
+        protects against takeover bouncing between candidates while a revival settles.
+        Once stable_count >= 30 (~1s @ 30fps), the lock has earned its identity and a
+        new revival decision (with cost+margin already vetted) is allowed to relink it.
+        """
+        if not self._identity_restricted or lock is None or lock.source != "revived":
+            return False
+        return lock.stable_count < 30
 
     def _relink_absent_existing_lock(self, pid: str, old_tid: Optional[int], new_tid: int,
                                      source: str, cost: float) -> bool:
@@ -225,10 +232,10 @@ class IdentityCore:
             progress = max(0.0, min(1.0, (self.frame_id - self._scene_reset_frame) / float(max_window)))
 
         if progress < 0.33:
-            return 0.18, 0.020
+            return 0.22, 0.010
         if progress < 0.66:
-            return 0.22, 0.012
-        return 0.30, 0.005
+            return 0.28, 0.005
+        return 0.32, 0.003
 
     @staticmethod
     def _revive_margin_ok(cost: float, margin: Optional[float], cost_max: float,
@@ -701,14 +708,30 @@ class IdentityCore:
         used_tids: Set[int] = set()
         used_pids: Set[str] = set()
 
+        force_rejected = 0
         for r, c in sorted(zip(r_idx, c_idx), key=lambda rc: cost[rc[0], rc[1]]):
             cst = float(cost[r, c])
+            # Hard cap — anything above is unreliable, leave UNKNOWN instead
             if cst > SCENE_REVIVE_FORCE_COST_MAX:
+                force_rejected += 1
+                print(f"[ForceCommitReject] frame={self.frame_id} cost={cst:.3f} > "
+                      f"max={SCENE_REVIVE_FORCE_COST_MAX:.3f} (kept UNKNOWN)")
                 continue
             tid = track_ids[r]
             pid = snap_pids[c]
             if tid in used_tids or pid in used_pids:
                 continue
+            # Margin check: refuse forced commits when 2nd-best is too close
+            row_costs = cost[r, :]
+            valid_row = row_costs[row_costs < 1e2]
+            if len(valid_row) >= 2:
+                sorted_row = np.sort(valid_row)
+                margin = float(sorted_row[1] - sorted_row[0])
+                if margin < 0.020:
+                    force_rejected += 1
+                    print(f"[ForceCommitReject] frame={self.frame_id} pid={pid} tid={tid} "
+                          f"cost={cst:.3f} margin={margin:.3f} reason=ambiguous")
+                    continue
             existing_lk = self.locks.get_lock(tid)
             if existing_lk is not None and existing_lk.pid != pid:
                 continue
@@ -725,6 +748,8 @@ class IdentityCore:
             used_pids.add(pid)
             self.revived_count += 1
             print(f"[ForceCommit] frame={self.frame_id} pid={pid} tid={tid} cost={cst:.3f}")
+        if force_rejected and self.frame_id % 5 == 0:
+            print(f"[ForceCommitSummary] frame={self.frame_id} rejected={force_rejected}")
 
         return revived, meta
 
