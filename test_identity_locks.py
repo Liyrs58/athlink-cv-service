@@ -80,7 +80,7 @@ def test_scene_revival_rejects_recovery_lock_protected():
 
     # Plant a revived lock for P2 → tid 126
     plant_revived_lock(ic.locks, tid=126, pid="P2", frame=829)
-    ic.locks.in_restricted = True
+    ic.begin_frame(832, present_tids={126, 130})
 
     # Build a minimal bench snapshot with P2 entry
     import numpy as np
@@ -108,6 +108,44 @@ def test_scene_revival_rejects_recovery_lock_protected():
     assert 130 not in revived, "tid=130 should NOT steal P2 from restricted revived lock"
     assert ic.ambiguous_rejects >= 1, "ambiguous_rejects should increment for recovery_lock_protected"
     print("PASS test_scene_revival_rejects_recovery_lock_protected")
+
+
+def test_scene_revival_relinks_absent_recovery_lock():
+    class FakeTrack:
+        def __init__(self, tid): self.track_id = tid
+
+    import numpy as np
+    ic = IdentityCore()
+    ic.in_scene_recovery = True
+    ic.frame_id = 832
+
+    plant_revived_lock(ic.locks, tid=126, pid="P2", frame=829)
+    before_created = ic.locks.locks_created
+    ic.begin_frame(832, present_tids={130})
+
+    snap_emb = np.random.randn(512).astype(np.float32)
+    snap_emb /= np.linalg.norm(snap_emb)
+    ic._bench_snapshot = {
+        "P2": {
+            "embedding": snap_emb,
+            "position": (0.5, 0.5),
+            "pitch": (0.5, 0.5),
+            "team_id": 0,
+            "last_seen": 800,
+        }
+    }
+    ic.team_labels = {130: 0}
+
+    revived, meta = ic.revive_cost_matrix(
+        [FakeTrack(130)], {130: snap_emb.copy()}, {130: (0.5, 0.5)}
+    )
+
+    assert revived == {130: "P2"}
+    assert meta[130].identity_valid is True
+    assert ic.locks.get_tid_for_pid("P2") == 130
+    assert ic.locks.locks_created == before_created
+    assert ic.locks.identity_switches == 0
+    print("PASS test_scene_revival_relinks_absent_recovery_lock")
 
 
 # ── Test 4: _recovery_lock_protected helper logic ────────────────────
@@ -211,15 +249,59 @@ def test_recent_dormant_lock_revives_without_new_churn():
     print("PASS test_recent_dormant_lock_revives_without_new_churn")
 
 
+def test_scene_reset_preserves_locks_for_recovery():
+    ic = IdentityCore()
+    lk, status = ic.locks.try_create_lock(
+        10, "P1", "hungarian", 100, 0.1,
+        allow_takeover=True, allow_rebind=True,
+    )
+    assert lk is not None and status == "created"
+    before_created = ic.locks.locks_created
+
+    ic.reset_for_scene(frame_id=549)
+
+    assert ic.locks.get_tid_for_pid("P1") == 10
+    assert ic.locks.locks_created == before_created
+    assert ic.in_scene_recovery is True
+    print("PASS test_scene_reset_preserves_locks_for_recovery")
+
+
+def test_freeze_entry_snapshot_merges_with_existing_snapshot():
+    import numpy as np
+    ic = IdentityCore()
+    old = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+    new = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+    ic._bench_snapshot = {
+        "P1": {"embedding": old.copy(), "position": (1, 1), "pitch": None, "team_id": None, "last_seen": 100},
+        "P2": {"embedding": old.copy(), "position": (2, 2), "pitch": None, "team_id": None, "last_seen": 100},
+    }
+    slot = ic._slot_by_pid("P1")
+    assert slot is not None
+    slot.state = "lost"
+    slot.embedding = new.copy()
+    slot.last_position = (9, 9)
+    slot.last_seen_frame = 540
+
+    saved = ic.snapshot_scene(549, merge_existing=True)
+
+    assert saved == 2
+    assert tuple(ic._bench_snapshot["P1"]["position"]) == (9, 9)
+    assert tuple(ic._bench_snapshot["P2"]["position"]) == (2, 2)
+    print("PASS test_freeze_entry_snapshot_merges_with_existing_snapshot")
+
+
 # ── runner ───────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     test_revived_lock_blocked_during_restricted()
     test_revived_lock_takeover_allowed_after_recovery()
     test_scene_revival_rejects_recovery_lock_protected()
+    test_scene_revival_relinks_absent_recovery_lock()
     test_recovery_lock_protected_helper()
     test_low_cost_soft_revive_bypasses_tight_margin()
     test_force_commit_remaining_scene_slot()
     test_renderer_never_labels_raw_tracker_ids()
     test_recent_dormant_lock_revives_without_new_churn()
+    test_scene_reset_preserves_locks_for_recovery()
+    test_freeze_entry_snapshot_merges_with_existing_snapshot()
     print("\nAll tests PASS")

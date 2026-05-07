@@ -10,6 +10,7 @@ import sys
 import os
 import cv2
 import json
+import subprocess
 from pathlib import Path
 
 print("=" * 70)
@@ -28,8 +29,21 @@ sys.path.insert(0, '/content/athlink-cv-service')
 print("✓ Working directory: /content/athlink-cv-service")
 print("✓ Python path configured\n")
 
-# Import tracker
+# Colab keeps imported modules alive across cells. Purge service modules so a
+# git pull/checkout actually takes effect without a full runtime restart.
+for module_name in list(sys.modules):
+    if module_name == "services" or module_name.startswith("services."):
+        del sys.modules[module_name]
+
+try:
+    head = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+except Exception as exc:
+    head = f"unknown ({exc})"
+print(f"✓ Git HEAD: {head}")
+
+# Import tracker after the cache purge.
 from services.tracker_core import run_tracking
+print(f"✓ Tracker source: {run_tracking.__code__.co_filename}")
 
 print("=" * 70)
 print("RUNNING TRACKING PIPELINE")

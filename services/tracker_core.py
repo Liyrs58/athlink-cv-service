@@ -204,6 +204,7 @@ class TrackerCore:
         self._needs_scene_revival = False
         self._scene_revival_frames_left = 0   # keep trying scene revival for N frames
         self._scene_reset_at_frame = -1   # guard hard-collapse for 30 frames post-reset
+        self._in_freeze_segment = False
 
         # Scene state tracking
         self._active_baseline = 0
@@ -358,8 +359,10 @@ class TrackerCore:
         state = self.vlm.analyze(frame, video_frame)
         is_freeze = state.is_freeze()
         is_play = state.is_play()
+        entered_freeze = is_freeze and not self._in_freeze_segment
 
         if is_freeze:
+            self._in_freeze_segment = True
             self._needs_scene_reset = True
 
         # Bug #3: Reset tracker on freeze→play transition (purge ghost tracks)
@@ -382,14 +385,15 @@ class TrackerCore:
             if self._active_baseline == 0.0:
                 self._active_baseline = 18.0
             print(f"[SoftStateReset] Frame {video_frame}: mode=normal baseline={self._active_baseline:.1f} low_streak=0 recovery_left=0")
-            print(f"[Reset] Frame {video_frame}: freeze→play, tracker + identity reset")
+            print(f"[Reset] Frame {video_frame}: freeze→play, tracker reset + identity recovery")
             self._needs_scene_reset = False
+            self._in_freeze_segment = False
             
-        # BUG FIX A: Snapshot on freeze entry
-        if is_freeze and not self._scene_snapshot_taken:
-            saved = self.identity.snapshot_scene(video_frame)
+        # Freeze-entry snapshot must refresh even if a prior hard-collapse snapshot exists.
+        if entered_freeze:
+            saved = self.identity.snapshot_scene(video_frame, merge_existing=True)
             self._scene_snapshot_taken = True
-            print(f"[Snapshot] Frame {video_frame}: freeze entry saved {saved} slots")
+            print(f"[Snapshot] Frame {video_frame}: freeze entry refreshed {saved} slots")
 
         # Run tracker (always except hard freeze)
         if not is_freeze:

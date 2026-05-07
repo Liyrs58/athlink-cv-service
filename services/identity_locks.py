@@ -101,6 +101,47 @@ class IdentityLockManager:
         lk = self._tid_to_lock.get(tid)
         return lk.ttl if lk else 0
 
+    def relink_absent_lock(
+        self,
+        old_tid: int,
+        new_tid: int,
+        pid: str,
+        frame_id: int,
+        source: str = "revived",
+        confidence: float = 0.0,
+        ttl: Optional[int] = None,
+    ) -> Tuple[Optional[IdentityLock], str]:
+        """
+        Move a reserved PID from an absent tracker id to the current tracker id.
+
+        This is not a visual identity switch: the old tracker id is no longer present,
+        so the lock is following the same PID across a tracker reset/fragment.
+        """
+        lk = self._tid_to_lock.get(old_tid)
+        if lk is None or lk.pid != pid:
+            return None, "missing_old_lock"
+
+        existing_new = self._tid_to_lock.get(new_tid)
+        if existing_new is not None and existing_new.pid != pid:
+            return None, "blocked_new_tid_owned"
+
+        self._tid_to_lock.pop(old_tid, None)
+        lk.track_id = new_tid
+        lk.source = source
+        lk.confidence = confidence
+        lk.stable_count = max(1, lk.stable_count)
+        lk.last_seen_frame = frame_id
+        lk.ttl = ttl if ttl is not None else LOCK_REVIVED_TTL
+        lk.dormant = False
+        lk.dormant_since_frame = -1
+        self._tid_to_lock[new_tid] = lk
+        self._pid_to_tid[pid] = new_tid
+        print(
+            f"[IDLockRelink] frame={frame_id} pid={pid} old_tid={old_tid} "
+            f"new_tid={new_tid} reason=absent_tracker_fragment"
+        )
+        return lk, "relinked_absent"
+
     # ------------------------------------------------------------------
     # Create / refresh / release
     # ------------------------------------------------------------------

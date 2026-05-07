@@ -58,6 +58,7 @@ SCENE_REVIVE_WINDOW = 90
 SCENE_REVIVE_COST_MAX = 0.25
 SCENE_REVIVE_MARGIN_MIN = 0.010
 SCENE_REVIVE_FORCE_COST_MAX = 0.50
+RECOVERY_PATCH_ID = "reid-recovery-v2-freeze-snapshot-lock-relink"
 LOW_CONFIDENCE_THRESHOLD = 0.55
 EMB_ALPHA = 0.25
 STABLE_PROTECT_THRESHOLD = 10
@@ -138,8 +139,15 @@ class IdentityCore:
         self.pitch_positions: Dict[int, Tuple[float, float]] = {}
         self.team_labels: Dict[int, Optional[int]] = {}
         self.reid_mode: str = "HSV-fallback"
+        self._present_tids: Set[int] = set()
 
         self.locks = IdentityLockManager(logger=logger)
+        print(
+            f"[ReIDPatch] id={RECOVERY_PATCH_ID} file={__file__} "
+            f"soft_auto={SOFT_REVIVE_AUTO_ACCEPT_COST:.2f} "
+            f"soft_margin={SOFT_REVIVE_MARGIN_MIN:.3f} "
+            f"scene_window={SCENE_REVIVE_WINDOW} force_commit={SCENE_REVIVE_FORCE_COST_MAX:.2f}"
+        )
 
         # Run-level metrics
         self.recovery_normal_assignments: int = 0
@@ -155,6 +163,34 @@ class IdentityCore:
     def _recovery_lock_protected(self, lock) -> bool:
         """True when restricted and the existing lock was freshly revived — must not be stolen."""
         return self._identity_restricted and lock is not None and lock.source == "revived"
+
+    def _relink_absent_existing_lock(self, pid: str, old_tid: Optional[int], new_tid: int,
+                                     source: str, cost: float) -> bool:
+        """Relink a reserved PID when its previous tracker id is absent from this frame."""
+        if old_tid is None or old_tid == new_tid or not self._identity_restricted:
+            return False
+        existing_lk = self.locks.get_lock(old_tid)
+        if existing_lk is None or old_tid in self._present_tids:
+            return False
+        lk, status = self.locks.relink_absent_lock(
+            old_tid=old_tid,
+            new_tid=new_tid,
+            pid=pid,
+            frame_id=self.frame_id,
+            source="revived",
+            confidence=cost,
+        )
+        if lk is None:
+            print(
+                f"[{source}ReviveRelinkBlocked] frame={self.frame_id} pid={pid} "
+                f"old_tid={old_tid} new_tid={new_tid} status={status}"
+            )
+            return False
+        print(
+            f"[{source}ReviveRelink] frame={self.frame_id} pid={pid} "
+            f"old_tid={old_tid} new_tid={new_tid} cost={cost:.3f}"
+        )
+        return True
 
     @property
     def _identity_restricted(self) -> bool:
@@ -226,7 +262,9 @@ class IdentityCore:
         else:
             print("[Identity] Reset: No snapshot exists to survive reset.")
 
-        self.locks.reset_all()
+        preserved = len(self.locks.locked_tids())
+        if preserved:
+            print(f"[IDLockFreeze] frame={frame_id} preserving {preserved} locks for scene recovery")
         self._recovery_frames_left = 60
         self.in_soft_collapse = False
         self.in_soft_recovery = False
@@ -255,7 +293,10 @@ class IdentityCore:
         self.locks.in_restricted = restricted
         self.locks.in_collapse = self.in_soft_collapse
         if present_tids is not None:
+            self._present_tids = set(present_tids)
             self.locks.tick(frame_id, present_tids, restricted=restricted)
+        else:
+            self._present_tids = set()
 
     # ------------------------------------------------------------------
     # assign_tracks — single entry point every frame
@@ -463,10 +504,12 @@ class IdentityCore:
     # Snapshots
     # ------------------------------------------------------------------
 
-    def snapshot_scene(self, frame_id: int) -> int:
+    def snapshot_scene(self, frame_id: int, merge_existing: bool = False) -> int:
         candidate = {}
         for s in self.slots:
-            if s.state in ("active", "dormant") and s.embedding is not None:
+            if s.embedding is None:
+                continue
+            if merge_existing or s.state in ("active", "dormant"):
                 candidate[s.pid] = {
                     "embedding": s.embedding.copy(),
                     "position": s.last_position,
@@ -480,9 +523,22 @@ class IdentityCore:
                 f" — keeping {len(self._bench_snapshot)} from earlier snapshot"
             )
             return len(self._bench_snapshot)
+        retained = 0
+        if merge_existing and self._bench_snapshot:
+            merged = dict(self._bench_snapshot)
+            retained = len([pid for pid in merged if pid not in candidate])
+            merged.update(candidate)
+            candidate = merged
         self._bench_snapshot = candidate
         saved = len(self._bench_snapshot)
-        print(f"[Identity] SceneSnapshot: {saved} slots saved at frame {frame_id}")
+        if merge_existing:
+            fresh = saved - retained
+            print(
+                f"[Identity] SceneSnapshot: {saved} slots saved at frame {frame_id} "
+                f"(fresh={fresh} retained={retained})"
+            )
+        else:
+            print(f"[Identity] SceneSnapshot: {saved} slots saved at frame {frame_id}")
         return saved
 
     def snapshot_soft(self, frame_id: int) -> int:
@@ -574,13 +630,17 @@ class IdentityCore:
             existing_tid = self.locks.get_tid_for_pid(pid)
             if existing_tid is not None and existing_tid != tid:
                 existing_lk = self.locks.get_lock(existing_tid)
-                if self._recovery_lock_protected(existing_lk):
+                relinked = self._relink_absent_existing_lock(pid, existing_tid, tid, "Scene", cst)
+                if relinked:
+                    existing_lk = self.locks.get_lock(tid)
+                elif self._recovery_lock_protected(existing_lk):
                     print(f"[SceneReviveReject] pid={pid} old_tid={existing_tid} "
                           f"new_tid={tid} reason=recovery_lock_protected")
                     note_reject("recovery_lock_protected")
                     self.ambiguous_rejects += 1
                     continue
-                if existing_lk and existing_lk.stable_count >= STABLE_PROTECT_THRESHOLD:
+                if (not relinked and existing_lk
+                        and existing_lk.stable_count >= STABLE_PROTECT_THRESHOLD):
                     print(f"[SceneReviveReject] pid={pid} old_tid={existing_tid} "
                           f"new_tid={tid} reason=stable_lock_protected")
                     note_reject("stable_lock_protected")
@@ -623,7 +683,10 @@ class IdentityCore:
         remaining_snap = {
             pid: snap
             for pid, snap in self._bench_snapshot.items()
-            if not self.locks.is_pid_locked(pid)
+            if (
+                not self.locks.is_pid_locked(pid)
+                or self.locks.get_tid_for_pid(pid) not in self._present_tids
+            )
             and (self._slot_by_pid(pid) is None or not self._slot_by_pid(pid).seen_this_frame)
         }
         if not remaining_snap or len(tracks) == 0:
@@ -749,13 +812,17 @@ class IdentityCore:
             existing_tid = self.locks.get_tid_for_pid(pid)
             if existing_tid is not None and existing_tid != tid:
                 existing_lk = self.locks.get_lock(existing_tid)
-                if self._recovery_lock_protected(existing_lk):
+                relinked = self._relink_absent_existing_lock(pid, existing_tid, tid, "Soft", cst)
+                if relinked:
+                    existing_lk = self.locks.get_lock(tid)
+                elif self._recovery_lock_protected(existing_lk):
                     print(f"[SoftReviveReject] pid={pid} old_tid={existing_tid} "
                           f"new_tid={tid} reason=recovery_lock_protected")
                     self.locks.soft_recovery_rebinds_blocked += 1
                     self.ambiguous_rejects += 1
                     continue
-                if existing_lk and existing_lk.stable_count >= STABLE_PROTECT_THRESHOLD:
+                if (not relinked and existing_lk
+                        and existing_lk.stable_count >= STABLE_PROTECT_THRESHOLD):
                     print(f"[SoftReviveReject] pid={pid} old_tid={existing_tid} "
                           f"new_tid={tid} reason=stable_lock_protected stable={existing_lk.stable_count}")
                     self.locks.soft_recovery_rebinds_blocked += 1
@@ -787,10 +854,10 @@ class IdentityCore:
         if is_first_recovery_frame:
             debug_costs.sort(key=lambda x: x["cost"])
             for d in debug_costs[:8]:
-                accepted = d["cost"] <= SOFT_REVIVE_COST_MAX
+                cost_ok = d["cost"] <= SOFT_REVIVE_COST_MAX
                 print(f"[SoftReviveCost] tid={d['tid']} pid={d['pid']} "
                       f"cost={d['cost']:.3f} emb={d['emb']:.3f} pos={d['pos']:.3f} "
-                      f"accepted={accepted}")
+                      f"cost_ok={cost_ok}")
         return revived, meta
 
     def _snapshot_cost_matrix(
@@ -851,7 +918,12 @@ class IdentityCore:
         allow_over = True
         if existing_tid is not None and existing_tid != tid:
             existing_lk = self.locks.get_lock(existing_tid)
-            if existing_lk and existing_lk.stable_count >= STABLE_PROTECT_THRESHOLD:
+            relinked = self._relink_absent_existing_lock(
+                pid, existing_tid, tid, "Apply", cost
+            )
+            if relinked:
+                existing_lk = self.locks.get_lock(tid)
+            elif existing_lk and existing_lk.stable_count >= STABLE_PROTECT_THRESHOLD:
                 allow_over = False
 
         lk_result, lk_status = self.locks.try_create_lock(
