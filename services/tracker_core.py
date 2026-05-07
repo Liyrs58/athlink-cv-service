@@ -223,6 +223,7 @@ class TrackerCore:
 
         # Officials tracking for output
         self._officials_this_frame = []
+        self._suspected_officials_this_frame = []  # held-back tracks (ref-leaning, unconfirmed)
 
         self.frame_idx = 0
         self.results = []
@@ -436,10 +437,13 @@ class TrackerCore:
             print(f"[TrackerCore] F{video_frame}: {stale_suppressed} stale tracks suppressed from render/assign")
 
         # ── Prompt 10: Filter out referees/officials (ENABLED — smart v2) ──
-        filtered_tracks, self._officials_this_frame = self.role_filter.filter(
+        # `suspected` are tracks with ref-leaning votes but not yet confirmed; we
+        # drop them entirely from this frame to avoid transient P-id leakage.
+        filtered_tracks, self._officials_this_frame, suspected_officials = self.role_filter.filter(
             visible_tracks, frame, video_frame
         )
         player_tracks = filtered_tracks
+        self._suspected_officials_this_frame = suspected_officials
         # ── Prompt 11: Score crop quality for each track ──
         quality_scores = self.crop_quality.score_batch(player_tracks, frame, video_frame)
         self.crop_quality.maybe_log(video_frame)
@@ -893,6 +897,26 @@ def run_tracking(video_path, job_id, frame_stride=1, max_frames=None, device="cp
     if summary['excessive_lock_churn']:
         print(f"[IdentityWarning] excessive lock churn: {summary['locks_created']} locks created (target ≤40)")
     print("=" * 60)
+
+    # Persist identity metrics next to track_results.json so phase 2 match_report
+    # can read them without re-parsing logs.
+    try:
+        import json as _json
+        metrics_path = Path(f"temp/{job_id}/tracking/identity_metrics.json")
+        metrics_path.parent.mkdir(parents=True, exist_ok=True)
+        metrics_payload = {
+            **{k: v for k, v in summary.items()},
+            "valid_identity_frames": valid,
+            "unknown_boxes": invalid,
+            "valid_id_coverage": valid_id_coverage,
+            "frames_in_collapse": getattr(tracker, "_frames_in_collapse", 0),
+            "frames_processed": processed,
+        }
+        with open(metrics_path, "w") as fh:
+            _json.dump(metrics_payload, fh, indent=2, default=str)
+        print(f"[IdentityMetrics] persisted to {metrics_path}")
+    except Exception as e:
+        print(f"[IdentityMetrics] persist failed: {e}")
 
     print(f"Done. Video frames: {video_frame}, processed: {processed}")
     return tracker.results

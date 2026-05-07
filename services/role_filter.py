@@ -62,7 +62,7 @@ class RoleFilter:
         self.black_ratio_thresh = cfg.get("black_ratio_thresh", 0.55)
         self.team_exclusion_dist = cfg.get("team_exclusion_dist", 0.40)
         self.edge_margin_frac = cfg.get("edge_margin_frac", 0.08)
-        self.min_frames_to_filter = cfg.get("min_frames_to_filter", 3)
+        self.min_frames_to_filter = cfg.get("min_frames_to_filter", 2)
         self.referee_confidence_thresh = cfg.get("referee_confidence_thresh", 0.70)
         self.log_interval = cfg.get("log_interval", 30)
 
@@ -81,18 +81,22 @@ class RoleFilter:
 
     def filter(
         self, tracks: list, frame: np.ndarray, frame_id: int = 0
-    ) -> Tuple[list, list]:
+    ) -> Tuple[list, list, list]:
         """
-        Classify tracks as player vs official.
+        Classify tracks as player / official / suspected_official.
+
+        suspected_official: at least one ref-leaning frame but not yet enough votes
+        to commit. Held back from BOTH the identity layer and the rendered output
+        for the current frame so refs cannot get a transient P-id during ramp-up.
 
         Returns:
-            (player_tracks, official_tracks)
+            (player_tracks, official_tracks, suspected_official_tracks)
         """
         if len(tracks) == 0:
-            return tracks, []
+            return tracks, [], []
 
         h, w = frame.shape[:2]
-        players, officials = [], []
+        players, officials, suspected = [], [], []
 
         for t in tracks:
             tid = t.track_id
@@ -170,20 +174,27 @@ class RoleFilter:
                     players.append(t)
                     continue
 
-            # Not enough evidence yet — assume player (conservative)
-            players.append(t)
+            # Not enough evidence yet. If we've seen ANY ref-leaning frame,
+            # hold back as "suspected" so the identity layer doesn't issue
+            # a transient P-id to a referee during the first 1-2 frames.
+            if ev["ref_votes"] >= 1:
+                suspected.append(t)
+            else:
+                players.append(t)
 
         # Periodic logging
         n_officials = len(officials)
-        if frame_id % self.log_interval == 0 and n_officials > 0:
+        n_suspected = len(suspected)
+        if frame_id % self.log_interval == 0 and (n_officials > 0 or n_suspected > 0):
             ref_ids = [t.track_id for t in officials]
+            sus_ids = [t.track_id for t in suspected]
             print(
                 f"[RoleFilter F{frame_id}] input={len(tracks)} "
                 f"players={len(players)} officials={n_officials} "
-                f"ref_ids={ref_ids}"
+                f"suspected={n_suspected} ref_ids={ref_ids} sus_ids={sus_ids}"
             )
 
-        return players, officials
+        return players, officials, suspected
 
     # ──────────────────────────────────────────────────────────────────
     # Signal implementations

@@ -21,6 +21,14 @@ LOCK_REVIVED_TTL = 210         # revivals get a longer grace
 LOCK_DORMANT_TTL = 300         # frames a dormant lock reserves pid before true expiry
 MEMORY_UPDATE_MIN_STABLE = 5   # don't write embedding until lock is this stable
 RECENT_DORMANT_REVIVE_FRAMES = 60
+STABLE_AUTO_DORMANT_THRESHOLD = 10  # locks above this stable_count go DORMANT on expiry instead of hard-release
+
+
+def _stability_ttl(base: int, stable_count: int) -> int:
+    """Stability-aware TTL: well-established locks get up to 2x more grace.
+    stable=0 -> base, stable=150 -> 1.5x, stable>=300 -> 2x. Capped at 2x."""
+    factor = 1.0 + min(1.0, max(0, stable_count) / 300.0)
+    return int(base * factor)
 
 
 @dataclass
@@ -298,7 +306,8 @@ class IdentityLockManager:
         lk.dormant_since_frame = -1
         if confidence is not None:
             lk.confidence = confidence
-        lk.ttl = LOCK_REVIVED_TTL if lk.source == "revived" else LOCK_DEFAULT_TTL
+        base_ttl = LOCK_REVIVED_TTL if lk.source == "revived" else LOCK_DEFAULT_TTL
+        lk.ttl = _stability_ttl(base_ttl, lk.stable_count)
         return lk
 
     def release_lock(self, tid: int, reason: str = "manual", frame_id: int = -1) -> Optional[str]:
@@ -355,15 +364,23 @@ class IdentityLockManager:
             lk.ttl -= 1
 
             if lk.ttl <= 0:
-                if restricted and not lk.dormant:
-                    # Convert to dormant: give it DORMANT_TTL more frames
+                # Auto-dormant for sufficiently-stable locks even in normal play.
+                # Otherwise a 308-frame-stable player going off-screen for 150 frames
+                # gets hard-released, then recreated as a NEW pid — pure churn.
+                should_dormant = (
+                    not lk.dormant and (
+                        restricted or lk.stable_count >= STABLE_AUTO_DORMANT_THRESHOLD
+                    )
+                )
+                if should_dormant:
                     lk.dormant = True
                     lk.dormant_since_frame = frame_id
                     lk.ttl = LOCK_DORMANT_TTL
                     self.locks_dormanted += 1
+                    reason_tag = "stale_during_restricted" if restricted else "stale_auto_dormant"
                     print(
                         f"[IDLockDormant] frame={frame_id} tid={tid} pid={lk.pid} "
-                        f"stable={lk.stable_count} reason=stale_during_restricted"
+                        f"stable={lk.stable_count} reason={reason_tag}"
                     )
                 elif lk.dormant and lk.ttl <= 0:
                     to_expire.append(tid)

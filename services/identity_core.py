@@ -1128,4 +1128,5 @@ class IdentityCore:
             "ambiguous_rejects": self.ambiguous_rejects,
             "revived_count": self.revived_count,
             "stable_locked_count": stable_locked,
+            "lock_retention_rate": retention,
         }
