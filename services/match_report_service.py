@@ -21,6 +21,22 @@ TEAM_HOME_HEX = "#1d63ff"
 TEAM_AWAY_HEX = "#22c55e"
 
 
+def _team_entries(team_data: Any) -> List[dict]:
+    """Normalise team_results into a list of {trackId, teamId} dicts.
+    team_service writes a bare list of track dicts; older paths may write a
+    {tracks: [...]} envelope. Tolerate both."""
+    if team_data is None:
+        return []
+    if isinstance(team_data, list):
+        return [t for t in team_data if isinstance(t, dict)]
+    if isinstance(team_data, dict):
+        for key in ("tracks", "teams"):
+            arr = team_data.get(key)
+            if isinstance(arr, list):
+                return [t for t in arr if isinstance(t, dict)]
+    return []
+
+
 def _safe_load(path: Path) -> Optional[Any]:
     if not path.exists():
         return None
@@ -149,7 +165,7 @@ def _teams_block(formation_data: Optional[dict], team_data: Optional[dict]) -> D
 
     if team_data:
         counts = defaultdict(int)
-        for entry in team_data.get("tracks", []) or team_data.get("teams", []) or []:
+        for entry in _team_entries(team_data):
             tid = entry.get("teamId", entry.get("team_id"))
             if tid is None:
                 continue
@@ -257,7 +273,7 @@ def _metrics_block(
 def _players_block(heatmap_data: Optional[dict], team_data: Optional[dict]) -> List[dict]:
     team_map: Dict[int, str] = {}
     if team_data:
-        for entry in team_data.get("tracks", []) or team_data.get("teams", []) or []:
+        for entry in _team_entries(team_data):
             tid = entry.get("trackId") or entry.get("track_id")
             t = entry.get("teamId", entry.get("team_id"))
             if tid is not None and t in (0, 1):
