@@ -622,6 +622,7 @@ def map_pitch(
     result = {
         "jobId": job_id,
         "framesProcessed": frames_checked,
+        "frameStride": int(frame_stride),
         "homographyFound": homography_found,
         "calibration_valid": calibration_valid,
         "calibration_failed": not calibration_valid,

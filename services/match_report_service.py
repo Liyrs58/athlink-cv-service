@@ -70,11 +70,21 @@ def _detect_video_meta(track_data: Optional[dict]) -> Dict[str, Any]:
     }
 
 
+def _team_assignment_confidence(team_entries: List[dict]) -> Optional[float]:
+    """Fraction of tracks that received any team label (0/1/2 = home/away/GK).
+    -1 = unassigned counts as miss. Returns None if no entries."""
+    if not team_entries:
+        return None
+    assigned = sum(1 for e in team_entries if int(e.get("teamId", e.get("team_id", -1))) in (0, 1, 2))
+    return round(assigned / len(team_entries), 3)
+
+
 def _quality(
     identity_metrics: Optional[dict],
     pitch_data: Optional[dict],
     track_data: Optional[dict],
     video_meta: Dict[str, Any],
+    team_entries: Optional[List[dict]] = None,
 ) -> Dict[str, Any]:
     framesProcessed = video_meta["framesProcessed"]
     durationSec = video_meta["durationSec"] or 0.0
@@ -102,11 +112,18 @@ def _quality(
     )
 
     pitch_coverage = 0.0
+    short_tracks_filtered = 0
     if pitch_data and framesProcessed:
         h = pitch_data.get("homographies") or {}
-        pitch_coverage = round(min(1.0, len(h) / framesProcessed), 3)
+        # pitch_service samples every Nth frame — use the actual stride to
+        # measure coverage of intended sample points, not raw frames.
+        stride = int(pitch_data.get("frameStride") or 5)
+        expected = max(1, framesProcessed // stride)
+        pitch_coverage = round(min(1.0, len(h) / expected), 3)
     elif pitch_data and pitch_data.get("homographyFound"):
         pitch_coverage = 1.0
+
+    team_assignment_acc = _team_assignment_confidence(team_entries or [])
 
     soft_collapse_fraction = round(
         frames_in_collapse / framesProcessed if framesProcessed else 0.0,
@@ -134,17 +151,25 @@ def _quality(
                     seen.add(str(pid))
         unique_ids = len(seen)
 
+    # Count short / unassigned tracks for transparency in the dashboard
+    if team_entries:
+        short_tracks_filtered = sum(
+            1 for e in team_entries
+            if int(e.get("teamId", e.get("team_id", -1))) == -1
+        )
+
     return {
         "stableIds": stableIds,
         "trackResurrection": track_resurrection,
         "lowIdSwitchesPerMin": low_id_switches_per_min,
-        "teamAssignmentAccuracy": None,   # populated when confidence_service is wired
+        "teamAssignmentAccuracy": team_assignment_acc,
         "pitchDetectionCoverage": pitch_coverage,
         "matchConfidence": match_confidence,
         "validIdCoverage": valid_id_coverage,
         "softCollapseFraction": soft_collapse_fraction,
         "uniqueIds": unique_ids,
         "unknownBoxes": unknown_boxes,
+        "shortTracksFiltered": short_tracks_filtered,
     }
 
 
@@ -164,12 +189,29 @@ def _teams_block(formation_data: Optional[dict], team_data: Optional[dict]) -> D
                     pass
 
     if team_data:
+        # team_service emits {0=home, 1=away, 2=goalkeeper, -2=official, -1=unassigned}.
+        # The mood-board "playerCount" should mean tracks-on-this-team inclusive of GK.
+        # We don't yet know which team a GK belongs to, so split GKs evenly until
+        # team-half occupancy from pitch_map is wired (TODO).
         counts = defaultdict(int)
+        gk_count = 0
         for entry in _team_entries(team_data):
             tid = entry.get("teamId", entry.get("team_id"))
             if tid is None:
                 continue
-            counts[int(tid)] += 1
+            tid = int(tid)
+            if tid in (0, 1):
+                counts[tid] += 1
+            elif tid == 2:
+                gk_count += 1
+        # Split GKs evenly: first to whichever team is short, then alternating
+        if gk_count:
+            if counts[0] <= counts[1]:
+                counts[0] += min(1, gk_count); gk_count -= 1
+            if gk_count:
+                counts[1] += min(1, gk_count); gk_count -= 1
+            # Anything left (rare) gets credited to home
+            counts[0] += gk_count
         home["playerCount"] = counts.get(0, 0)
         away["playerCount"] = counts.get(1, 0)
 
@@ -333,12 +375,13 @@ def build_match_report(job_id: str) -> dict:
 
     video = _detect_video_meta(track_data)
     fps = video["fps"] or 25.0
+    team_entries = _team_entries(team_data)
 
     report = {
         "jobId": job_id,
         "video": video,
         "scoreline": {"home": None, "away": None},
-        "quality": _quality(identity_metrics, pitch_data, track_data, video),
+        "quality": _quality(identity_metrics, pitch_data, track_data, video, team_entries),
         "teams": _teams_block(formation_data, team_data),
         "metrics": _metrics_block(pass_data, pressing_data, xg_data, heatmap_data, events_data),
         "players": _players_block(heatmap_data, team_data),
