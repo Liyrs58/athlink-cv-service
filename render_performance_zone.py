@@ -172,26 +172,40 @@ def _select_around_ball(
     k_per_team: int = DEFAULT_K_PER_TEAM,
 ) -> Tuple[Optional[int], List[int]]:
     """Returns (carrier_tid, [tids_to_render]) for this frame.
-    Carrier = nearest player to the ball; selection = carrier + k nearest from each team within radius."""
+    Carrier = nearest player to the ball; selection = carrier + k nearest from
+    each team within radius. When ball is missing entirely (no ball-model
+    available), falls back to "centre of player cluster" so the renderer still
+    produces a tactical view.
+    """
+    # Frame's player positions
+    players_now = [
+        (tid, (px, py))
+        for (tid, fi), (px, py) in world_pos.items()
+        if fi == frame_idx
+    ]
+    if not players_now:
+        return None, []
+
+    # Resolve ball position, with ±15 frame search, then cluster-centroid fallback
     ball = ball_pos.get(frame_idx)
     if ball is None:
-        # no ball this frame — pick nearest ball position within ±15 frames
         for delta in range(1, 16):
             if (b1 := ball_pos.get(frame_idx - delta)) is not None:
                 ball = b1; break
             if (b2 := ball_pos.get(frame_idx + delta)) is not None:
                 ball = b2; break
     if ball is None:
-        return None, []
+        # Cluster-centroid fallback: median of player positions = "where the action is"
+        xs = sorted(p[0] for _, p in players_now)
+        ys = sorted(p[1] for _, p in players_now)
+        mid = len(xs) // 2
+        ball = (xs[mid], ys[mid])
     bx, by = ball
+
     candidates = []
-    for (tid, fi), (px, py) in world_pos.items():
-        if fi != frame_idx:
-            continue
+    for tid, (px, py) in players_now:
         d = ((px - bx) ** 2 + (py - by) ** 2) ** 0.5
         candidates.append((d, tid))
-    if not candidates:
-        return None, []
     candidates.sort()
     carrier_tid = candidates[0][1]
     selected = {carrier_tid}
@@ -206,6 +220,12 @@ def _select_around_ball(
             continue
         for _, tid in lst[:k_per_team]:
             selected.add(tid)
+    # Always have at least k_per_team * 2 visible players if available, so
+    # when ball is unknown we still see 8 rings around the action centre.
+    if len(selected) < min(8, len(candidates)):
+        for d, tid in candidates[: 8]:
+            if d <= radius_m * 1.3:
+                selected.add(tid)
     return int(carrier_tid), list(selected)
 
 

@@ -105,7 +105,65 @@ def run_full_pipeline(
         if ok:
             track_results = out
 
-    # 2. Convert frames -> tracks-with-trajectory schema (used by team_service + analytics)
+    # 2a. Ball detection — only runs if a dedicated ball model is available.
+    # Merges {frameIdx: {bbox, confidence, source}} into the tracking JSON's
+    # per-frame "ball" arrays so downstream analytics + the renderer can use it.
+    if track_results and not skip_tracking:
+        ball_model_paths = [
+            repo_root / "models" / "roboflow_ball.pt",
+            Path("/content/roboflow_ball.pt"),
+        ]
+        if any(p.exists() for p in ball_model_paths):
+            try:
+                from services.ball_tracking_service import BallTracker
+                bt = BallTracker()
+                bt.load_model()
+                if bt.model is not None:
+                    cap = cv2.VideoCapture(str(video_path))
+                    fi = 0
+                    detected = 0
+                    while True:
+                        ok, frame = cap.read()
+                        if not ok:
+                            break
+                        det = bt.detect(frame, fi)
+                        if det is not None:
+                            detected += 1
+                        fi += 1
+                    cap.release()
+                    positions = bt.get_positions()
+                    # Merge into track_results.json on disk
+                    track_path = base / "tracking" / "track_results.json"
+                    if track_path.exists():
+                        with open(track_path) as f:
+                            data = json.load(f)
+                        for fr in data.get("frames", []):
+                            pos = positions.get(int(fr["frameIndex"]))
+                            if pos is not None:
+                                fr.setdefault("ball", [])
+                                # Avoid duplicates if tracker_core already wrote one
+                                if not fr["ball"]:
+                                    fr["ball"].append({
+                                        "bbox": [
+                                            float(pos["x"]) - 8, float(pos["y"]) - 8,
+                                            float(pos["x"]) + 8, float(pos["y"]) + 8,
+                                        ],
+                                        "confidence": float(pos.get("conf", pos.get("confidence", 0.5))),
+                                        "source": "ball_tracker",
+                                        "interpolated": bool(pos.get("interpolated", False)),
+                                    })
+                        with open(track_path, "w") as f:
+                            json.dump(data, f, indent=2)
+                        track_results = data.get("frames", [])
+                    print(f"[FullPipeline] ball: {detected} detections merged into track_results.json")
+                _record("ball_detection", True)
+            except Exception as e:
+                print(f"[FullPipeline] ball_detection failed: {e}")
+                _record("ball_detection", False, str(e))
+        else:
+            print("[FullPipeline] no roboflow_ball.pt found; skipping ball detection (analytics will use cluster-centroid fallback)")
+
+    # 2b. Convert frames -> tracks-with-trajectory schema (used by team_service + analytics)
     converted_tracks: List[dict] = []
     if track_results:
         from services.pitch_service import _frames_to_tracks_schema
