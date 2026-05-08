@@ -648,63 +648,46 @@ def _resolve_blocked_option(
     return best
 
 
-def _touchline_pixels(
-    H_inv: np.ndarray,
+def _touchline_world(
     carrier_world: Optional[Tuple[float, float]],
     pitch_w: float = 105.0,
     pitch_h: float = 68.0,
-    image_w: int = 1920,
-    image_h: int = 1080,
     *,
     segment_len_m: float = 18.0,
-) -> Optional[Tuple[Tuple[int, int], Tuple[int, int]]]:
-    """Return (p1, p2) image-space endpoints of a SHORT touchline segment near
-    the carrier. The segment is `segment_len_m` metres long along the world
-    touchline, centred on the carrier's x-coord projected onto y=0 or y=68.
+) -> Optional[Tuple[Tuple[float, float], Tuple[float, float]]]:
+    """Return WORLD-COORD endpoints of a short touchline segment near the
+    carrier.  The segment is `segment_len_m` metres long along whichever
+    touchline (y=0 or y=68) the carrier is closer to, centred on the
+    carrier's x-coord.
 
-    Returns None if the carrier isn't reasonably close to a touchline (>14 m).
+    Returns None if the carrier is >14 m from either touchline.
+    Pixel projection happens per-frame in the render loop.
     """
     if carrier_world is None:
         return None
-    cx_world, cy_world = carrier_world
-    # Pick whichever touchline (y=0 or y=68) the carrier is closer to
-    y_top = 0.0
-    y_bot = pitch_h
-    near_top = abs(cy_world - y_top)
-    near_bot = abs(cy_world - y_bot)
-    y_world = y_top if near_top <= near_bot else y_bot
+    cx, cy = carrier_world
+    y_top, y_bot = 0.0, pitch_h
+    near_top = abs(cy - y_top)
+    near_bot = abs(cy - y_bot)
+    y_tl = y_top if near_top <= near_bot else y_bot
     if min(near_top, near_bot) > 14.0:
         return None  # carrier is mid-pitch, touchline isn't part of the trap
-
-    # Carrier projected onto the touchline (in world coords)
     half = segment_len_m / 2.0
-    x_a = max(0.0, cx_world - half)
-    x_b = min(pitch_w, cx_world + half)
-    try:
-        p1 = project_world_point((x_a, y_world), H_inv)
-        p2 = project_world_point((x_b, y_world), H_inv)
-    except Exception:
-        return None
-    if p1 is None or p2 is None:
-        return None
-
-    def _clamp(p):
-        x = max(0, min(image_w - 1, int(p[0])))
-        y = max(0, min(image_h - 1, int(p[1])))
-        return (x, y)
-    return _clamp(p1), _clamp(p2)
+    x_a = max(0.0, cx - half)
+    x_b = min(pitch_w, cx + half)
+    return ((x_a, y_tl), (x_b, y_tl))
 
 
-def _shrink_polygon(points_px: List[Tuple[int, int]], factor: float = 0.72) -> List[Tuple[int, int]]:
-    """Shrink a polygon toward its centroid. `factor=0.72` keeps the trap zone
-    tight to the cast instead of ballooning out to wide convex-hull edges."""
-    if not points_px:
-        return points_px
-    arr = np.array(points_px, dtype=np.float64)
+def _shrink_polygon(points: List[Tuple[float, float]], factor: float = 0.72) -> List[Tuple[float, float]]:
+    """Shrink a polygon toward its centroid. Works in any coordinate space
+    (world metres or image pixels). `factor=0.72` keeps the trap zone tight."""
+    if not points:
+        return points
+    arr = np.array(points, dtype=np.float64)
     cx, cy = arr.mean(axis=0)
     return [
-        (int(round(cx + (x - cx) * factor)), int(round(cy + (y - cy) * factor)))
-        for (x, y) in points_px
+        (float(cx + (x - cx) * factor), float(cy + (y - cy) * factor))
+        for (x, y) in points
     ]
 
 
@@ -982,78 +965,61 @@ def render_story(
                 "Try relaxing presser_max_m or choosing a different carrier."
             )
 
-    # ── Build OverlayPlan: cache every drawing primitive's pixel coords ──
+    # ── Build OverlayPlan: world-space geometry (reprojected per-frame) ───
     plan: Dict[str, object] = {}
 
-    # Rings + role pills
+    # Rings: store tid + visual metadata — world pos resolved per-frame
     ring_specs: List[dict] = []
     for tid, role_key, display in cast_with_label:
-        fp = anchor_foot.get(int(tid))
-        if fp is None:
-            continue
         team = team_map.get(int(tid))
         color = _team_color(team)
-        base_radius = 24
-        wp = world_pos.get((int(tid), anchor_frame))
-        if wp is not None and H_inv_anchor is not None:
-            rr = project_world_radius(RING_RADIUS_M, wp, H_inv_anchor)
-            if rr is not None:
-                base_radius = int(rr)
-        mult = ROLE_RING_RADIUS_MULT.get(role_key, 1.0)
-        radius = int(base_radius * mult)
         ring_specs.append({
             "tid": int(tid),
-            "fp": fp,
-            "radius": radius,
             "color": color,
             "role_key": role_key,
             "label": display,
         })
     plan["rings"] = ring_specs
 
-    # Zone hull — carrier + pressers only (no OPTION). Shrink toward centroid
-    # so the zone reads as the LOCAL trap, not the convex hull of half the pitch.
+    # Zone hull in WORLD coords — carrier + pressers only (no OPTION).
+    # Shrink toward centroid so the zone reads as the LOCAL trap.
     zone_tids = [t for (t, r, _) in cast_with_label if r in ("CARRIER", "DEFENDER")]
-    zone_pts_raw = [anchor_foot[t] for t in zone_tids if t in anchor_foot]
-    if len(zone_pts_raw) >= 3:
+    zone_world_raw = [world_pos.get((int(t), anchor_frame)) for t in zone_tids]
+    zone_world_raw = [wp for wp in zone_world_raw if wp is not None]
+    if len(zone_world_raw) >= 3:
         zone_shrink = float(story.get("zone_shrink", 0.72))
-        plan["zone_pts"] = _shrink_polygon(zone_pts_raw, factor=zone_shrink)
+        plan["zone_world"] = _shrink_polygon(zone_world_raw, factor=zone_shrink)
     else:
-        plan["zone_pts"] = []
+        plan["zone_world"] = []
 
-    # Pressure arrows: each PRESSER -> CARRIER
+    # Pressure arrows: store track IDs, not pixel coords
     arrow_specs: List[dict] = []
-    carrier_fp = anchor_foot.get(int(carrier_tid))
     for i, ptid in enumerate(pressers):
-        pfp = anchor_foot.get(int(ptid))
-        if pfp is None or carrier_fp is None:
-            continue
         bend = 0.30 if i % 2 == 0 else -0.30
         arrow_specs.append({
-            "from": pfp,
-            "to": carrier_fp,
+            "from_tid": int(ptid),
+            "to_tid": int(carrier_tid),
             "color": ARROW_KIND_COLORS["pressure"],
             "bend": bend,
         })
     plan["arrows"] = arrow_specs
 
-    # Blocked passing lane: CARRIER -> BLOCKED OPTION (red dashed with X)
-    blocked_lane = None
-    if show_blocked_lane and blocked_tid is not None and blocked_tid in anchor_foot:
-        blocked_lane = (carrier_fp, anchor_foot[int(blocked_tid)])
-    plan["blocked_lane"] = blocked_lane
+    # Blocked passing lane: track IDs (resolved per-frame)
+    if show_blocked_lane and blocked_tid is not None:
+        plan["blocked_lane"] = (int(carrier_tid), int(blocked_tid))
+    else:
+        plan["blocked_lane"] = None
 
-    # Touchline glow — short segment near the carrier, NOT a full sideline.
-    touchline = None
-    if show_touchline and H_inv_anchor is not None and carrier_world is not None:
-        touchline = _touchline_pixels(
-            H_inv_anchor, carrier_world,
-            image_w=w, image_h=h,
+    # Touchline glow — short segment in WORLD coords near the carrier.
+    touchline_world = None
+    if show_touchline and carrier_world is not None:
+        touchline_world = _touchline_world(
+            carrier_world,
             segment_len_m=float(story.get("touchline_segment_m", 18.0)),
         )
-    plan["touchline"] = touchline
+    plan["touchline_world"] = touchline_world
 
-    # ── Per-frame loop: draw the cached plan, no recomputation ──────────
+    # ── Per-frame loop: reproject world → image each frame ──────────────
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     out = cv2.VideoWriter(str(output_path), fourcc, fps, (w, h))
 
@@ -1064,7 +1030,7 @@ def render_story(
             f"[render_story] anchor_frame={anchor_frame}  window=[{frame_lo}, {frame_hi}]  "
             f"({(frame_hi - frame_lo + 1) / fps:.1f}s)  "
             f"cast={[(t, r) for (t, r, _) in cast_with_label]}  "
-            f"blocked_option={blocked_tid}  touchline={'yes' if touchline else 'no'}"
+            f"blocked_option={blocked_tid}  touchline={'yes' if touchline_world else 'no'}"
         )
 
     while True:
@@ -1079,48 +1045,110 @@ def render_story(
         if frame_idx > frame_hi:
             break
 
+        # ── Resolve this frame's homography (world → image) ──────────────
+        H_inv = H_inv_by_frame.get(frame_idx)
+        if H_inv is None and H_inv_by_frame:
+            nearest = min(H_inv_by_frame.keys(), key=lambda k: abs(k - frame_idx))
+            H_inv = H_inv_by_frame[nearest]
+
         # Step 1: dim
         if dim_alpha > 0:
             black = np.zeros_like(frame)
             cv2.addWeighted(black, dim_alpha, frame, 1.0 - dim_alpha, 0, frame)
 
-        # Step 2: zone hull
-        if plan["zone_pts"]:
-            draw_zone_hull(frame, plan["zone_pts"], zone_color, alpha=zone_alpha)
+        # Helper: project a world point for this frame
+        def _proj(wp: Optional[Tuple[float, float]]) -> Optional[Tuple[int, int]]:
+            if wp is None or H_inv is None:
+                return None
+            return project_world_point(wp, H_inv)
 
-        # Step 3: touchline glow — short, thinner segment near the carrier
-        if plan["touchline"]:
-            tl_a, tl_b = plan["touchline"]
-            draw_glow_line(frame, tl_a, tl_b, ARROW_KIND_COLORS["pressure"], thickness=6, glow_layers=2)
+        # Step 2: zone hull (reproject world coords → image)
+        if plan["zone_world"]:
+            zone_px = [_proj(wp) for wp in plan["zone_world"]]
+            zone_px = [p for p in zone_px if p is not None]
+            if len(zone_px) >= 3:
+                draw_zone_hull(frame, zone_px, zone_color, alpha=zone_alpha)
 
-        # Step 4: pressure arrows (curved)
+        # Step 3: touchline glow (reproject world endpoints → image)
+        tl_px: Optional[Tuple[Tuple[int, int], Tuple[int, int]]] = None
+        if plan["touchline_world"] and H_inv is not None:
+            tl_a_w, tl_b_w = plan["touchline_world"]
+            tl_a_px = _proj(tl_a_w)
+            tl_b_px = _proj(tl_b_w)
+            if tl_a_px is not None and tl_b_px is not None:
+                tl_px = (tl_a_px, tl_b_px)
+                draw_glow_line(
+                    frame, tl_a_px, tl_b_px,
+                    ARROW_KIND_COLORS["pressure"], thickness=6, glow_layers=2,
+                )
+
+        # Step 4: pressure arrows (resolve world pos per-frame)
         for a in plan["arrows"]:
-            draw_curved_arrow(
-                frame, a["from"], a["to"], a["color"],
-                thickness=4, bend=a["bend"], stop_short_px=32,
-            )
+            from_w = world_pos.get((a["from_tid"], frame_idx))
+            to_w = world_pos.get((a["to_tid"], frame_idx))
+            from_px = _proj(from_w)
+            to_px = _proj(to_w)
+            if from_px is not None and to_px is not None:
+                draw_curved_arrow(
+                    frame, from_px, to_px, a["color"],
+                    thickness=4, bend=a["bend"], stop_short_px=32,
+                )
 
-        # Step 5: blocked passing lane
+        # Step 5: blocked passing lane (resolve per-frame)
+        blocked_px: Optional[Tuple[Tuple[int, int], Tuple[int, int]]] = None
         if plan["blocked_lane"] is not None:
-            ba, bb = plan["blocked_lane"]
-            draw_blocked_lane(frame, ba, bb, color=ARROW_KIND_COLORS["pressure"], thickness=3)
+            c_tid, b_tid = plan["blocked_lane"]
+            c_w = world_pos.get((c_tid, frame_idx))
+            b_w = world_pos.get((b_tid, frame_idx))
+            c_px = _proj(c_w)
+            b_px = _proj(b_w)
+            if c_px is not None and b_px is not None:
+                blocked_px = (c_px, b_px)
+                draw_blocked_lane(
+                    frame, c_px, b_px,
+                    color=ARROW_KIND_COLORS["pressure"], thickness=3,
+                )
 
-        # Step 6: rings + role pills (BLOCKED OPTION pill goes BELOW its ring
-        # so it doesn't pile on top of the BALL CARRIER pill / blocked-lane chip)
+        # Step 6: rings + role pills (resolve per-frame world pos → image)
+        carrier_px: Optional[Tuple[int, int]] = None
         for r in plan["rings"]:
-            fp = r["fp"]
+            tid = r["tid"]
+            wp = world_pos.get((tid, frame_idx))
+            fp = _proj(wp)
+            if fp is None:
+                # Fallback: derive foot pixel from bbox in tracking data
+                rec = frames_data.get(frame_idx, {})
+                for p in rec.get("players", []):
+                    p_tid = p.get("rawTrackId") or p.get("trackId")
+                    if p_tid is not None and int(p_tid) == tid:
+                        bbox = p.get("bbox")
+                        if bbox and len(bbox) == 4:
+                            x1, y1, x2, y2 = map(int, bbox)
+                            fp = ((x1 + x2) // 2, y2)
+                        break
+            if fp is None:
+                continue
             color = r["color"]
+            # Compute ring radius in image space from world coords
+            base_radius = 24
+            if wp is not None and H_inv is not None:
+                rr = project_world_radius(RING_RADIUS_M, wp, H_inv)
+                if rr is not None:
+                    base_radius = int(rr)
+            mult = ROLE_RING_RADIUS_MULT.get(r["role_key"], 1.0)
+            radius = int(base_radius * mult)
             if r["role_key"] == "CARRIER":
-                inner = max(3, r["radius"] // 3)
+                inner = max(3, radius // 3)
                 cv2.ellipse(frame, fp, (inner, inner // 2), 0, 0, 360, color, -1, cv2.LINE_AA)
-            _draw_foot_ring(frame, fp, r["radius"], color, style="solid", thickness=4)
+                carrier_px = fp
+            _draw_foot_ring(frame, fp, radius, color, style="solid", thickness=4)
             below = r["role_key"] == "OPTION"
             draw_role_pill(
                 frame, fp, r["label"], color,
-                above_offset_px=r["radius"] + 12, below=below,
+                above_offset_px=radius + 12, below=below,
             )
 
-        # Step 7: title + subtitle banners (rendered every frame)
+        # Step 7: title + subtitle banners (screen-space, not pitch-anchored)
         for c in callouts:
             c_lo, c_hi = c.get("frames", [frame_lo, frame_hi])
             if not (c_lo <= frame_idx <= c_hi):
@@ -1131,20 +1159,18 @@ def render_story(
             position = str(c.get("position", "top"))
             draw_banner(frame, text, position=position)
 
-        # Step 8: anchored callouts derived from the plan
-        if plan["touchline"]:
-            tl_a, tl_b = plan["touchline"]
-            # Anchor at the midpoint of the short segment, slightly above-line
+        # Step 8: anchored callouts (derived from reprojected positions)
+        if tl_px is not None:
+            tl_a, tl_b = tl_px
             tl_mx = (tl_a[0] + tl_b[0]) // 2
             tl_my = (tl_a[1] + tl_b[1]) // 2 - 18
             draw_local_callout(
                 frame, (tl_mx, tl_my), "TOUCHLINE = EXTRA DEFENDER",
                 side="left", accent=ARROW_KIND_COLORS["pressure"],
             )
-        if plan["blocked_lane"] is not None and carrier_fp is not None:
-            ba, bb = plan["blocked_lane"]
+        if blocked_px is not None:
+            ba, bb = blocked_px
             mx = (ba[0] + bb[0]) // 2
-            # Push the chip perpendicularly off the line so it doesn't sit on top of the X marker
             dy = bb[1] - ba[1]
             offset = 22 if dy >= 0 else -22
             my = (ba[1] + bb[1]) // 2 + offset
@@ -1167,8 +1193,8 @@ def render_story(
         "total_frames_window": frame_hi - frame_lo + 1,
         "rings": len(plan["rings"]),
         "arrows": len(plan["arrows"]),
-        "zone_pts": len(plan["zone_pts"]) if plan["zone_pts"] else 0,
-        "touchline": bool(plan["touchline"]),
+        "zone_world": len(plan["zone_world"]) if plan["zone_world"] else 0,
+        "touchline": bool(plan["touchline_world"]),
         "blocked_lane": bool(plan["blocked_lane"]),
         "carrier_tid": carrier_tid,
         "blocked_tid": blocked_tid,
@@ -1179,8 +1205,8 @@ def render_story(
             print(f"[render_story] WARN rings={manifest['rings']} < 3 — story too thin")
         if manifest["arrows"] < 1:
             print(f"[render_story] WARN no arrows in plan")
-        if manifest["zone_pts"] < 3:
-            print(f"[render_story] WARN no zone hull (need >=3 points at anchor)")
+        if manifest["zone_world"] < 3:
+            print(f"[render_story] WARN no zone hull (need >=3 world points at anchor)")
         if not manifest["touchline"]:
             print(f"[render_story] WARN touchline not resolved (homography missing?)")
     return manifest
