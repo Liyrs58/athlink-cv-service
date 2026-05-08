@@ -229,21 +229,36 @@ class TrackerCore:
         self.results = []
 
     def detect(self, frame):
-        """YOLO – returns np.array (N,6) [x1,y1,x2,y2,conf,cls]."""
+        """YOLO – returns np.array (N,6) [x1,y1,x2,y2,conf,cls].
+
+        Side effect: stashes the highest-confidence ball (class 0) detection of
+        the current frame on `self._last_ball_det` so the per-frame writer can
+        persist it. Roboflow sports model classes: 0=ball, 1=goalkeeper,
+        2=player, 3=referee."""
+        self._last_ball_det = None
         results = self.yolo.predict(frame, conf=0.05, verbose=False)
         boxes = results[0].boxes
         if boxes is None or len(boxes) == 0:
             return np.empty((0, 6))
 
         dets = []
+        best_ball = None
         for box in boxes:
             cls = int(box.cls.item())
-            if cls in [1, 2, 3]:
-                dets.append([
-                    float(box.xyxy[0][0]), float(box.xyxy[0][1]),
-                    float(box.xyxy[0][2]), float(box.xyxy[0][3]),
-                    float(box.conf.item()), float(cls)
-                ])
+            x1, y1 = float(box.xyxy[0][0]), float(box.xyxy[0][1])
+            x2, y2 = float(box.xyxy[0][2]), float(box.xyxy[0][3])
+            conf = float(box.conf.item())
+            if cls == 0:
+                if best_ball is None or conf > best_ball[4]:
+                    best_ball = [x1, y1, x2, y2, conf, 0.0]
+            elif cls in (1, 2, 3):
+                dets.append([x1, y1, x2, y2, conf, float(cls)])
+        if best_ball is not None:
+            self._last_ball_det = {
+                "bbox": [best_ball[0], best_ball[1], best_ball[2], best_ball[3]],
+                "confidence": best_ball[4],
+                "source": "yolo",
+            }
         return np.array(dets, dtype=float) if dets else np.empty((0, 6))
 
     def _extract_torso_hsv(self, frame: np.ndarray, bbox: list) -> np.ndarray:
@@ -801,10 +816,16 @@ class TrackerCore:
                     "is_official": True,
                 })
 
+            ball_list = []
+            last_ball = getattr(self, "_last_ball_det", None)
+            if last_ball is not None:
+                ball_list.append(last_ball)
+
             self.results.append({
                 "frameIndex": int(video_frame),
                 "players": players,
                 "officials": officials_list,
+                "ball": ball_list,
                 "detection_count": len(dets),
                 "track_count": n_tracks,
                 "officials_filtered": len(self._officials_this_frame),
