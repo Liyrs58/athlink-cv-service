@@ -76,6 +76,71 @@ def draw_dashed_path(
             t = t1 + gap
 
 
+# ── zone hulls + banners ──────────────────────────────────────────────────
+
+def draw_zone_hull(
+    img: np.ndarray,
+    points_px: List[Tuple[int, int]],
+    color_bgr: Tuple[int, int, int],
+    *,
+    alpha: float = 0.18,
+    outline_thickness: int = 2,
+) -> None:
+    """Filled convex hull of given pixel points + 2px outline.
+    Used for shaded tactical zones (pressing trap, overload, defensive line, etc.)."""
+    pts = [p for p in points_px if p is not None]
+    if len(pts) < 3:
+        return
+    arr = np.array(pts, dtype=np.int32)
+    hull = cv2.convexHull(arr)
+    overlay = img.copy()
+    cv2.fillPoly(overlay, [hull], color_bgr, cv2.LINE_AA)
+    cv2.addWeighted(overlay, alpha, img, 1.0 - alpha, 0, img)
+    # Slightly more saturated outline
+    outline = tuple(min(255, int(c * 1.2)) for c in color_bgr)
+    cv2.polylines(img, [hull], isClosed=True, color=outline, thickness=outline_thickness, lineType=cv2.LINE_AA)
+
+
+def draw_banner(
+    img: np.ndarray,
+    text: str,
+    *,
+    position: str = "top",
+    accent: Optional[Tuple[int, int, int]] = None,
+) -> None:
+    """Top-centre title banner. Larger than draw_caption.
+    position='top' -> big bold title at y=40; 'top_sub' -> smaller subtitle at y=78."""
+    if not text:
+        return
+    h_img, w_img = img.shape[:2]
+    is_top = position == "top"
+    fs = 1.1 if is_top else 0.62
+    th = 3 if is_top else 2
+    y_baseline = 56 if is_top else 96
+    fg = (245, 245, 245) if is_top else (210, 210, 210)
+    bg = (20, 20, 20)
+    font = cv2.FONT_HERSHEY_SIMPLEX
+
+    (tw, hh), _ = cv2.getTextSize(text.upper(), font, fs, th)
+    pad_x = 22 if is_top else 14
+    pad_y = 12 if is_top else 8
+    box_w = tw + 2 * pad_x
+    box_h = hh + 2 * pad_y
+    x = (w_img - box_w) // 2
+    y = y_baseline - hh - pad_y
+
+    overlay = img.copy()
+    cv2.rectangle(overlay, (x, y), (x + box_w, y + box_h), bg, -1, cv2.LINE_AA)
+    cv2.addWeighted(overlay, 0.82, img, 0.18, 0, img)
+
+    if accent is not None:
+        cv2.rectangle(img, (x, y), (x + 8, y + box_h), accent, -1, cv2.LINE_AA)
+        text_x = x + 8 + pad_x
+    else:
+        text_x = x + pad_x
+    cv2.putText(img, text.upper(), (text_x, y_baseline), font, fs, fg, th, cv2.LINE_AA)
+
+
 # ── caption chip ──────────────────────────────────────────────────────────
 
 def draw_caption(

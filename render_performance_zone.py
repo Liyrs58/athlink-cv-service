@@ -33,8 +33,10 @@ from services.tactical_overlay import (
     CAPTION_FOR_EVENT,  # noqa: F401  (re-exported for downstream)
     caption_for_window,
     draw_arrow,
+    draw_banner,
     draw_caption,
     draw_dashed_path,
+    draw_zone_hull,
 )
 from services.world_to_image import (
     invert_homography,
@@ -564,6 +566,222 @@ def render_performance_zone(
         print(f"[render_performance_zone] {written} frames -> {output_path}")
         if extracted:
             print(f"[render_performance_zone] {extracted} samples -> {frame_dir}")
+
+
+# ── Phase 4: hardcoded story renderer ─────────────────────────────────────
+
+ARROW_KIND_COLORS = {
+    "pressure": (56, 56, 240),     # red — defenders closing carrier
+    "pass":     None,              # resolved per arrow from carrier team
+    "run":      None,              # resolved per arrow from cast team
+    "support":  (40, 220, 255),    # ball-yellow
+}
+
+ROLE_RING_RADIUS_MULT = {
+    "CARRIER":   1.55,
+    "DEFENDER":  1.05,
+    "RUNNER":    1.25,
+    "OPTION":    1.05,
+}
+
+
+def _hex_to_bgr(hex_str: str) -> Tuple[int, int, int]:
+    s = hex_str.lstrip("#")
+    if len(s) != 6:
+        return NEUTRAL
+    r = int(s[0:2], 16); g = int(s[2:4], 16); b = int(s[4:6], 16)
+    return (b, g, r)
+
+
+def _foot_pixel(
+    p_entry: dict,
+    world_pos: Dict[Tuple[int, int], Tuple[float, float]],
+    frame_idx: int,
+    H_inv: Optional[np.ndarray],
+) -> Optional[Tuple[int, int]]:
+    """Best foot-point estimate for a player record on this frame."""
+    tid = p_entry.get("rawTrackId") or p_entry.get("trackId")
+    if tid is None:
+        return None
+    wp = world_pos.get((int(tid), frame_idx))
+    if wp is not None and H_inv is not None:
+        px = project_world_point(wp, H_inv)
+        if px is not None:
+            return px
+    bbox = p_entry.get("bbox")
+    if not bbox or len(bbox) != 4:
+        return None
+    x1, y1, x2, y2 = map(int, bbox)
+    return ((x1 + x2) // 2, y2)
+
+
+def render_story(
+    video_path: str,
+    results_json: str,
+    pitch_map_json: str,
+    team_results_json: str,
+    story_json: str,
+    output_path: str,
+    *,
+    verbose: bool = True,
+) -> None:
+    """Render a hardcoded tactical clip from a story JSON sidecar.
+
+    The JSON authors the entire moment — frame range, cast (track_id -> role),
+    arrows (track_id -> track_id with kind), shaded zone (convex hull of cast),
+    callouts (title/subtitle banners). No auto-selection.
+    """
+    with open(story_json) as f:
+        story = json.load(f)
+
+    frame_lo, frame_hi = story.get("frame_range", [0, 10**9])
+    cast_list = story.get("cast", []) or []
+    cast_role: Dict[int, str] = {}
+    for entry in cast_list:
+        tid = entry.get("trackId")
+        if tid is None:
+            continue
+        cast_role[int(tid)] = str(entry.get("role", "PLAYER")).upper()
+    cast_set = set(cast_role.keys())
+
+    arrows_cfg = story.get("arrows", []) or []
+    zone_cfg = story.get("zone") or {}
+    callouts = story.get("callouts", []) or []
+    dim_others = bool(story.get("dim_others", True))
+    dim_alpha = float(story.get("dim_alpha", 0.45))
+
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        raise FileNotFoundError(f"Video not found: {video_path}")
+
+    fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+
+    with open(results_json) as f:
+        track_data = json.load(f)
+    frames_data = {int(f["frameIndex"]): f for f in track_data.get("frames", [])}
+
+    H_inv_by_frame, world_pos, _ = _load_pitch_map(pitch_map_json)
+    team_map = _load_team_map(team_results_json)
+
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    out = cv2.VideoWriter(str(output_path), fourcc, fps, (w, h))
+
+    frame_idx = 0
+    written = 0
+    if verbose:
+        print(f"[render_story] window=[{frame_lo}, {frame_hi}]  ({(frame_hi - frame_lo + 1) / fps:.1f}s)  cast={cast_role}")
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        if total and frame_idx >= total:
+            break
+        if frame_idx < frame_lo:
+            frame_idx += 1
+            continue
+        if frame_idx > frame_hi:
+            break
+
+        rec = frames_data.get(frame_idx, {})
+        H_inv = H_inv_by_frame.get(frame_idx)
+        if H_inv is None and H_inv_by_frame:
+            nearest = min(H_inv_by_frame.keys(), key=lambda k: abs(k - frame_idx))
+            H_inv = H_inv_by_frame[nearest]
+
+        # Per-frame foot pixels for everybody who has a record
+        foot_px: Dict[int, Tuple[int, int]] = {}
+        for p in rec.get("players", []):
+            if p.get("is_official", False):
+                continue
+            tid = p.get("rawTrackId") or p.get("trackId")
+            if tid is None:
+                continue
+            fp = _foot_pixel(p, world_pos, frame_idx, H_inv)
+            if fp is not None:
+                foot_px[int(tid)] = fp
+
+        # Step 1: dim entire frame so the cast pops
+        if dim_others:
+            black = np.zeros_like(frame)
+            cv2.addWeighted(black, dim_alpha, frame, 1.0 - dim_alpha, 0, frame)
+
+        # Step 2: shaded zone (convex hull of cast)
+        if zone_cfg:
+            zone_tids = zone_cfg.get("track_ids") or list(cast_set)
+            zone_lo, zone_hi = zone_cfg.get("frames", [frame_lo, frame_hi])
+            if zone_lo <= frame_idx <= zone_hi:
+                pts = [foot_px[t] for t in zone_tids if int(t) in foot_px]
+                if len(pts) >= 3:
+                    color = _hex_to_bgr(zone_cfg.get("color", "#ff5544"))
+                    alpha_z = float(zone_cfg.get("alpha", 0.18))
+                    draw_zone_hull(frame, pts, color, alpha=alpha_z)
+
+        # Step 3: arrows (drawn under rings, above zone)
+        for ar in arrows_cfg:
+            a_lo, a_hi = ar.get("frames", [frame_lo, frame_hi])
+            if not (a_lo <= frame_idx <= a_hi):
+                continue
+            ftid = ar.get("from_track")
+            ttid = ar.get("to_track")
+            if ftid is None or ttid is None:
+                continue
+            fp = foot_px.get(int(ftid))
+            tp = foot_px.get(int(ttid))
+            if fp is None or tp is None:
+                continue
+            kind = str(ar.get("kind", "pass")).lower()
+            color = ARROW_KIND_COLORS.get(kind)
+            if color is None:
+                # carrier or sender team color
+                color = _team_color(team_map.get(int(ftid), -1))
+            draw_arrow(frame, fp, tp, color, thickness=5)
+
+        # Step 4: cast rings + role nameplates
+        for tid, role in cast_role.items():
+            fp = foot_px.get(int(tid))
+            if fp is None:
+                continue
+            team = team_map.get(int(tid))
+            color = _team_color(team)
+            base_radius = 24
+            if H_inv is not None:
+                wp = world_pos.get((int(tid), frame_idx))
+                if wp is not None:
+                    rr = project_world_radius(RING_RADIUS_M, wp, H_inv)
+                    if rr is not None:
+                        base_radius = int(rr)
+            mult = ROLE_RING_RADIUS_MULT.get(role, 1.0)
+            radius = int(base_radius * mult)
+            # CARRIER gets an inner glow
+            if role == "CARRIER":
+                inner = max(3, radius // 3)
+                cv2.ellipse(frame, fp, (inner, inner // 2), 0, 0, 360, color, -1, cv2.LINE_AA)
+            _draw_foot_ring(frame, fp, radius, color, style="solid", thickness=4)
+            _draw_nameplate(frame, fp, color, pid=role, name=role, number=None)
+
+        # Step 5: callouts
+        for c in callouts:
+            c_lo, c_hi = c.get("frames", [frame_lo, frame_hi])
+            if not (c_lo <= frame_idx <= c_hi):
+                continue
+            text = str(c.get("text", "")).strip()
+            if not text:
+                continue
+            position = str(c.get("position", "top"))
+            draw_banner(frame, text, position=position)
+
+        out.write(frame)
+        written += 1
+        frame_idx += 1
+
+    cap.release()
+    out.release()
+    if verbose:
+        print(f"[render_story] {written} frames -> {output_path}")
 
 
 if __name__ == "__main__":
