@@ -35,6 +35,63 @@ def draw_arrow(
     )
 
 
+def draw_curved_arrow(
+    img: np.ndarray,
+    start_px: Tuple[int, int],
+    end_px: Tuple[int, int],
+    color: Tuple[int, int, int],
+    *,
+    thickness: int = 4,
+    bend: float = 0.25,
+    stop_short_px: int = 28,
+    glow: bool = True,
+) -> None:
+    """Quadratic-Bezier arrow from start to end with an inward bend.
+    Reads as a closing-pressure motion, not a straight pass line.
+    `bend` is signed — positive bows clockwise, negative anti-clockwise.
+    `stop_short_px` shortens the head so it lands outside the target ring."""
+    if start_px is None or end_px is None:
+        return
+    sx, sy = start_px
+    ex, ey = end_px
+    dx, dy = ex - sx, ey - sy
+    length = float(np.hypot(dx, dy))
+    if length < 4:
+        return
+
+    # Trim end-point so the head doesn't crash into the target ring
+    trim = min(stop_short_px, int(length * 0.4))
+    ex2 = int(ex - dx * (trim / length))
+    ey2 = int(ey - dy * (trim / length))
+
+    # Control point: midpoint pushed perpendicularly by `bend` * length
+    mx, my = (sx + ex2) / 2.0, (sy + ey2) / 2.0
+    nx, ny = -(ey2 - sy) / max(1.0, length), (ex2 - sx) / max(1.0, length)
+    cx = int(mx + nx * length * bend)
+    cy = int(my + ny * length * bend)
+
+    # Sample 24 points along the Bezier
+    pts = []
+    for i in range(25):
+        t = i / 24.0
+        u = 1.0 - t
+        bx = u * u * sx + 2 * u * t * cx + t * t * ex2
+        by = u * u * sy + 2 * u * t * cy + t * t * ey2
+        pts.append((int(bx), int(by)))
+
+    if glow:
+        for i in range(1, len(pts)):
+            cv2.line(img, pts[i - 1], pts[i], (0, 0, 0), thickness + 3, cv2.LINE_AA)
+    for i in range(1, len(pts)):
+        cv2.line(img, pts[i - 1], pts[i], color, thickness, cv2.LINE_AA)
+    # Arrowhead at the trimmed tip, oriented along the last bezier segment
+    if len(pts) >= 2:
+        cv2.arrowedLine(
+            img, pts[-2], pts[-1], color, thickness,
+            tipLength=0.6, line_type=cv2.LINE_AA,
+        )
+
+
 def draw_dashed_path(
     img: np.ndarray,
     points_px: List[Tuple[int, int]],
@@ -77,6 +134,76 @@ def draw_dashed_path(
 
 
 # ── zone hulls + banners ──────────────────────────────────────────────────
+
+def draw_role_pill(
+    img: np.ndarray,
+    anchor_px: Tuple[int, int],
+    text: str,
+    color: Tuple[int, int, int],
+    *,
+    above_offset_px: int = 22,
+    fg: Tuple[int, int, int] = (255, 255, 255),
+) -> None:
+    """Clean single-piece pill above anchor. No number tab, no fallback '?'.
+    Centred horizontally on anchor. Slightly bolder than draw_caption."""
+    if not text:
+        return
+    text = text.upper()
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    fs = 0.48
+    th = 1
+    (tw, hh), _ = cv2.getTextSize(text, font, fs, th)
+    pad_x, pad_y = 8, 5
+    box_w = tw + 2 * pad_x
+    box_h = hh + 2 * pad_y
+    cx, cy = anchor_px
+    x1 = cx - box_w // 2
+    y2 = max(cy - above_offset_px, box_h)
+    y1 = y2 - box_h
+
+    # Black halo for legibility on grass
+    cv2.rectangle(img, (x1 - 1, y1 - 1), (x1 + box_w + 1, y2 + 1), (0, 0, 0), -1, cv2.LINE_AA)
+    cv2.rectangle(img, (x1, y1), (x1 + box_w, y2), color, -1, cv2.LINE_AA)
+    cv2.putText(img, text, (x1 + pad_x, y2 - pad_y), font, fs, fg, th + 1, cv2.LINE_AA)
+
+
+def draw_local_callout(
+    img: np.ndarray,
+    anchor_px: Tuple[int, int],
+    text: str,
+    *,
+    side: str = "right",
+    bg: Tuple[int, int, int] = (28, 28, 28),
+    fg: Tuple[int, int, int] = (240, 240, 240),
+    accent: Optional[Tuple[int, int, int]] = None,
+) -> None:
+    """Short tactical caption near a player/ring (e.g. 'PASSING LANE CLOSED').
+    `side` controls whether the chip sits to the right or left of anchor."""
+    if not text:
+        return
+    text = text.upper()
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    fs = 0.5
+    th = 1
+    (tw, hh), _ = cv2.getTextSize(text, font, fs, th)
+    pad_x, pad_y = 10, 6
+    box_w = tw + 2 * pad_x + (6 if accent is not None else 0)
+    box_h = hh + 2 * pad_y
+    cx, cy = anchor_px
+    if side == "left":
+        x1 = max(8, cx - 28 - box_w)
+    else:
+        x1 = cx + 28
+    y1 = max(8, cy - box_h // 2)
+    overlay = img.copy()
+    cv2.rectangle(overlay, (x1, y1), (x1 + box_w, y1 + box_h), bg, -1, cv2.LINE_AA)
+    cv2.addWeighted(overlay, 0.85, img, 0.15, 0, img)
+    text_x = x1 + pad_x
+    if accent is not None:
+        cv2.rectangle(img, (x1, y1), (x1 + 5, y1 + box_h), accent, -1, cv2.LINE_AA)
+        text_x = x1 + 5 + pad_x
+    cv2.putText(img, text, (text_x, y1 + box_h - pad_y), font, fs, fg, th, cv2.LINE_AA)
+
 
 def draw_zone_hull(
     img: np.ndarray,

@@ -35,7 +35,10 @@ from services.tactical_overlay import (
     draw_arrow,
     draw_banner,
     draw_caption,
+    draw_curved_arrow,
     draw_dashed_path,
+    draw_local_callout,
+    draw_role_pill,
     draw_zone_hull,
 )
 from services.world_to_image import (
@@ -647,8 +650,20 @@ def render_story(
     arrows_cfg = story.get("arrows", []) or []
     zone_cfg = story.get("zone") or {}
     callouts = story.get("callouts", []) or []
+    local_callouts = story.get("local_callouts", []) or []
+    # Lower default dim — keeps broadcast image alive
     dim_others = bool(story.get("dim_others", True))
-    dim_alpha = float(story.get("dim_alpha", 0.45))
+    dim_alpha = float(story.get("dim_alpha", 0.30))
+    # Distance threshold (metres). A cast member further than this from the
+    # carrier on a given frame gets DROPPED from rings + arrows for that frame
+    # only. Defaults to 12m for "pressing trap" feel; story can override.
+    pressure_max_m = float(story.get("pressure_max_m", 12.0))
+    arrow_kind_default_curved = bool(story.get("curved_pressure_arrows", True))
+    # Role label override map: "DEFENDER" -> "PRESSER", etc.
+    role_label_override: Dict[str, str] = {
+        k.upper(): str(v).upper()
+        for k, v in (story.get("role_labels") or {}).items()
+    }
 
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
@@ -704,23 +719,54 @@ def render_story(
             if fp is not None:
                 foot_px[int(tid)] = fp
 
-        # Step 1: dim entire frame so the cast pops
+        # Carrier + distance-filtered cast.
+        # The carrier ring/zone always renders; pressers/runners/etc. get
+        # dropped on frames where they're > pressure_max_m from the carrier.
+        carrier_tid: Optional[int] = next(
+            (t for t, r in cast_role.items() if r == "CARRIER" and t in foot_px),
+            None,
+        )
+        carrier_world = world_pos.get((carrier_tid, frame_idx)) if carrier_tid is not None else None
+        active_cast: Dict[int, str] = {}
+        for t, r in cast_role.items():
+            if t not in foot_px:
+                continue
+            if r == "CARRIER":
+                active_cast[t] = r
+                continue
+            if carrier_world is None:
+                # No homography for this frame — keep everyone, fall back to pixel filter
+                cp = foot_px.get(carrier_tid) if carrier_tid is not None else None
+                fp = foot_px[t]
+                if cp is None or np.hypot(cp[0] - fp[0], cp[1] - fp[1]) <= 380:
+                    active_cast[t] = r
+                continue
+            wp = world_pos.get((int(t), frame_idx))
+            if wp is None:
+                continue
+            d = float(np.hypot(wp[0] - carrier_world[0], wp[1] - carrier_world[1]))
+            if d <= pressure_max_m:
+                active_cast[t] = r
+        active_set = set(active_cast.keys())
+
+        # Step 1: dim entire frame so the cast pops (lighter default)
         if dim_others:
             black = np.zeros_like(frame)
             cv2.addWeighted(black, dim_alpha, frame, 1.0 - dim_alpha, 0, frame)
 
-        # Step 2: shaded zone (convex hull of cast)
+        # Step 2: shaded zone (convex hull of ACTIVE cast only)
         if zone_cfg:
-            zone_tids = zone_cfg.get("track_ids") or list(cast_set)
+            zone_tids = [t for t in (zone_cfg.get("track_ids") or list(cast_set))
+                         if int(t) in active_set]
             zone_lo, zone_hi = zone_cfg.get("frames", [frame_lo, frame_hi])
-            if zone_lo <= frame_idx <= zone_hi:
-                pts = [foot_px[t] for t in zone_tids if int(t) in foot_px]
+            if zone_lo <= frame_idx <= zone_hi and len(zone_tids) >= 3:
+                pts = [foot_px[int(t)] for t in zone_tids if int(t) in foot_px]
                 if len(pts) >= 3:
                     color = _hex_to_bgr(zone_cfg.get("color", "#ff5544"))
-                    alpha_z = float(zone_cfg.get("alpha", 0.18))
+                    alpha_z = float(zone_cfg.get("alpha", 0.22))
                     draw_zone_hull(frame, pts, color, alpha=alpha_z)
 
-        # Step 3: arrows (drawn under rings, above zone)
+        # Step 3: arrows. Drop arrows whose endpoints aren't both in active cast.
         for ar in arrows_cfg:
             a_lo, a_hi = ar.get("frames", [frame_lo, frame_hi])
             if not (a_lo <= frame_idx <= a_hi):
@@ -729,19 +775,27 @@ def render_story(
             ttid = ar.get("to_track")
             if ftid is None or ttid is None:
                 continue
-            fp = foot_px.get(int(ftid))
-            tp = foot_px.get(int(ttid))
+            ftid, ttid = int(ftid), int(ttid)
+            if ftid not in active_set or ttid not in active_set:
+                continue
+            fp = foot_px.get(ftid)
+            tp = foot_px.get(ttid)
             if fp is None or tp is None:
                 continue
             kind = str(ar.get("kind", "pass")).lower()
             color = ARROW_KIND_COLORS.get(kind)
             if color is None:
-                # carrier or sender team color
-                color = _team_color(team_map.get(int(ftid), -1))
-            draw_arrow(frame, fp, tp, color, thickness=5)
+                color = _team_color(team_map.get(ftid, -1))
+            # Curved bezier for pressure (closing in); straight for pass/run
+            if kind == "pressure" and arrow_kind_default_curved:
+                # Sign the bend so two pressers curve from opposite sides
+                bend = float(ar.get("bend", 0.30 if (ftid % 2 == 0) else -0.30))
+                draw_curved_arrow(frame, fp, tp, color, thickness=4, bend=bend, stop_short_px=32)
+            else:
+                draw_arrow(frame, fp, tp, color, thickness=5)
 
-        # Step 4: cast rings + role nameplates
-        for tid, role in cast_role.items():
+        # Step 4: cast rings + role pills (active cast only)
+        for tid, role in active_cast.items():
             fp = foot_px.get(int(tid))
             if fp is None:
                 continue
@@ -761,9 +815,10 @@ def render_story(
                 inner = max(3, radius // 3)
                 cv2.ellipse(frame, fp, (inner, inner // 2), 0, 0, 360, color, -1, cv2.LINE_AA)
             _draw_foot_ring(frame, fp, radius, color, style="solid", thickness=4)
-            _draw_nameplate(frame, fp, color, pid=role, name=role, number=None)
+            label = role_label_override.get(role, role)
+            draw_role_pill(frame, fp, label, color, above_offset_px=radius + 12)
 
-        # Step 5: callouts
+        # Step 5: title/subtitle banners (top-centre)
         for c in callouts:
             c_lo, c_hi = c.get("frames", [frame_lo, frame_hi])
             if not (c_lo <= frame_idx <= c_hi):
@@ -773,6 +828,25 @@ def render_story(
                 continue
             position = str(c.get("position", "top"))
             draw_banner(frame, text, position=position)
+
+        # Step 6: local in-scene callouts (anchored to a track)
+        for c in local_callouts:
+            c_lo, c_hi = c.get("frames", [frame_lo, frame_hi])
+            if not (c_lo <= frame_idx <= c_hi):
+                continue
+            anchor_tid = c.get("anchor_track")
+            if anchor_tid is None:
+                continue
+            anchor_tid = int(anchor_tid)
+            if anchor_tid not in foot_px:
+                continue
+            text = str(c.get("text", "")).strip()
+            if not text:
+                continue
+            side = str(c.get("side", "right"))
+            accent_team = team_map.get(anchor_tid, -1)
+            accent = _team_color(accent_team) if accent_team in (0, 1) else None
+            draw_local_callout(frame, foot_px[anchor_tid], text, side=side, accent=accent)
 
         out.write(frame)
         written += 1
