@@ -883,11 +883,104 @@ def render_story(
     # ── Pre-validate: minimum geometry must be present ────────────────────
     pressers = [t for (t, r, _) in cast_with_label if r == "DEFENDER"]
     if len(pressers) < 1:
-        raise RuntimeError(
-            "anchor frame does not satisfy minimum trap geometry "
-            f"(no PRESSER/DEFENDER within {presser_max_m}m of carrier at frame {anchor_frame}). "
-            "Try a different anchor_frame or relax presser_max_m in the story."
-        )
+        # Auto-search: scan the story's frame_range for a better anchor frame
+        # where at least 1 DEFENDER is within presser_max_m of the carrier.
+        defender_tids = [tid for (tid, raw_role) in raw_cast
+                         if _normalise_role(raw_role) == "DEFENDER"]
+        best_anchor = None
+        best_min_dist = float("inf")
+        # First try within the story's frame_range, then widen to the full video
+        scan_ranges = [
+            (max(0, frame_lo), min(total - 1, frame_hi) if total else frame_hi),
+        ]
+        if total:
+            scan_ranges.append((0, total - 1))
+        for scan_lo, scan_hi in scan_ranges:
+            if best_anchor is not None:
+                break
+            for fi in range(scan_lo, scan_hi + 1):
+                cw = world_pos.get((int(carrier_tid), fi))
+                if cw is None:
+                    continue
+                for dtid in defender_tids:
+                    dw = world_pos.get((int(dtid), fi))
+                    if dw is None:
+                        continue
+                    d = float(np.hypot(dw[0] - cw[0], dw[1] - cw[1]))
+                    if d <= presser_max_m and d < best_min_dist:
+                        best_min_dist = d
+                        best_anchor = fi
+        if best_anchor is not None:
+            # If the new anchor falls outside the original frame_range,
+            # auto-expand the render window to center around the anchor.
+            if best_anchor < frame_lo or best_anchor > frame_hi:
+                half_win = (frame_hi - frame_lo) // 2
+                frame_lo = max(0, best_anchor - half_win)
+                frame_hi = min((total - 1) if total else 10**9, best_anchor + half_win)
+                if verbose:
+                    print(
+                        f"[render_story] frame_range auto-expanded to "
+                        f"[{frame_lo}, {frame_hi}] to include new anchor"
+                    )
+            if verbose:
+                print(
+                    f"[render_story] anchor_frame {anchor_frame} had no pressers "
+                    f"within {presser_max_m}m — auto-relocated to frame {best_anchor} "
+                    f"(closest defender {best_min_dist:.1f}m)"
+                )
+            anchor_frame = best_anchor
+            # Re-derive anchor foot pixels at the new anchor frame
+            H_inv_anchor = H_inv_by_frame.get(anchor_frame)
+            if H_inv_anchor is None and H_inv_by_frame:
+                nearest = min(H_inv_by_frame.keys(), key=lambda k: abs(k - anchor_frame))
+                H_inv_anchor = H_inv_by_frame[nearest]
+            anchor_rec = frames_data.get(anchor_frame, {})
+            anchor_foot = {}
+            for p in anchor_rec.get("players", []):
+                if p.get("is_official", False):
+                    continue
+                tid_p = p.get("rawTrackId") or p.get("trackId")
+                if tid_p is None:
+                    continue
+                fp = _foot_pixel(p, world_pos, anchor_frame, H_inv_anchor)
+                if fp is not None:
+                    anchor_foot[int(tid_p)] = fp
+            carrier_world = world_pos.get((int(carrier_tid), anchor_frame))
+            # Re-populate cast_with_label from raw_cast at new anchor foot
+            cast_with_label = []
+            for tid, raw_role in raw_cast:
+                norm = _normalise_role(raw_role)
+                if tid in anchor_foot:
+                    cast_with_label.append((tid, norm, raw_role))
+            # Re-apply distance filter
+            if carrier_world is not None:
+                kept = []
+                for (tid, role_key, display) in cast_with_label:
+                    if role_key == "CARRIER":
+                        kept.append((tid, role_key, display)); continue
+                    wp = world_pos.get((int(tid), anchor_frame))
+                    if wp is None:
+                        kept.append((tid, role_key, display)); continue
+                    d = float(np.hypot(wp[0] - carrier_world[0], wp[1] - carrier_world[1]))
+                    limit = option_max_m if role_key == "OPTION" else presser_max_m
+                    if d <= limit:
+                        kept.append((tid, role_key, display))
+                cast_with_label = kept
+            # Re-resolve BLOCKED OPTION at the new anchor
+            if not any(r == "OPTION" for _, r, _ in cast_with_label):
+                blocked_tid = _resolve_blocked_option(
+                    carrier_tid, anchor_frame, world_pos, team_map, max_dist_m=12.0
+                )
+                if blocked_tid is not None and blocked_tid in anchor_foot:
+                    cast_with_label.append((blocked_tid, "OPTION", "BLOCKED OPTION"))
+            pressers = [t for (t, r, _) in cast_with_label if r == "DEFENDER"]
+        if len(pressers) < 1:
+            raise RuntimeError(
+                "No frame in the story's window satisfies minimum trap geometry "
+                f"(no PRESSER/DEFENDER within {presser_max_m}m of carrier in "
+                f"frames [{frame_lo}, {frame_hi}]). "
+                "Try relaxing presser_max_m or choosing a different carrier."
+            )
 
     # ── Build OverlayPlan: cache every drawing primitive's pixel coords ──
     plan: Dict[str, object] = {}
