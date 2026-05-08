@@ -34,9 +34,11 @@ from services.tactical_overlay import (
     caption_for_window,
     draw_arrow,
     draw_banner,
+    draw_blocked_lane,
     draw_caption,
     draw_curved_arrow,
     draw_dashed_path,
+    draw_glow_line,
     draw_local_callout,
     draw_role_pill,
     draw_zone_hull,
@@ -618,6 +620,73 @@ def _foot_pixel(
     return ((x1 + x2) // 2, y2)
 
 
+def _resolve_blocked_option(
+    carrier_tid: int,
+    anchor_frame: int,
+    world_pos: Dict[Tuple[int, int], Tuple[float, float]],
+    team_map: Dict[int, int],
+    *,
+    max_dist_m: float = 12.0,
+) -> Optional[int]:
+    """Find the carrier's nearest teammate at the anchor frame.
+    Returns the trackId or None if no teammate is within max_dist_m."""
+    cw = world_pos.get((int(carrier_tid), int(anchor_frame)))
+    if cw is None:
+        return None
+    carrier_team = team_map.get(int(carrier_tid))
+    best = None
+    best_d = max_dist_m
+    for (tid, fi), (x, y) in world_pos.items():
+        if fi != anchor_frame or tid == carrier_tid:
+            continue
+        if team_map.get(int(tid)) != carrier_team:
+            continue
+        d = float(np.hypot(x - cw[0], y - cw[1]))
+        if d <= best_d:
+            best_d = d
+            best = int(tid)
+    return best
+
+
+def _touchline_pixels(
+    H_inv: np.ndarray,
+    carrier_pixel: Tuple[int, int],
+    pitch_w: float = 105.0,
+    pitch_h: float = 68.0,
+    image_w: int = 1920,
+    image_h: int = 1080,
+) -> Optional[Tuple[Tuple[int, int], Tuple[int, int]]]:
+    """Return (p1, p2) image-space endpoints of the touchline closer to the carrier.
+    Tries world y=0 vs y=68 (top/bottom touchlines)."""
+    candidates = []
+    for y_world in (0.0, pitch_h):
+        try:
+            p1 = project_world_point((0.0, y_world), H_inv)
+            p2 = project_world_point((pitch_w, y_world), H_inv)
+        except Exception:
+            continue
+        if p1 is None or p2 is None:
+            continue
+        # Distance from carrier to the line midpoint
+        mx = (p1[0] + p2[0]) / 2.0
+        my = (p1[1] + p2[1]) / 2.0
+        d = float(np.hypot(mx - carrier_pixel[0], my - carrier_pixel[1]))
+        # Discard lines that are obviously off-screen
+        if not (0 <= mx <= image_w * 1.5) or not (-image_h <= my <= image_h * 2):
+            continue
+        candidates.append((d, p1, p2))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda kv: kv[0])
+    _, p1, p2 = candidates[0]
+    # Clamp endpoints to the visible frame bounds for cleaner rendering
+    def _clamp(p):
+        x = max(0, min(image_w - 1, int(p[0])))
+        y = max(0, min(image_h - 1, int(p[1])))
+        return (x, y)
+    return _clamp(p1), _clamp(p2)
+
+
 def render_story(
     video_path: str,
     results_json: str,
@@ -627,44 +696,79 @@ def render_story(
     output_path: str,
     *,
     verbose: bool = True,
-) -> None:
-    """Render a hardcoded tactical clip from a story JSON sidecar.
+) -> dict:
+    """Anchor-frozen tactical clip render.
 
-    The JSON authors the entire moment — frame range, cast (track_id -> role),
-    arrows (track_id -> track_id with kind), shaded zone (convex hull of cast),
-    callouts (title/subtitle banners). No auto-selection.
+    Computes ring/zone/arrow/touchline geometry ONCE at the story's anchor
+    frame, then draws the same overlay on every frame in frame_range.
+    The broadcast plays underneath; the explanation stays still.
+
+    Story JSON schema (Phase 4.3):
+        {
+          "title": "PRESSING TRAP",
+          "subtitle": "TOUCHLINE 2V1",
+          "frame_range": [140, 215],
+          "anchor_frame": 165,            # optional, default = midpoint
+          "fps": 25,
+          "cast": [
+            {"trackId": 587, "role": "BALL CARRIER"},
+            {"trackId": 622, "role": "PRESSER"},
+            {"trackId": 596, "role": "COVER"}
+          ],
+          "blocked_option_track": null,   # optional, null = auto-pick
+          "show_blocked_lane": true,
+          "show_touchline": true,
+          "dim_alpha": 0.32,
+          "zone_color": "#ff5544",
+          "zone_alpha": 0.22,
+          "callouts": [
+            {"text": "PRESSING TRAP", "position": "top",     "frames":[140,215]},
+            {"text": "TOUCHLINE 2V1", "position": "top_sub", "frames":[140,215]}
+          ]
+        }
+
+    Returns a small validation manifest dict.
     """
     with open(story_json) as f:
         story = json.load(f)
 
+    # ── Story config ──────────────────────────────────────────────────────
     frame_lo, frame_hi = story.get("frame_range", [0, 10**9])
+    anchor_frame = int(story.get("anchor_frame") or (frame_lo + frame_hi) // 2)
+
     cast_list = story.get("cast", []) or []
-    cast_role: Dict[int, str] = {}
+    # Map roles into a canonical key and an optional display label override.
+    # We accept any case; convert to upper for matching against ROLE_RING_RADIUS_MULT.
+    raw_cast: List[Tuple[int, str]] = []
     for entry in cast_list:
         tid = entry.get("trackId")
         if tid is None:
             continue
-        cast_role[int(tid)] = str(entry.get("role", "PLAYER")).upper()
-    cast_set = set(cast_role.keys())
+        raw_cast.append((int(tid), str(entry.get("role", "PLAYER")).upper()))
 
-    arrows_cfg = story.get("arrows", []) or []
-    zone_cfg = story.get("zone") or {}
+    # Find carrier (any "CARRIER" role variant — "BALL CARRIER" maps to CARRIER)
+    def _normalise_role(r: str) -> str:
+        r = r.upper()
+        if "CARRIER" in r:
+            return "CARRIER"
+        if "PRESSER" in r or r == "DEFENDER":
+            return "DEFENDER"
+        if r in ("COVER", "COVER DEFENDER"):
+            return "DEFENDER"
+        if "RUNNER" in r:
+            return "RUNNER"
+        if "BLOCKED" in r:
+            return "OPTION"
+        return r
+
     callouts = story.get("callouts", []) or []
-    local_callouts = story.get("local_callouts", []) or []
-    # Lower default dim — keeps broadcast image alive
-    dim_others = bool(story.get("dim_others", True))
-    dim_alpha = float(story.get("dim_alpha", 0.30))
-    # Distance threshold (metres). A cast member further than this from the
-    # carrier on a given frame gets DROPPED from rings + arrows for that frame
-    # only. Defaults to 12m for "pressing trap" feel; story can override.
-    pressure_max_m = float(story.get("pressure_max_m", 12.0))
-    arrow_kind_default_curved = bool(story.get("curved_pressure_arrows", True))
-    # Role label override map: "DEFENDER" -> "PRESSER", etc.
-    role_label_override: Dict[str, str] = {
-        k.upper(): str(v).upper()
-        for k, v in (story.get("role_labels") or {}).items()
-    }
+    show_touchline = bool(story.get("show_touchline", True))
+    show_blocked_lane = bool(story.get("show_blocked_lane", True))
+    dim_alpha = float(story.get("dim_alpha", 0.32))
+    zone_color = _hex_to_bgr(story.get("zone_color", "#ff5544"))
+    zone_alpha = float(story.get("zone_alpha", 0.22))
 
+    # ── Load track + pitch + team data ────────────────────────────────────
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
         raise FileNotFoundError(f"Video not found: {video_path}")
@@ -676,18 +780,139 @@ def render_story(
 
     with open(results_json) as f:
         track_data = json.load(f)
-    frames_data = {int(f["frameIndex"]): f for f in track_data.get("frames", [])}
+    frames_data = {int(fr["frameIndex"]): fr for fr in track_data.get("frames", [])}
 
-    H_inv_by_frame, world_pos, _ = _load_pitch_map(pitch_map_json)
+    H_inv_by_frame, world_pos, _ball_pos = _load_pitch_map(pitch_map_json)
     team_map = _load_team_map(team_results_json)
 
+    # ── Resolve anchor-frame H_inv ────────────────────────────────────────
+    H_inv_anchor = H_inv_by_frame.get(anchor_frame)
+    if H_inv_anchor is None and H_inv_by_frame:
+        nearest = min(H_inv_by_frame.keys(), key=lambda k: abs(k - anchor_frame))
+        H_inv_anchor = H_inv_by_frame[nearest]
+
+    # ── Anchor-frame foot pixels for everyone in the JSON ────────────────
+    anchor_rec = frames_data.get(anchor_frame, {})
+    anchor_foot: Dict[int, Tuple[int, int]] = {}
+    for p in anchor_rec.get("players", []):
+        if p.get("is_official", False):
+            continue
+        tid = p.get("rawTrackId") or p.get("trackId")
+        if tid is None:
+            continue
+        fp = _foot_pixel(p, world_pos, anchor_frame, H_inv_anchor)
+        if fp is not None:
+            anchor_foot[int(tid)] = fp
+
+    # ── Carrier + cast resolution (with auto-resolve BLOCKED OPTION) ─────
+    carrier_tid: Optional[int] = None
+    cast_with_label: List[Tuple[int, str, str]] = []  # (tid, role_key, display_label)
+    for tid, raw_role in raw_cast:
+        norm = _normalise_role(raw_role)
+        if norm == "CARRIER" and carrier_tid is None:
+            carrier_tid = tid
+        if tid in anchor_foot:
+            cast_with_label.append((tid, norm, raw_role))
+
+    if carrier_tid is None:
+        raise RuntimeError("story has no CARRIER role")
+
+    # Auto-resolve BLOCKED OPTION if not explicitly cast
+    blocked_tid_explicit = story.get("blocked_option_track")
+    blocked_tid: Optional[int] = None
+    if blocked_tid_explicit is not None:
+        blocked_tid = int(blocked_tid_explicit)
+    else:
+        if not any(r == "OPTION" for _, r, _ in cast_with_label):
+            blocked_tid = _resolve_blocked_option(
+                carrier_tid, anchor_frame, world_pos, team_map, max_dist_m=12.0
+            )
+            if blocked_tid is not None and blocked_tid in anchor_foot:
+                cast_with_label.append((blocked_tid, "OPTION", "BLOCKED OPTION"))
+
+    # ── Pre-validate: minimum geometry must be present ────────────────────
+    pressers = [t for (t, r, _) in cast_with_label if r == "DEFENDER"]
+    if len(pressers) < 1:
+        raise RuntimeError(
+            "anchor frame does not satisfy minimum trap geometry "
+            f"(no PRESSER/DEFENDER visible at frame {anchor_frame})"
+        )
+
+    # ── Build OverlayPlan: cache every drawing primitive's pixel coords ──
+    plan: Dict[str, object] = {}
+
+    # Rings + role pills
+    ring_specs: List[dict] = []
+    for tid, role_key, display in cast_with_label:
+        fp = anchor_foot.get(int(tid))
+        if fp is None:
+            continue
+        team = team_map.get(int(tid))
+        color = _team_color(team)
+        base_radius = 24
+        wp = world_pos.get((int(tid), anchor_frame))
+        if wp is not None and H_inv_anchor is not None:
+            rr = project_world_radius(RING_RADIUS_M, wp, H_inv_anchor)
+            if rr is not None:
+                base_radius = int(rr)
+        mult = ROLE_RING_RADIUS_MULT.get(role_key, 1.0)
+        radius = int(base_radius * mult)
+        ring_specs.append({
+            "tid": int(tid),
+            "fp": fp,
+            "radius": radius,
+            "color": color,
+            "role_key": role_key,
+            "label": display,
+        })
+    plan["rings"] = ring_specs
+
+    # Zone hull (carrier + pressers + blocked option)
+    zone_tids = [t for (t, r, _) in cast_with_label if r in ("CARRIER", "DEFENDER", "OPTION")]
+    zone_pts = [anchor_foot[t] for t in zone_tids if t in anchor_foot]
+    plan["zone_pts"] = zone_pts if len(zone_pts) >= 3 else []
+
+    # Pressure arrows: each PRESSER -> CARRIER
+    arrow_specs: List[dict] = []
+    carrier_fp = anchor_foot.get(int(carrier_tid))
+    for i, ptid in enumerate(pressers):
+        pfp = anchor_foot.get(int(ptid))
+        if pfp is None or carrier_fp is None:
+            continue
+        bend = 0.30 if i % 2 == 0 else -0.30
+        arrow_specs.append({
+            "from": pfp,
+            "to": carrier_fp,
+            "color": ARROW_KIND_COLORS["pressure"],
+            "bend": bend,
+        })
+    plan["arrows"] = arrow_specs
+
+    # Blocked passing lane: CARRIER -> BLOCKED OPTION (red dashed with X)
+    blocked_lane = None
+    if show_blocked_lane and blocked_tid is not None and blocked_tid in anchor_foot:
+        blocked_lane = (carrier_fp, anchor_foot[int(blocked_tid)])
+    plan["blocked_lane"] = blocked_lane
+
+    # Touchline glow + chip
+    touchline = None
+    if show_touchline and H_inv_anchor is not None and carrier_fp is not None:
+        touchline = _touchline_pixels(H_inv_anchor, carrier_fp, image_w=w, image_h=h)
+    plan["touchline"] = touchline
+
+    # ── Per-frame loop: draw the cached plan, no recomputation ──────────
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     out = cv2.VideoWriter(str(output_path), fourcc, fps, (w, h))
 
-    frame_idx = 0
     written = 0
+    frame_idx = 0
     if verbose:
-        print(f"[render_story] window=[{frame_lo}, {frame_hi}]  ({(frame_hi - frame_lo + 1) / fps:.1f}s)  cast={cast_role}")
+        print(
+            f"[render_story] anchor_frame={anchor_frame}  window=[{frame_lo}, {frame_hi}]  "
+            f"({(frame_hi - frame_lo + 1) / fps:.1f}s)  "
+            f"cast={[(t, r) for (t, r, _) in cast_with_label]}  "
+            f"blocked_option={blocked_tid}  touchline={'yes' if touchline else 'no'}"
+        )
 
     while True:
         ret, frame = cap.read()
@@ -701,124 +926,43 @@ def render_story(
         if frame_idx > frame_hi:
             break
 
-        rec = frames_data.get(frame_idx, {})
-        H_inv = H_inv_by_frame.get(frame_idx)
-        if H_inv is None and H_inv_by_frame:
-            nearest = min(H_inv_by_frame.keys(), key=lambda k: abs(k - frame_idx))
-            H_inv = H_inv_by_frame[nearest]
-
-        # Per-frame foot pixels for everybody who has a record
-        foot_px: Dict[int, Tuple[int, int]] = {}
-        for p in rec.get("players", []):
-            if p.get("is_official", False):
-                continue
-            tid = p.get("rawTrackId") or p.get("trackId")
-            if tid is None:
-                continue
-            fp = _foot_pixel(p, world_pos, frame_idx, H_inv)
-            if fp is not None:
-                foot_px[int(tid)] = fp
-
-        # Carrier + distance-filtered cast.
-        # The carrier ring/zone always renders; pressers/runners/etc. get
-        # dropped on frames where they're > pressure_max_m from the carrier.
-        carrier_tid: Optional[int] = next(
-            (t for t, r in cast_role.items() if r == "CARRIER" and t in foot_px),
-            None,
-        )
-        carrier_world = world_pos.get((carrier_tid, frame_idx)) if carrier_tid is not None else None
-        active_cast: Dict[int, str] = {}
-        for t, r in cast_role.items():
-            if t not in foot_px:
-                continue
-            if r == "CARRIER":
-                active_cast[t] = r
-                continue
-            if carrier_world is None:
-                # No homography for this frame — keep everyone, fall back to pixel filter
-                cp = foot_px.get(carrier_tid) if carrier_tid is not None else None
-                fp = foot_px[t]
-                if cp is None or np.hypot(cp[0] - fp[0], cp[1] - fp[1]) <= 380:
-                    active_cast[t] = r
-                continue
-            wp = world_pos.get((int(t), frame_idx))
-            if wp is None:
-                continue
-            d = float(np.hypot(wp[0] - carrier_world[0], wp[1] - carrier_world[1]))
-            if d <= pressure_max_m:
-                active_cast[t] = r
-        active_set = set(active_cast.keys())
-
-        # Step 1: dim entire frame so the cast pops (lighter default)
-        if dim_others:
+        # Step 1: dim
+        if dim_alpha > 0:
             black = np.zeros_like(frame)
             cv2.addWeighted(black, dim_alpha, frame, 1.0 - dim_alpha, 0, frame)
 
-        # Step 2: shaded zone (convex hull of ACTIVE cast only)
-        if zone_cfg:
-            zone_tids = [t for t in (zone_cfg.get("track_ids") or list(cast_set))
-                         if int(t) in active_set]
-            zone_lo, zone_hi = zone_cfg.get("frames", [frame_lo, frame_hi])
-            if zone_lo <= frame_idx <= zone_hi and len(zone_tids) >= 3:
-                pts = [foot_px[int(t)] for t in zone_tids if int(t) in foot_px]
-                if len(pts) >= 3:
-                    color = _hex_to_bgr(zone_cfg.get("color", "#ff5544"))
-                    alpha_z = float(zone_cfg.get("alpha", 0.22))
-                    draw_zone_hull(frame, pts, color, alpha=alpha_z)
+        # Step 2: zone hull
+        if plan["zone_pts"]:
+            draw_zone_hull(frame, plan["zone_pts"], zone_color, alpha=zone_alpha)
 
-        # Step 3: arrows. Drop arrows whose endpoints aren't both in active cast.
-        for ar in arrows_cfg:
-            a_lo, a_hi = ar.get("frames", [frame_lo, frame_hi])
-            if not (a_lo <= frame_idx <= a_hi):
-                continue
-            ftid = ar.get("from_track")
-            ttid = ar.get("to_track")
-            if ftid is None or ttid is None:
-                continue
-            ftid, ttid = int(ftid), int(ttid)
-            if ftid not in active_set or ttid not in active_set:
-                continue
-            fp = foot_px.get(ftid)
-            tp = foot_px.get(ttid)
-            if fp is None or tp is None:
-                continue
-            kind = str(ar.get("kind", "pass")).lower()
-            color = ARROW_KIND_COLORS.get(kind)
-            if color is None:
-                color = _team_color(team_map.get(ftid, -1))
-            # Curved bezier for pressure (closing in); straight for pass/run
-            if kind == "pressure" and arrow_kind_default_curved:
-                # Sign the bend so two pressers curve from opposite sides
-                bend = float(ar.get("bend", 0.30 if (ftid % 2 == 0) else -0.30))
-                draw_curved_arrow(frame, fp, tp, color, thickness=4, bend=bend, stop_short_px=32)
-            else:
-                draw_arrow(frame, fp, tp, color, thickness=5)
+        # Step 3: touchline glow + chip
+        if plan["touchline"]:
+            tl_a, tl_b = plan["touchline"]
+            draw_glow_line(frame, tl_a, tl_b, ARROW_KIND_COLORS["pressure"], thickness=10)
 
-        # Step 4: cast rings + role pills (active cast only)
-        for tid, role in active_cast.items():
-            fp = foot_px.get(int(tid))
-            if fp is None:
-                continue
-            team = team_map.get(int(tid))
-            color = _team_color(team)
-            base_radius = 24
-            if H_inv is not None:
-                wp = world_pos.get((int(tid), frame_idx))
-                if wp is not None:
-                    rr = project_world_radius(RING_RADIUS_M, wp, H_inv)
-                    if rr is not None:
-                        base_radius = int(rr)
-            mult = ROLE_RING_RADIUS_MULT.get(role, 1.0)
-            radius = int(base_radius * mult)
-            # CARRIER gets an inner glow
-            if role == "CARRIER":
-                inner = max(3, radius // 3)
+        # Step 4: pressure arrows (curved)
+        for a in plan["arrows"]:
+            draw_curved_arrow(
+                frame, a["from"], a["to"], a["color"],
+                thickness=4, bend=a["bend"], stop_short_px=32,
+            )
+
+        # Step 5: blocked passing lane
+        if plan["blocked_lane"] is not None:
+            ba, bb = plan["blocked_lane"]
+            draw_blocked_lane(frame, ba, bb, color=ARROW_KIND_COLORS["pressure"], thickness=3)
+
+        # Step 6: rings + role pills
+        for r in plan["rings"]:
+            fp = r["fp"]
+            color = r["color"]
+            if r["role_key"] == "CARRIER":
+                inner = max(3, r["radius"] // 3)
                 cv2.ellipse(frame, fp, (inner, inner // 2), 0, 0, 360, color, -1, cv2.LINE_AA)
-            _draw_foot_ring(frame, fp, radius, color, style="solid", thickness=4)
-            label = role_label_override.get(role, role)
-            draw_role_pill(frame, fp, label, color, above_offset_px=radius + 12)
+            _draw_foot_ring(frame, fp, r["radius"], color, style="solid", thickness=4)
+            draw_role_pill(frame, fp, r["label"], color, above_offset_px=r["radius"] + 12)
 
-        # Step 5: title/subtitle banners (top-centre)
+        # Step 7: title + subtitle banners (rendered every frame)
         for c in callouts:
             c_lo, c_hi = c.get("frames", [frame_lo, frame_hi])
             if not (c_lo <= frame_idx <= c_hi):
@@ -829,24 +973,20 @@ def render_story(
             position = str(c.get("position", "top"))
             draw_banner(frame, text, position=position)
 
-        # Step 6: local in-scene callouts (anchored to a track)
-        for c in local_callouts:
-            c_lo, c_hi = c.get("frames", [frame_lo, frame_hi])
-            if not (c_lo <= frame_idx <= c_hi):
-                continue
-            anchor_tid = c.get("anchor_track")
-            if anchor_tid is None:
-                continue
-            anchor_tid = int(anchor_tid)
-            if anchor_tid not in foot_px:
-                continue
-            text = str(c.get("text", "")).strip()
-            if not text:
-                continue
-            side = str(c.get("side", "right"))
-            accent_team = team_map.get(anchor_tid, -1)
-            accent = _team_color(accent_team) if accent_team in (0, 1) else None
-            draw_local_callout(frame, foot_px[anchor_tid], text, side=side, accent=accent)
+        # Step 8: anchored callouts derived from the plan
+        if plan["touchline"]:
+            tl_a, _ = plan["touchline"]
+            draw_local_callout(
+                frame, tl_a, "TOUCHLINE = EXTRA DEFENDER",
+                side="right", accent=ARROW_KIND_COLORS["pressure"],
+            )
+        if plan["blocked_lane"] is not None and carrier_fp is not None:
+            mx = (plan["blocked_lane"][0][0] + plan["blocked_lane"][1][0]) // 2
+            my = (plan["blocked_lane"][0][1] + plan["blocked_lane"][1][1]) // 2
+            draw_local_callout(
+                frame, (mx, my), "PASSING LANE CLOSED",
+                side="right", accent=ARROW_KIND_COLORS["pressure"],
+            )
 
         out.write(frame)
         written += 1
@@ -854,8 +994,31 @@ def render_story(
 
     cap.release()
     out.release()
+
+    # ── Validation manifest ───────────────────────────────────────────────
+    manifest = {
+        "anchor_frame": anchor_frame,
+        "frames_written": written,
+        "total_frames_window": frame_hi - frame_lo + 1,
+        "rings": len(plan["rings"]),
+        "arrows": len(plan["arrows"]),
+        "zone_pts": len(plan["zone_pts"]) if plan["zone_pts"] else 0,
+        "touchline": bool(plan["touchline"]),
+        "blocked_lane": bool(plan["blocked_lane"]),
+        "carrier_tid": carrier_tid,
+        "blocked_tid": blocked_tid,
+    }
     if verbose:
-        print(f"[render_story] {written} frames -> {output_path}")
+        print(f"[render_story] manifest={manifest}")
+        if manifest["rings"] < 3:
+            print(f"[render_story] WARN rings={manifest['rings']} < 3 — story too thin")
+        if manifest["arrows"] < 1:
+            print(f"[render_story] WARN no arrows in plan")
+        if manifest["zone_pts"] < 3:
+            print(f"[render_story] WARN no zone hull (need >=3 points at anchor)")
+        if not manifest["touchline"]:
+            print(f"[render_story] WARN touchline not resolved (homography missing?)")
+    return manifest
 
 
 if __name__ == "__main__":

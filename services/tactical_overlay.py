@@ -135,6 +135,54 @@ def draw_dashed_path(
 
 # ── zone hulls + banners ──────────────────────────────────────────────────
 
+def draw_glow_line(
+    img: np.ndarray,
+    p_from: Tuple[int, int],
+    p_to: Tuple[int, int],
+    color: Tuple[int, int, int],
+    *,
+    thickness: int = 10,
+    glow_layers: int = 3,
+) -> None:
+    """Thick semi-transparent line with a halo. Used to mark the touchline as
+    a tactical 'extra defender' so the trap reads spatially."""
+    if p_from is None or p_to is None:
+        return
+    # Outer halo (very thick, very transparent)
+    overlay = img.copy()
+    for i in range(glow_layers, 0, -1):
+        t = thickness + i * 6
+        a = 0.10 + 0.06 * (glow_layers - i + 1)
+        cv2.line(overlay, p_from, p_to, color, t, cv2.LINE_AA)
+        cv2.addWeighted(overlay, a, img, 1.0 - a, 0, img)
+    # Bright core
+    cv2.line(img, p_from, p_to, color, thickness, cv2.LINE_AA)
+
+
+def draw_blocked_lane(
+    img: np.ndarray,
+    p_from: Tuple[int, int],
+    p_to: Tuple[int, int],
+    color: Tuple[int, int, int] = (56, 56, 240),
+    *,
+    thickness: int = 3,
+) -> None:
+    """Dashed line with a small 'X' at midpoint — 'this passing lane is closed'."""
+    if p_from is None or p_to is None:
+        return
+    # Dashed using existing helper
+    pts = [p_from, p_to]
+    draw_dashed_path(img, pts, color, thickness=thickness, seg_len=10, gap=8, fade=False)
+    # X marker at midpoint
+    mx = (p_from[0] + p_to[0]) // 2
+    my = (p_from[1] + p_to[1]) // 2
+    s = 9
+    cv2.line(img, (mx - s, my - s), (mx + s, my + s), (0, 0, 0), thickness + 2, cv2.LINE_AA)
+    cv2.line(img, (mx - s, my + s), (mx + s, my - s), (0, 0, 0), thickness + 2, cv2.LINE_AA)
+    cv2.line(img, (mx - s, my - s), (mx + s, my + s), color, thickness, cv2.LINE_AA)
+    cv2.line(img, (mx - s, my + s), (mx + s, my - s), color, thickness, cv2.LINE_AA)
+
+
 def draw_role_pill(
     img: np.ndarray,
     anchor_px: Tuple[int, int],
