@@ -263,11 +263,12 @@ def draw_zone_hull(
     points_px: List[Tuple[int, int]],
     color_bgr: Tuple[int, int, int],
     *,
-    alpha: float = 0.18,
-    outline_thickness: int = 2,
+    alpha: float = 0.32,
+    outline_thickness: int = 3,
 ) -> None:
-    """Filled convex hull of given pixel points + 2px outline.
-    Used for shaded tactical zones (pressing trap, overload, defensive line, etc.)."""
+    """Filled convex hull + saturated outline + thin black shadow ring.
+    Used for shaded tactical zones (pressing trap, overload, defensive line, etc.).
+    The shadow ring keeps the polygon legible on bright grass."""
     pts = [p for p in points_px if p is not None]
     if len(pts) < 3:
         return
@@ -276,9 +277,12 @@ def draw_zone_hull(
     overlay = img.copy()
     cv2.fillPoly(overlay, [hull], color_bgr, cv2.LINE_AA)
     cv2.addWeighted(overlay, alpha, img, 1.0 - alpha, 0, img)
-    # Slightly more saturated outline
+    # Black shadow underneath the saturated outline so the polygon reads on grass
+    cv2.polylines(img, [hull], isClosed=True, color=(0, 0, 0),
+                  thickness=outline_thickness + 2, lineType=cv2.LINE_AA)
     outline = tuple(min(255, int(c * 1.2)) for c in color_bgr)
-    cv2.polylines(img, [hull], isClosed=True, color=outline, thickness=outline_thickness, lineType=cv2.LINE_AA)
+    cv2.polylines(img, [hull], isClosed=True, color=outline,
+                  thickness=outline_thickness, lineType=cv2.LINE_AA)
 
 
 def draw_banner(

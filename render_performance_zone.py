@@ -585,6 +585,7 @@ ARROW_KIND_COLORS = {
 ROLE_RING_RADIUS_MULT = {
     "CARRIER":   1.55,
     "DEFENDER":  1.05,
+    "COVER":     1.00,
     "RUNNER":    1.25,
     "OPTION":    1.05,
 }
@@ -654,13 +655,16 @@ def _touchline_world(
     pitch_h: float = 68.0,
     *,
     segment_len_m: float = 18.0,
+    max_dist_m: float = 6.0,
 ) -> Optional[Tuple[Tuple[float, float], Tuple[float, float]]]:
     """Return WORLD-COORD endpoints of a short touchline segment near the
     carrier.  The segment is `segment_len_m` metres long along whichever
     touchline (y=0 or y=68) the carrier is closer to, centred on the
     carrier's x-coord.
 
-    Returns None if the carrier is >14 m from either touchline.
+    Returns None if the carrier is more than `max_dist_m` metres from either
+    touchline. Default is 6 m for pressing-trap stories. Story authors can
+    relax this for `WIDE_CHANNEL_CHASE` stories via story.touchline_max_m.
     Pixel projection happens per-frame in the render loop.
     """
     if carrier_world is None:
@@ -670,8 +674,8 @@ def _touchline_world(
     near_top = abs(cy - y_top)
     near_bot = abs(cy - y_bot)
     y_tl = y_top if near_top <= near_bot else y_bot
-    if min(near_top, near_bot) > 14.0:
-        return None  # carrier is mid-pitch, touchline isn't part of the trap
+    if min(near_top, near_bot) > max_dist_m:
+        return None  # carrier is too far from any touchline for it to be part of the story
     half = segment_len_m / 2.0
     x_a = max(0.0, cx - half)
     x_b = min(pitch_w, cx + half)
@@ -701,11 +705,23 @@ def render_story(
     *,
     verbose: bool = True,
 ) -> dict:
-    """Anchor-frozen tactical clip render.
+    """Anchor-derived, per-frame-reprojected tactical clip render.
 
-    Computes ring/zone/arrow/touchline geometry ONCE at the story's anchor
-    frame, then draws the same overlay on every frame in frame_range.
-    The broadcast plays underneath; the explanation stays still.
+    Overlay GEOMETRY is computed in **world** coordinates at the story's
+    anchor frame (cast trackIds, zone hull world points, arrow world
+    endpoints, touchline world segment, blocked-lane track endpoints).
+    On every frame the renderer looks up that frame's homography and
+    reprojects each primitive to image space — players move, the camera
+    pans/zooms, and the overlays follow the pitch (NOT a fixed screen
+    position).
+
+    Story validity is checked at the anchor frame against geometric
+    preconditions (e.g. PRESSING_TRAP requires carrier near touchline,
+    >=2 pressers within 8 m, good angle spread, tight zone). If the
+    user's anchor doesn't satisfy them, the renderer scans the clip for
+    a better anchor; if none qualifies, the story is honestly retitled
+    via STORY_TYPE_TITLE — unless `strict_story_type` is set in the JSON,
+    in which case it raises.
 
     Story JSON schema (Phase 4.3):
         {
@@ -758,7 +774,7 @@ def render_story(
         if "PRESSER" in r or r == "DEFENDER":
             return "DEFENDER"
         if r in ("COVER", "COVER DEFENDER"):
-            return "DEFENDER"
+            return "COVER"
         if "RUNNER" in r:
             return "RUNNER"
         if "BLOCKED" in r:
@@ -786,7 +802,7 @@ def render_story(
         track_data = json.load(f)
     frames_data = {int(fr["frameIndex"]): fr for fr in track_data.get("frames", [])}
 
-    H_inv_by_frame, world_pos, _ball_pos = _load_pitch_map(pitch_map_json)
+    H_inv_by_frame, world_pos, ball_pos = _load_pitch_map(pitch_map_json)
     team_map = _load_team_map(team_results_json)
 
     # ── Resolve anchor-frame H_inv ────────────────────────────────────────
@@ -848,7 +864,7 @@ def render_story(
                 dropped_reasons.append(f"{display}/tid={tid} {d:.1f}m>{limit}m")
         cast_with_label = kept
         if dropped_reasons and verbose:
-            print(f"[render_story] dropped from cast: {dropped_reasons}")
+            print(f"[render_story] dropped from cast (anchor F={anchor_frame}): {dropped_reasons}")
 
     # Auto-resolve BLOCKED OPTION if not explicitly cast (and not already filtered out)
     blocked_tid_explicit = story.get("blocked_option_track")
@@ -863,55 +879,95 @@ def render_story(
             if blocked_tid is not None and blocked_tid in anchor_foot:
                 cast_with_label.append((blocked_tid, "OPTION", "BLOCKED OPTION"))
 
-    # ── Pre-validate: minimum geometry must be present ────────────────────
-    pressers = [t for (t, r, _) in cast_with_label if r == "DEFENDER"]
-    if len(pressers) < 1:
-        # Auto-search: scan the story's frame_range for a better anchor frame
-        # where at least 1 DEFENDER is within presser_max_m of the carrier.
-        defender_tids = [tid for (tid, raw_role) in raw_cast
-                         if _normalise_role(raw_role) == "DEFENDER"]
-        best_anchor = None
-        best_min_dist = float("inf")
-        # First try within the story's frame_range, then widen to the full video
+    # ── Validity-aware relocator ──────────────────────────────────────────
+    # The story is validated against the geometric preconditions of its
+    # declared type (pressing trap = near touchline, 2+ pressers, good angle
+    # spread, tight zone). If the user's anchor doesn't satisfy them, we scan
+    # all frames for the best match. If none is valid, we either RETITLE the
+    # story honestly (default) or RAISE if `strict_story_type` is set.
+    from services.story_validators import (  # local import to avoid cycles
+        STORY_TYPE_TITLE,
+        soft_score_pressing_trap,
+        validate_pressing_trap,
+    )
+
+    declared_story_type = "PRESSING_TRAP"  # only PRESSING_TRAP is implemented
+    strict_story_type = bool(story.get("strict_story_type", False))
+    declared_defender_tids = [
+        tid for (tid, raw_role) in raw_cast
+        if _normalise_role(raw_role) in ("DEFENDER", "COVER")
+    ]
+
+    def _validate_at(fi: int) -> Tuple[bool, str, dict]:
+        return validate_pressing_trap(
+            world_pos, fi, int(carrier_tid), declared_defender_tids
+        )
+
+    is_valid, recommended_type, geom = _validate_at(anchor_frame)
+    if verbose:
+        print(
+            f"[render_story] validator @ user anchor F={anchor_frame}: "
+            f"valid={is_valid} type={recommended_type} geom={geom}"
+        )
+
+    if not is_valid:
+        # Scan frame_range first, then full video, scoring every frame
         scan_ranges = [
             (max(0, frame_lo), min(total - 1, frame_hi) if total else frame_hi),
         ]
         if total:
             scan_ranges.append((0, total - 1))
+
+        best_fi = None
+        best_score = -1.0
+        best_geom = None
+        best_type = recommended_type
+        best_valid = False
+        seen_fi: set = set()
         for scan_lo, scan_hi in scan_ranges:
-            if best_anchor is not None:
-                break
             for fi in range(scan_lo, scan_hi + 1):
-                cw = world_pos.get((int(carrier_tid), fi))
-                if cw is None:
+                if fi in seen_fi:
                     continue
-                for dtid in defender_tids:
-                    dw = world_pos.get((int(dtid), fi))
-                    if dw is None:
-                        continue
-                    d = float(np.hypot(dw[0] - cw[0], dw[1] - cw[1]))
-                    if d <= presser_max_m and d < best_min_dist:
-                        best_min_dist = d
-                        best_anchor = fi
-        if best_anchor is not None:
-            # If the new anchor falls outside the original frame_range,
-            # auto-expand the render window to center around the anchor.
-            if best_anchor < frame_lo or best_anchor > frame_hi:
+                seen_fi.add(fi)
+                v, t, g = _validate_at(fi)
+                s = soft_score_pressing_trap(g)
+                # Prefer valid frames; among valid, take the highest soft score
+                priority = (1.0 if v else 0.0) * 1000 + s
+                if priority > best_score:
+                    best_score = priority
+                    best_fi = fi
+                    best_geom = g
+                    best_type = t
+                    best_valid = v
+            if best_valid:
+                break  # don't widen if we found a valid anchor in the original range
+
+        if best_fi is None:
+            if strict_story_type:
+                raise RuntimeError(
+                    f"Story declared {declared_story_type} but no frame in "
+                    f"[{frame_lo}, {frame_hi}] satisfies the geometry, and "
+                    "strict_story_type is set."
+                )
+            best_fi = anchor_frame  # keep original
+        if verbose:
+            print(
+                f"[render_story] relocator picked F={best_fi}  valid={best_valid}  "
+                f"type={best_type}  score={best_score:.2f}  geom={best_geom}"
+            )
+
+        # Move anchor to the best frame
+        if best_fi != anchor_frame:
+            if best_fi < frame_lo or best_fi > frame_hi:
                 half_win = (frame_hi - frame_lo) // 2
-                frame_lo = max(0, best_anchor - half_win)
-                frame_hi = min((total - 1) if total else 10**9, best_anchor + half_win)
+                frame_lo = max(0, best_fi - half_win)
+                frame_hi = min((total - 1) if total else 10**9, best_fi + half_win)
                 if verbose:
                     print(
                         f"[render_story] frame_range auto-expanded to "
                         f"[{frame_lo}, {frame_hi}] to include new anchor"
                     )
-            if verbose:
-                print(
-                    f"[render_story] anchor_frame {anchor_frame} had no pressers "
-                    f"within {presser_max_m}m — auto-relocated to frame {best_anchor} "
-                    f"(closest defender {best_min_dist:.1f}m)"
-                )
-            anchor_frame = best_anchor
+            anchor_frame = best_fi
             # Re-derive anchor foot pixels at the new anchor frame
             H_inv_anchor = H_inv_by_frame.get(anchor_frame)
             if H_inv_anchor is None and H_inv_by_frame:
@@ -929,13 +985,11 @@ def render_story(
                 if fp is not None:
                     anchor_foot[int(tid_p)] = fp
             carrier_world = world_pos.get((int(carrier_tid), anchor_frame))
-            # Re-populate cast_with_label from raw_cast at new anchor foot
             cast_with_label = []
             for tid, raw_role in raw_cast:
                 norm = _normalise_role(raw_role)
                 if tid in anchor_foot:
                     cast_with_label.append((tid, norm, raw_role))
-            # Re-apply distance filter
             if carrier_world is not None:
                 kept = []
                 for (tid, role_key, display) in cast_with_label:
@@ -949,21 +1003,59 @@ def render_story(
                     if d <= limit:
                         kept.append((tid, role_key, display))
                 cast_with_label = kept
-            # Re-resolve BLOCKED OPTION at the new anchor
             if not any(r == "OPTION" for _, r, _ in cast_with_label):
-                blocked_tid = _resolve_blocked_option(
+                blocked_tid_re = _resolve_blocked_option(
                     carrier_tid, anchor_frame, world_pos, team_map, max_dist_m=12.0
                 )
-                if blocked_tid is not None and blocked_tid in anchor_foot:
-                    cast_with_label.append((blocked_tid, "OPTION", "BLOCKED OPTION"))
-            pressers = [t for (t, r, _) in cast_with_label if r == "DEFENDER"]
-        if len(pressers) < 1:
-            raise RuntimeError(
-                "No frame in the story's window satisfies minimum trap geometry "
-                f"(no PRESSER/DEFENDER within {presser_max_m}m of carrier in "
-                f"frames [{frame_lo}, {frame_hi}]). "
-                "Try relaxing presser_max_m or choosing a different carrier."
+                if blocked_tid_re is not None and blocked_tid_re in anchor_foot:
+                    cast_with_label.append((blocked_tid_re, "OPTION", "BLOCKED OPTION"))
+                    if blocked_tid_explicit is None:
+                        blocked_tid = blocked_tid_re
+            pressers = [t for (t, r, _) in cast_with_label if r in ("DEFENDER", "COVER")]
+            geom = best_geom
+            is_valid = best_valid
+            recommended_type = best_type
+        else:
+            geom = best_geom or geom
+            is_valid = best_valid
+            recommended_type = best_type
+
+        # If still invalid, downgrade title (or raise under strict mode)
+        if not is_valid:
+            if strict_story_type:
+                raise RuntimeError(
+                    f"Story declared {declared_story_type} but the best available "
+                    f"frame F={anchor_frame} only qualifies as {recommended_type}, "
+                    "and strict_story_type is set."
+                )
+            new_title, new_subtitle = STORY_TYPE_TITLE.get(
+                recommended_type, STORY_TYPE_TITLE["1V1_PRESSURE"]
             )
+            # Mutate callouts in place: 'top' -> new_title, 'top_sub' -> new_subtitle
+            for c in callouts:
+                pos = str(c.get("position", "top"))
+                if pos == "top":
+                    c["text"] = new_title
+                elif pos == "top_sub":
+                    c["text"] = new_subtitle
+            if verbose:
+                print(
+                    f"[render_story] retitled story_type={declared_story_type} "
+                    f"-> {recommended_type}"
+                )
+
+    if len(pressers) < 1:
+        raise RuntimeError(
+            "No frame satisfies even the relaxed minimum trap geometry "
+            f"(no defender within {presser_max_m}m of carrier in "
+            f"[{frame_lo}, {frame_hi}]). Try a different carrier."
+        )
+
+    # Final validator pass at the resolved anchor — used by the manifest
+    final_valid, final_type, final_geom = _validate_at(anchor_frame)
+    if not final_valid and not is_valid:
+        # We downgraded; the manifest will reflect that.
+        pass
 
     # ── Build OverlayPlan: world-space geometry (reprojected per-frame) ───
     plan: Dict[str, object] = {}
@@ -983,7 +1075,7 @@ def render_story(
 
     # Zone hull in WORLD coords — carrier + pressers only (no OPTION).
     # Shrink toward centroid so the zone reads as the LOCAL trap.
-    zone_tids = [t for (t, r, _) in cast_with_label if r in ("CARRIER", "DEFENDER")]
+    zone_tids = [t for (t, r, _) in cast_with_label if r in ("CARRIER", "DEFENDER", "COVER")]
     zone_world_raw = [world_pos.get((int(t), anchor_frame)) for t in zone_tids]
     zone_world_raw = [wp for wp in zone_world_raw if wp is not None]
     if len(zone_world_raw) >= 3:
@@ -1011,19 +1103,36 @@ def render_story(
         plan["blocked_lane"] = None
 
     # Touchline glow — short segment in WORLD coords near the carrier.
+    # Default max distance is 6m (pressing-trap geometry). Story authors can
+    # relax for WIDE_CHANNEL_CHASE etc. via touchline_max_m.
     touchline_world = None
     if show_touchline and carrier_world is not None:
         touchline_world = _touchline_world(
             carrier_world,
             segment_len_m=float(story.get("touchline_segment_m", 18.0)),
+            max_dist_m=float(story.get("touchline_max_m", 6.0)),
         )
     plan["touchline_world"] = touchline_world
+
+    # ── Ball-dot pre-flight ──────────────────────────────────────────────
+    show_ball = bool(story.get("show_ball", True))
+    ball_in_window = False
+    if show_ball and ball_pos:
+        ball_in_window = any(frame_lo <= fi <= frame_hi for fi in ball_pos.keys())
+        if not ball_in_window and verbose:
+            print(
+                f"[render_story] WARN ball_pos has {len(ball_pos)} entries but "
+                f"none inside window [{frame_lo}, {frame_hi}] — ball dot will be skipped"
+            )
+    elif show_ball and verbose:
+        print("[render_story] WARN ball_pos empty — ball dot will be skipped")
 
     # ── Per-frame loop: reproject world → image each frame ──────────────
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     out = cv2.VideoWriter(str(output_path), fourcc, fps, (w, h))
 
     written = 0
+    ball_dots_drawn = 0
     frame_idx = 0
     if verbose:
         print(
@@ -1143,10 +1252,31 @@ def render_story(
                 carrier_px = fp
             _draw_foot_ring(frame, fp, radius, color, style="solid", thickness=4)
             below = r["role_key"] == "OPTION"
+            # Dynamic pill offset: ~half-radius at wide shots, capped low at zoom
+            pill_offset = max(int(radius * 0.55) + 12, 24)
             draw_role_pill(
                 frame, fp, r["label"], color,
-                above_offset_px=radius + 12, below=below,
+                above_offset_px=pill_offset, below=below,
             )
+
+        # Step 6.5: ball dot — yellow ring + filled inner dot at ball world pos
+        if show_ball and ball_pos and H_inv is not None:
+            ball_w = ball_pos.get(frame_idx)
+            if ball_w is None:
+                # Tolerance: ±10 frames
+                for delta in range(1, 11):
+                    if (b1 := ball_pos.get(frame_idx - delta)) is not None:
+                        ball_w = b1; break
+                    if (b2 := ball_pos.get(frame_idx + delta)) is not None:
+                        ball_w = b2; break
+            if ball_w is not None:
+                ball_px = _proj(ball_w)
+                if ball_px is not None:
+                    # Outer halo + ring + filled inner dot
+                    cv2.circle(frame, ball_px, 11, (0, 0, 0), 2, cv2.LINE_AA)
+                    cv2.circle(frame, ball_px, 9, BALL, 2, cv2.LINE_AA)
+                    cv2.circle(frame, ball_px, 4, BALL, -1, cv2.LINE_AA)
+                    ball_dots_drawn += 1
 
         # Step 7: title + subtitle banners (screen-space, not pitch-anchored)
         for c in callouts:
@@ -1187,28 +1317,73 @@ def render_story(
     out.release()
 
     # ── Validation manifest ───────────────────────────────────────────────
+    declared_pressers = sum(1 for (_, raw_role) in raw_cast
+                            if _normalise_role(raw_role) in ("DEFENDER", "COVER"))
+    active_pressers = sum(1 for (_, r, _) in cast_with_label
+                          if r in ("DEFENDER", "COVER"))
+    cover_declared = any(_normalise_role(r) == "COVER" for (_, r) in raw_cast)
+    cover_active = any(r == "COVER" for (_, r, _) in cast_with_label)
+    final_story_type = recommended_type if not is_valid else declared_story_type
+    retitled = (final_story_type != declared_story_type) or (not is_valid and final_valid is False)
+
     manifest = {
+        "story_valid": bool(final_valid),
+        "story_type": final_story_type,
         "anchor_frame": anchor_frame,
         "frames_written": written,
         "total_frames_window": frame_hi - frame_lo + 1,
-        "rings": len(plan["rings"]),
-        "arrows": len(plan["arrows"]),
-        "zone_world": len(plan["zone_world"]) if plan["zone_world"] else 0,
-        "touchline": bool(plan["touchline_world"]),
-        "blocked_lane": bool(plan["blocked_lane"]),
-        "carrier_tid": carrier_tid,
-        "blocked_tid": blocked_tid,
+        # Geometry from validator at the resolved anchor
+        "carrier_touchline_distance_m": (final_geom or {}).get("carrier_touchline_distance_m"),
+        "presser_angle_spread_deg":     (final_geom or {}).get("presser_angle_spread_deg"),
+        "trap_zone_area_m2":            (final_geom or {}).get("trap_zone_area_m2"),
+        "carrier_pitch_third":          (final_geom or {}).get("carrier_pitch_third"),
+        # Cast accounting
+        "pressers_declared": declared_pressers,
+        "pressers_active":   active_pressers,
+        "cover_declared":    cover_declared,
+        "cover_active":      cover_active,
+        "retitled":          retitled,
+        # Visual primitives
+        "rings":         len(plan["rings"]),
+        "arrows":        len(plan["arrows"]),
+        "zone_world":    len(plan["zone_world"]) if plan["zone_world"] else 0,
+        "touchline":     bool(plan["touchline_world"]),
+        "blocked_lane":  bool(plan["blocked_lane"]),
+        "ball_dots_drawn": ball_dots_drawn,
+        "carrier_tid":   carrier_tid,
+        "blocked_tid":   blocked_tid,
     }
     if verbose:
         print(f"[render_story] manifest={manifest}")
+        # Hard pass/fail signals — always print when triggered
+        if active_pressers < declared_pressers:
+            print(
+                f"[render_story] WARN pressers_active={active_pressers} < "
+                f"declared={declared_pressers} (story may have been retitled)"
+            )
+        if cover_declared and not cover_active:
+            print("[render_story] WARN cover_declared=True but cover_active=False — cover lost")
+        if retitled:
+            print(
+                f"[render_story] WARN story_type was downgraded to {final_story_type} "
+                "(use strict_story_type=true in JSON to force a hard error)"
+            )
+        if show_ball:
+            if ball_dots_drawn == 0:
+                print("[render_story] WARN no ball positions found in window — ball dot never drawn")
+            elif written and ball_dots_drawn / max(written, 1) < 0.5:
+                print(
+                    f"[render_story] WARN ball tracking sparse: "
+                    f"{ball_dots_drawn}/{written} frames had a ball position"
+                )
         if manifest["rings"] < 3:
             print(f"[render_story] WARN rings={manifest['rings']} < 3 — story too thin")
         if manifest["arrows"] < 1:
-            print(f"[render_story] WARN no arrows in plan")
+            print("[render_story] WARN no arrows in plan")
         if manifest["zone_world"] < 3:
-            print(f"[render_story] WARN no zone hull (need >=3 world points at anchor)")
+            print("[render_story] WARN no zone hull (need >=3 world points at anchor)")
         if not manifest["touchline"]:
-            print(f"[render_story] WARN touchline not resolved (homography missing?)")
+            print("[render_story] WARN touchline not resolved (carrier far from sideline OR homography missing)")
     return manifest
 
 
