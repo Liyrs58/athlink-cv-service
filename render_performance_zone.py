@@ -1453,7 +1453,7 @@ def render_story(
                     continue
                 wp = world_pos.get((int(r["tid"]), anchor_frame))
                 radius_m = RING_RADIUS_M * ROLE_RING_RADIUS_MULT.get(r["role_key"], 1.0)
-                radius = project_world_radius(radius_m, wp, H_inv) if (wp and H_inv) else 28
+                radius = project_world_radius(radius_m, wp, H_inv) if (wp is not None and H_inv is not None) else 28
                 fp = _proj(wp) if wp else anchor_foot.get(int(r["tid"]))
                 if fp is None:
                     continue
