@@ -650,41 +650,62 @@ def _resolve_blocked_option(
 
 def _touchline_pixels(
     H_inv: np.ndarray,
-    carrier_pixel: Tuple[int, int],
+    carrier_world: Optional[Tuple[float, float]],
     pitch_w: float = 105.0,
     pitch_h: float = 68.0,
     image_w: int = 1920,
     image_h: int = 1080,
+    *,
+    segment_len_m: float = 18.0,
 ) -> Optional[Tuple[Tuple[int, int], Tuple[int, int]]]:
-    """Return (p1, p2) image-space endpoints of the touchline closer to the carrier.
-    Tries world y=0 vs y=68 (top/bottom touchlines)."""
-    candidates = []
-    for y_world in (0.0, pitch_h):
-        try:
-            p1 = project_world_point((0.0, y_world), H_inv)
-            p2 = project_world_point((pitch_w, y_world), H_inv)
-        except Exception:
-            continue
-        if p1 is None or p2 is None:
-            continue
-        # Distance from carrier to the line midpoint
-        mx = (p1[0] + p2[0]) / 2.0
-        my = (p1[1] + p2[1]) / 2.0
-        d = float(np.hypot(mx - carrier_pixel[0], my - carrier_pixel[1]))
-        # Discard lines that are obviously off-screen
-        if not (0 <= mx <= image_w * 1.5) or not (-image_h <= my <= image_h * 2):
-            continue
-        candidates.append((d, p1, p2))
-    if not candidates:
+    """Return (p1, p2) image-space endpoints of a SHORT touchline segment near
+    the carrier. The segment is `segment_len_m` metres long along the world
+    touchline, centred on the carrier's x-coord projected onto y=0 or y=68.
+
+    Returns None if the carrier isn't reasonably close to a touchline (>14 m).
+    """
+    if carrier_world is None:
         return None
-    candidates.sort(key=lambda kv: kv[0])
-    _, p1, p2 = candidates[0]
-    # Clamp endpoints to the visible frame bounds for cleaner rendering
+    cx_world, cy_world = carrier_world
+    # Pick whichever touchline (y=0 or y=68) the carrier is closer to
+    y_top = 0.0
+    y_bot = pitch_h
+    near_top = abs(cy_world - y_top)
+    near_bot = abs(cy_world - y_bot)
+    y_world = y_top if near_top <= near_bot else y_bot
+    if min(near_top, near_bot) > 14.0:
+        return None  # carrier is mid-pitch, touchline isn't part of the trap
+
+    # Carrier projected onto the touchline (in world coords)
+    half = segment_len_m / 2.0
+    x_a = max(0.0, cx_world - half)
+    x_b = min(pitch_w, cx_world + half)
+    try:
+        p1 = project_world_point((x_a, y_world), H_inv)
+        p2 = project_world_point((x_b, y_world), H_inv)
+    except Exception:
+        return None
+    if p1 is None or p2 is None:
+        return None
+
     def _clamp(p):
         x = max(0, min(image_w - 1, int(p[0])))
         y = max(0, min(image_h - 1, int(p[1])))
         return (x, y)
     return _clamp(p1), _clamp(p2)
+
+
+def _shrink_polygon(points_px: List[Tuple[int, int]], factor: float = 0.72) -> List[Tuple[int, int]]:
+    """Shrink a polygon toward its centroid. `factor=0.72` keeps the trap zone
+    tight to the cast instead of ballooning out to wide convex-hull edges."""
+    if not points_px:
+        return points_px
+    arr = np.array(points_px, dtype=np.float64)
+    cx, cy = arr.mean(axis=0)
+    return [
+        (int(round(cx + (x - cx) * factor)), int(round(cy + (y - cy) * factor)))
+        for (x, y) in points_px
+    ]
 
 
 def render_story(
@@ -817,7 +838,36 @@ def render_story(
     if carrier_tid is None:
         raise RuntimeError("story has no CARRIER role")
 
-    # Auto-resolve BLOCKED OPTION if not explicitly cast
+    carrier_world = world_pos.get((int(carrier_tid), anchor_frame))
+
+    # ── Tactical-accuracy filter ─────────────────────────────────────────
+    # Drop cast members who are too far from the carrier at the anchor
+    # frame to belong to the trap. The user reported the COVER label landing
+    # on a defender far from the action; this filter removes that case.
+    # Carrier is never dropped; OPTION is allowed up to 14 m (it's a passing
+    # option, not a presser).
+    presser_max_m = float(story.get("presser_max_m", 9.0))
+    option_max_m = float(story.get("option_max_m", 14.0))
+    if carrier_world is not None:
+        kept: List[Tuple[int, str, str]] = []
+        dropped_reasons: List[str] = []
+        for (tid, role_key, display) in cast_with_label:
+            if role_key == "CARRIER":
+                kept.append((tid, role_key, display)); continue
+            wp = world_pos.get((int(tid), anchor_frame))
+            if wp is None:
+                kept.append((tid, role_key, display)); continue
+            d = float(np.hypot(wp[0] - carrier_world[0], wp[1] - carrier_world[1]))
+            limit = option_max_m if role_key == "OPTION" else presser_max_m
+            if d <= limit:
+                kept.append((tid, role_key, display))
+            else:
+                dropped_reasons.append(f"{display}/tid={tid} {d:.1f}m>{limit}m")
+        cast_with_label = kept
+        if dropped_reasons and verbose:
+            print(f"[render_story] dropped from cast: {dropped_reasons}")
+
+    # Auto-resolve BLOCKED OPTION if not explicitly cast (and not already filtered out)
     blocked_tid_explicit = story.get("blocked_option_track")
     blocked_tid: Optional[int] = None
     if blocked_tid_explicit is not None:
@@ -835,7 +885,8 @@ def render_story(
     if len(pressers) < 1:
         raise RuntimeError(
             "anchor frame does not satisfy minimum trap geometry "
-            f"(no PRESSER/DEFENDER visible at frame {anchor_frame})"
+            f"(no PRESSER/DEFENDER within {presser_max_m}m of carrier at frame {anchor_frame}). "
+            "Try a different anchor_frame or relax presser_max_m in the story."
         )
 
     # ── Build OverlayPlan: cache every drawing primitive's pixel coords ──
@@ -867,10 +918,15 @@ def render_story(
         })
     plan["rings"] = ring_specs
 
-    # Zone hull (carrier + pressers + blocked option)
-    zone_tids = [t for (t, r, _) in cast_with_label if r in ("CARRIER", "DEFENDER", "OPTION")]
-    zone_pts = [anchor_foot[t] for t in zone_tids if t in anchor_foot]
-    plan["zone_pts"] = zone_pts if len(zone_pts) >= 3 else []
+    # Zone hull — carrier + pressers only (no OPTION). Shrink toward centroid
+    # so the zone reads as the LOCAL trap, not the convex hull of half the pitch.
+    zone_tids = [t for (t, r, _) in cast_with_label if r in ("CARRIER", "DEFENDER")]
+    zone_pts_raw = [anchor_foot[t] for t in zone_tids if t in anchor_foot]
+    if len(zone_pts_raw) >= 3:
+        zone_shrink = float(story.get("zone_shrink", 0.72))
+        plan["zone_pts"] = _shrink_polygon(zone_pts_raw, factor=zone_shrink)
+    else:
+        plan["zone_pts"] = []
 
     # Pressure arrows: each PRESSER -> CARRIER
     arrow_specs: List[dict] = []
@@ -894,10 +950,14 @@ def render_story(
         blocked_lane = (carrier_fp, anchor_foot[int(blocked_tid)])
     plan["blocked_lane"] = blocked_lane
 
-    # Touchline glow + chip
+    # Touchline glow — short segment near the carrier, NOT a full sideline.
     touchline = None
-    if show_touchline and H_inv_anchor is not None and carrier_fp is not None:
-        touchline = _touchline_pixels(H_inv_anchor, carrier_fp, image_w=w, image_h=h)
+    if show_touchline and H_inv_anchor is not None and carrier_world is not None:
+        touchline = _touchline_pixels(
+            H_inv_anchor, carrier_world,
+            image_w=w, image_h=h,
+            segment_len_m=float(story.get("touchline_segment_m", 18.0)),
+        )
     plan["touchline"] = touchline
 
     # ── Per-frame loop: draw the cached plan, no recomputation ──────────
@@ -935,10 +995,10 @@ def render_story(
         if plan["zone_pts"]:
             draw_zone_hull(frame, plan["zone_pts"], zone_color, alpha=zone_alpha)
 
-        # Step 3: touchline glow + chip
+        # Step 3: touchline glow — short, thinner segment near the carrier
         if plan["touchline"]:
             tl_a, tl_b = plan["touchline"]
-            draw_glow_line(frame, tl_a, tl_b, ARROW_KIND_COLORS["pressure"], thickness=10)
+            draw_glow_line(frame, tl_a, tl_b, ARROW_KIND_COLORS["pressure"], thickness=6, glow_layers=2)
 
         # Step 4: pressure arrows (curved)
         for a in plan["arrows"]:
@@ -952,7 +1012,8 @@ def render_story(
             ba, bb = plan["blocked_lane"]
             draw_blocked_lane(frame, ba, bb, color=ARROW_KIND_COLORS["pressure"], thickness=3)
 
-        # Step 6: rings + role pills
+        # Step 6: rings + role pills (BLOCKED OPTION pill goes BELOW its ring
+        # so it doesn't pile on top of the BALL CARRIER pill / blocked-lane chip)
         for r in plan["rings"]:
             fp = r["fp"]
             color = r["color"]
@@ -960,7 +1021,11 @@ def render_story(
                 inner = max(3, r["radius"] // 3)
                 cv2.ellipse(frame, fp, (inner, inner // 2), 0, 0, 360, color, -1, cv2.LINE_AA)
             _draw_foot_ring(frame, fp, r["radius"], color, style="solid", thickness=4)
-            draw_role_pill(frame, fp, r["label"], color, above_offset_px=r["radius"] + 12)
+            below = r["role_key"] == "OPTION"
+            draw_role_pill(
+                frame, fp, r["label"], color,
+                above_offset_px=r["radius"] + 12, below=below,
+            )
 
         # Step 7: title + subtitle banners (rendered every frame)
         for c in callouts:
@@ -975,14 +1040,21 @@ def render_story(
 
         # Step 8: anchored callouts derived from the plan
         if plan["touchline"]:
-            tl_a, _ = plan["touchline"]
+            tl_a, tl_b = plan["touchline"]
+            # Anchor at the midpoint of the short segment, slightly above-line
+            tl_mx = (tl_a[0] + tl_b[0]) // 2
+            tl_my = (tl_a[1] + tl_b[1]) // 2 - 18
             draw_local_callout(
-                frame, tl_a, "TOUCHLINE = EXTRA DEFENDER",
-                side="right", accent=ARROW_KIND_COLORS["pressure"],
+                frame, (tl_mx, tl_my), "TOUCHLINE = EXTRA DEFENDER",
+                side="left", accent=ARROW_KIND_COLORS["pressure"],
             )
         if plan["blocked_lane"] is not None and carrier_fp is not None:
-            mx = (plan["blocked_lane"][0][0] + plan["blocked_lane"][1][0]) // 2
-            my = (plan["blocked_lane"][0][1] + plan["blocked_lane"][1][1]) // 2
+            ba, bb = plan["blocked_lane"]
+            mx = (ba[0] + bb[0]) // 2
+            # Push the chip perpendicularly off the line so it doesn't sit on top of the X marker
+            dy = bb[1] - ba[1]
+            offset = 22 if dy >= 0 else -22
+            my = (ba[1] + bb[1]) // 2 + offset
             draw_local_callout(
                 frame, (mx, my), "PASSING LANE CLOSED",
                 side="right", accent=ARROW_KIND_COLORS["pressure"],

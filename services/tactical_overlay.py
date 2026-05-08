@@ -190,10 +190,11 @@ def draw_role_pill(
     color: Tuple[int, int, int],
     *,
     above_offset_px: int = 22,
+    below: bool = False,
     fg: Tuple[int, int, int] = (255, 255, 255),
 ) -> None:
-    """Clean single-piece pill above anchor. No number tab, no fallback '?'.
-    Centred horizontally on anchor. Slightly bolder than draw_caption."""
+    """Clean single-piece pill above anchor (or below when `below=True`).
+    No number tab, no fallback '?'. Centred horizontally on anchor."""
     if not text:
         return
     text = text.upper()
@@ -206,8 +207,12 @@ def draw_role_pill(
     box_h = hh + 2 * pad_y
     cx, cy = anchor_px
     x1 = cx - box_w // 2
-    y2 = max(cy - above_offset_px, box_h)
-    y1 = y2 - box_h
+    if below:
+        y1 = cy + above_offset_px
+        y2 = y1 + box_h
+    else:
+        y2 = max(cy - above_offset_px, box_h)
+        y1 = y2 - box_h
 
     # Black halo for legibility on grass
     cv2.rectangle(img, (x1 - 1, y1 - 1), (x1 + box_w + 1, y2 + 1), (0, 0, 0), -1, cv2.LINE_AA)
