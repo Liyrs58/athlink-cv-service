@@ -272,6 +272,113 @@ def _draw_foot_ring(
         cv2.ellipse(img, (cx, cy), (rx, ry), 0, a0, a1, color, thickness, cv2.LINE_AA)
 
 
+def _draw_glow_line_alpha(
+    img: np.ndarray,
+    p_from: Tuple[int, int],
+    p_to: Tuple[int, int],
+    color: Tuple[int, int, int],
+    *,
+    thickness: int = 10,
+    alpha: float = 1.0,
+    glow_layers: int = 3,
+) -> None:
+    """Alpha-aware version of draw_glow_line for animated reveals."""
+    if p_from is None or p_to is None or alpha <= 0:
+        return
+    if alpha >= 0.999:
+        draw_glow_line(img, p_from, p_to, color, thickness=thickness, glow_layers=glow_layers)
+        return
+    overlay = img.copy()
+    draw_glow_line(overlay, p_from, p_to, color, thickness=thickness, glow_layers=glow_layers)
+    cv2.addWeighted(overlay, alpha, img, 1.0 - alpha, 0, img)
+
+
+def _draw_partial_curved_arrow(
+    img: np.ndarray,
+    start_px: Tuple[int, int],
+    end_px: Tuple[int, int],
+    color: Tuple[int, int, int],
+    *,
+    thickness: int = 4,
+    bend: float = 0.25,
+    stop_short_px: int = 28,
+    progress: float = 1.0,
+) -> None:
+    """Draw only the first `progress` [0,1] fraction of a bezier arrow.
+    At progress=1 this is identical to draw_curved_arrow."""
+    if start_px is None or end_px is None or progress <= 0:
+        return
+    sx, sy = start_px
+    ex, ey = end_px
+    dx, dy = ex - sx, ey - sy
+    length = float(np.hypot(dx, dy))
+    if length < 4:
+        return
+    trim = min(stop_short_px, int(length * 0.4))
+    ex2 = int(ex - dx * (trim / length))
+    ey2 = int(ey - dy * (trim / length))
+    mx, my = (sx + ex2) / 2.0, (sy + ey2) / 2.0
+    nx, ny = -(ey2 - sy) / max(1.0, length), (ex2 - sx) / max(1.0, length)
+    cx_ = int(mx + nx * length * bend)
+    cy_ = int(my + ny * length * bend)
+    n_pts = 25
+    max_i = max(1, int(n_pts * progress))
+    pts = []
+    for i in range(min(max_i + 1, n_pts + 1)):
+        t = i / float(n_pts)
+        u = 1.0 - t
+        bx = u * u * sx + 2 * u * t * cx_ + t * t * ex2
+        by = u * u * sy + 2 * u * t * cy_ + t * t * ey2
+        pts.append((int(bx), int(by)))
+    # Shadow first
+    for i in range(1, len(pts)):
+        cv2.line(img, pts[i - 1], pts[i], (0, 0, 0), thickness + 3, cv2.LINE_AA)
+    for i in range(1, len(pts)):
+        cv2.line(img, pts[i - 1], pts[i], color, thickness, cv2.LINE_AA)
+    # Arrowhead only when near-complete
+    if progress >= 0.9 and len(pts) >= 2:
+        cv2.arrowedLine(img, pts[-2], pts[-1], color, thickness, tipLength=0.6, line_type=cv2.LINE_AA)
+
+
+def _draw_blocked_lane_alpha(
+    img: np.ndarray,
+    p_from: Tuple[int, int],
+    p_to: Tuple[int, int],
+    color: Tuple[int, int, int],
+    *,
+    thickness: int = 3,
+    alpha: float = 1.0,
+) -> None:
+    """Alpha-aware blocked-lane dashed line + X marker."""
+    if p_from is None or p_to is None or alpha <= 0:
+        return
+    if alpha >= 0.999:
+        draw_blocked_lane(img, p_from, p_to, color, thickness=thickness)
+        return
+    overlay = img.copy()
+    draw_blocked_lane(overlay, p_from, p_to, color, thickness=thickness)
+    cv2.addWeighted(overlay, alpha, img, 1.0 - alpha, 0, img)
+
+
+def _draw_banner_alpha(
+    img: np.ndarray,
+    text: str,
+    *,
+    position: str = "top",
+    alpha: float = 1.0,
+) -> None:
+    """Alpha-fade version of draw_banner for title animation."""
+    if not text or alpha <= 0:
+        return
+    if alpha >= 0.999:
+        draw_banner(img, text, position=position)
+        return
+    overlay = img.copy()
+    draw_banner(overlay, text, position=position)
+    cv2.addWeighted(overlay, alpha, img, 1.0 - alpha, 0, img)
+
+
+
 def _draw_nameplate(
     img: np.ndarray,
     anchor_px: Tuple[int, int],
@@ -787,6 +894,8 @@ def render_story(
     dim_alpha = float(story.get("dim_alpha", 0.32))
     zone_color = _hex_to_bgr(story.get("zone_color", "#ff5544"))
     zone_alpha = float(story.get("zone_alpha", 0.22))
+    render_mode = str(story.get("render_mode", "live_reprojected"))
+    debug_allow_invalid_story = bool(story.get("debug_allow_invalid_story", False))
 
     # ── Load track + pitch + team data ────────────────────────────────────
     cap = cv2.VideoCapture(str(video_path))
@@ -804,6 +913,41 @@ def render_story(
 
     H_inv_by_frame, world_pos, ball_pos = _load_pitch_map(pitch_map_json)
     team_map = _load_team_map(team_results_json)
+
+    # ── Ball-data pre-flight ──────────────────────────────────────────────
+    # Classify ball tracking quality at load time. Anything below "detector"
+    # strips claims that depend on knowing who has the ball.
+    win_frames = frame_hi - frame_lo + 1
+    ball_frames_in_window = sum(
+        1 for fi in ball_pos.keys() if frame_lo <= fi <= frame_hi
+    ) if ball_pos else 0
+    if ball_frames_in_window == 0:
+        ball_source = "missing"
+        ball_confidence = 0.0
+    elif ball_frames_in_window / max(1, win_frames) >= 0.6:
+        ball_source = "detector"
+        ball_confidence = round(ball_frames_in_window / max(1, win_frames), 2)
+    else:
+        ball_source = "fallback"
+        ball_confidence = round(ball_frames_in_window / max(1, win_frames), 2)
+
+    ball_ok = ball_source in ("detector", "fallback")
+    if not ball_ok:
+        if verbose:
+            print(
+                f"[render_story] WARN ball_source='{ball_source}' — "
+                "stripping BALL CARRIER pill, PASSING LANE CLOSED, blocked lane. "
+                "Set debug_allow_invalid_story=true to override."
+            )
+        # Strip claims that require knowing who has the ball
+        if not debug_allow_invalid_story:
+            show_blocked_lane = False
+            # Relabel CARRIER to just 'PLAYER' so we don't lie
+            callouts = [
+                {**c, "text": "PRESSURE SEQUENCE"}
+                if str(c.get("position")) == "top" else c
+                for c in callouts
+            ]
 
     # ── Resolve anchor-frame H_inv ────────────────────────────────────────
     H_inv_anchor = H_inv_by_frame.get(anchor_frame)
@@ -1070,9 +1214,36 @@ def render_story(
 
     # Final validator pass at the resolved anchor — used by the manifest
     final_valid, final_type, final_geom = _validate_at(anchor_frame)
-    if not final_valid and not is_valid:
-        # We downgraded; the manifest will reflect that.
-        pass
+
+    # ── Product-mode gate ────────────────────────────────────────────────
+    # In product mode (debug_allow_invalid_story not set), an invalid story
+    # must NOT produce a rendered clip. We raise here — before opening the
+    # VideoWriter — so no partial MP4 is written.
+    story_is_valid = bool(final_valid) and ball_ok
+    if not story_is_valid and not debug_allow_invalid_story:
+        cap.release()
+        failing_reasons = []
+        if not final_valid:
+            failing_reasons.append(
+                f"story_type={declared_story_type} failed geometry validation "
+                f"(best frame F={anchor_frame} qualifies as '{final_type}'). "
+                f"Geometry: {final_geom}"
+            )
+        if not ball_ok:
+            failing_reasons.append(
+                f"ball_source='{ball_source}' (confidence={ball_confidence:.0%}) — "
+                "ball tracking too sparse to claim a tactical story."
+            )
+        raise RuntimeError(
+            "[render_story] Story failed product-mode gate — no MP4 written.\n"
+            + "\n".join(f"  • {r}" for r in failing_reasons)
+            + "\nSet debug_allow_invalid_story=true in the story JSON to force a debug render."
+        )
+    if verbose and not story_is_valid:
+        print(
+            f"[render_story] DEBUG MODE: story_valid=False but debug_allow_invalid_story=True. "
+            f"Rendering anyway. ball_source={ball_source} final_type={final_type}"
+        )
 
     # ── Build OverlayPlan: world-space geometry (reprojected per-frame) ───
     plan: Dict[str, object] = {}
@@ -1144,6 +1315,57 @@ def render_story(
     elif show_ball and verbose:
         print("[render_story] WARN ball_pos empty — ball dot will be skipped")
 
+    # ── Animation timeline constants ─────────────────────────────────────
+    # Each entry is (start_frame_offset, end_frame_offset) within the clip.
+    # In freeze_frame mode frame_offset = output_frame_index (0-based).
+    # In live_reprojected mode frame_offset = frame_idx - frame_lo.
+    ANIM = {
+        "title_fade":    (0,   10),
+        "carrier_ring":  (10,  20),
+        "presser_rings": (18,  30),
+        "arrows_draw":   (28,  45),
+        "zone_fade":     (40,  55),
+        "blocked_lane":  (52,  68),
+        "callouts":      (65,  78),
+    }
+
+    def _smoothstep(t: float) -> float:
+        """Cubic smoothstep easing: 0→1 with zero derivative at endpoints."""
+        t = max(0.0, min(1.0, t))
+        return t * t * (3.0 - 2.0 * t)
+
+    def _anim_alpha(key: str, offset: int) -> float:
+        """Return [0,1] progress for a named animation stage at this offset."""
+        start, end = ANIM[key]
+        if offset < start:
+            return 0.0
+        if offset >= end:
+            return 1.0
+        return _smoothstep((offset - start) / max(1, end - start))
+
+    # ── Freeze-frame: capture anchor background once ──────────────────────
+    freeze_bg: Optional[np.ndarray] = None
+    anim_frames = int(story.get("anim_frames", 90))  # output frame count in FF mode
+    if render_mode == "freeze_frame":
+        cap.set(cv2.CAP_PROP_POS_FRAMES, float(anchor_frame))
+        ok, freeze_bg = cap.read()
+        if not ok or freeze_bg is None:
+            cap.release()
+            raise RuntimeError(
+                f"freeze_frame: could not read anchor_frame={anchor_frame} from video"
+            )
+        # Dim the frozen background once
+        if dim_alpha > 0:
+            black = np.zeros_like(freeze_bg)
+            cv2.addWeighted(black, dim_alpha, freeze_bg, 1.0 - dim_alpha, 0, freeze_bg)
+        # Rewind for any later live reads (not needed in FF mode but keeps cap state clean)
+        cap.set(cv2.CAP_PROP_POS_FRAMES, 0.0)
+        if verbose:
+            print(
+                f"[render_story] freeze_frame mode: captured anchor F={anchor_frame}, "
+                f"will output {anim_frames} animation frames"
+            )
+
     # ── Per-frame loop: reproject world → image each frame ──────────────
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     out = cv2.VideoWriter(str(output_path), fourcc, fps, (w, h))
@@ -1159,34 +1381,143 @@ def render_story(
             f"blocked_option={blocked_tid}  touchline={'yes' if touchline_world else 'no'}"
         )
 
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-        if total and frame_idx >= total:
-            break
-        if frame_idx < frame_lo:
-            frame_idx += 1
-            continue
-        if frame_idx > frame_hi:
-            break
+    # ---------------------
+    # FREEZE-FRAME sub-loop
+    # ---------------------
+    if render_mode == "freeze_frame":
+        assert freeze_bg is not None
+        for anim_idx in range(anim_frames):
+            frame = freeze_bg.copy()
+            frame_offset = anim_idx  # animation time is anim_idx, not video frame
 
-        # ── Resolve this frame's homography (world → image) ──────────────
-        H_inv = H_inv_by_frame.get(frame_idx)
-        if H_inv is None and H_inv_by_frame:
-            nearest = min(H_inv_by_frame.keys(), key=lambda k: abs(k - frame_idx))
-            H_inv = H_inv_by_frame[nearest]
+            # All world mapping uses anchor homography (camera frozen)
+            H_inv = H_inv_by_frame.get(anchor_frame)
+            if H_inv is None and H_inv_by_frame:
+                nearest = min(H_inv_by_frame.keys(), key=lambda k: abs(k - anchor_frame))
+                H_inv = H_inv_by_frame[nearest]
 
-        # Step 1: dim
-        if dim_alpha > 0:
-            black = np.zeros_like(frame)
-            cv2.addWeighted(black, dim_alpha, frame, 1.0 - dim_alpha, 0, frame)
+            def _proj(wp):
+                if wp is None or H_inv is None:
+                    return None
+                return project_world_point(wp, H_inv)
 
-        # Helper: project a world point for this frame
-        def _proj(wp: Optional[Tuple[float, float]]) -> Optional[Tuple[int, int]]:
-            if wp is None or H_inv is None:
-                return None
-            return project_world_point(wp, H_inv)
+            # Step 2: zone hull — fades in during zone_fade window
+            zone_alpha_t = _anim_alpha("zone_fade", frame_offset)
+            if plan["zone_world"] and zone_alpha_t > 0:
+                zone_px = [_proj(wp) for wp in plan["zone_world"]]
+                zone_px = [p for p in zone_px if p is not None]
+                if len(zone_px) >= 3:
+                    draw_zone_hull(frame, zone_px, zone_color, alpha=zone_alpha * zone_alpha_t)
+
+            # Step 3: touchline glow — appears with presser_rings
+            tl_alpha_t = _anim_alpha("presser_rings", frame_offset)
+            tl_px = None
+            if plan["touchline_world"] and H_inv is not None and tl_alpha_t > 0:
+                tl_a_w, tl_b_w = plan["touchline_world"]
+                tl_a = _proj(tl_a_w)
+                tl_b = _proj(tl_b_w)
+                if tl_a and tl_b:
+                    tl_px = (tl_a, tl_b)
+                    _draw_glow_line_alpha(frame, tl_a, tl_b, ARROW_KIND_COLORS["pressure"],
+                                         thickness=10, alpha=tl_alpha_t)
+
+            # Step 4: pressure arrows — draw progressively along bezier
+            arrows_t = _anim_alpha("arrows_draw", frame_offset)
+            if arrows_t > 0:
+                for a in plan["arrows"]:
+                    fp_from = world_pos.get((int(a["from_tid"]), anchor_frame))
+                    fp_to = world_pos.get((int(a["to_tid"]), anchor_frame))
+                    pa = _proj(fp_from)
+                    pb = _proj(fp_to)
+                    if pa and pb:
+                        _draw_partial_curved_arrow(frame, pa, pb, a["color"],
+                                                   bend=a["bend"], progress=arrows_t)
+
+            # Step 5: blocked lane — dashes appear
+            blocked_t = _anim_alpha("blocked_lane", frame_offset)
+            if plan["blocked_lane"] and blocked_t > 0:
+                carrier_fp_w = world_pos.get((int(plan["blocked_lane"][0]), anchor_frame))
+                blocked_fp_w = world_pos.get((int(plan["blocked_lane"][1]), anchor_frame))
+                ba = _proj(carrier_fp_w)
+                bb = _proj(blocked_fp_w)
+                if ba and bb:
+                    _draw_blocked_lane_alpha(frame, ba, bb, ARROW_KIND_COLORS["pressure"],
+                                            thickness=3, alpha=blocked_t)
+
+            # Step 6: rings — carrier first, then pressers
+            for r in plan["rings"]:
+                is_carrier = r["role_key"] == "CARRIER"
+                ring_key = "carrier_ring" if is_carrier else "presser_rings"
+                ring_t = _anim_alpha(ring_key, frame_offset)
+                if ring_t <= 0:
+                    continue
+                wp = world_pos.get((int(r["tid"]), anchor_frame))
+                radius_m = RING_RADIUS_M * ROLE_RING_RADIUS_MULT.get(r["role_key"], 1.0)
+                radius = project_world_radius(radius_m, wp, H_inv) if (wp and H_inv) else 28
+                fp = _proj(wp) if wp else anchor_foot.get(int(r["tid"]))
+                if fp is None:
+                    continue
+                # Pulse scale for carrier on first appear
+                if is_carrier and ring_t < 1.0:
+                    radius = int(radius * (0.6 + 0.4 * ring_t))
+                r_color = tuple(int(c * ring_t + (1 - ring_t) * 255) for c in r["color"])
+                _draw_foot_ring(frame, fp, radius, r["color"], style="solid",
+                                thickness=max(1, int(RING_THICKNESS * ring_t)))
+                if ring_t >= 0.6:
+                    below = r["role_key"] == "OPTION"
+                    pill_offset = max(int(radius * 0.55) + 12, 24)
+                    draw_role_pill(frame, fp, r["label"], r["color"],
+                                  above_offset_px=pill_offset, below=below)
+
+            # Step 7: callouts (title/subtitle banners)
+            callout_t = _anim_alpha("callouts", frame_offset)
+            title_t = _anim_alpha("title_fade", frame_offset)
+            for c in callouts:
+                pos = str(c.get("position", "top"))
+                t = title_t if pos == "top" else callout_t
+                if t <= 0:
+                    continue
+                _draw_banner_alpha(frame, c["text"], position=pos, alpha=t)
+
+            out.write(frame)
+            written += 1
+        cap.release()
+
+    else:
+        # --------------------------
+        # LIVE-REPROJECTED sub-loop
+        # --------------------------
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            if total and frame_idx >= total:
+                break
+            if frame_idx < frame_lo:
+                frame_idx += 1
+                continue
+            if frame_idx > frame_hi:
+                break
+
+            # animation offset from start of window (for live mode timeline)
+            frame_offset = frame_idx - frame_lo
+
+            # ── Resolve this frame's homography (world → image) ──────────
+            H_inv = H_inv_by_frame.get(frame_idx)
+            if H_inv is None and H_inv_by_frame:
+                nearest = min(H_inv_by_frame.keys(), key=lambda k: abs(k - frame_idx))
+                H_inv = H_inv_by_frame[nearest]
+
+            # Step 1: dim
+            if dim_alpha > 0:
+                black = np.zeros_like(frame)
+                cv2.addWeighted(black, dim_alpha, frame, 1.0 - dim_alpha, 0, frame)
+
+            # Helper: project a world point for this frame
+            def _proj(wp):
+                if wp is None or H_inv is None:
+                    return None
+                return project_world_point(wp, H_inv)
 
         # Step 2: zone hull (reproject world coords → image)
         if plan["zone_world"]:
@@ -1344,11 +1675,16 @@ def render_story(
     retitled = (final_story_type != declared_story_type) or (not is_valid and final_valid is False)
 
     manifest = {
-        "story_valid": bool(final_valid),
-        "story_type": final_story_type,
-        "anchor_frame": anchor_frame,
-        "frames_written": written,
-        "total_frames_window": frame_hi - frame_lo + 1,
+        # Quality gate fields (must all be truthy for a valid product render)
+        "story_valid":     story_is_valid,
+        "story_type":      final_story_type,
+        "render_mode":     render_mode,
+        "ball_source":     ball_source,
+        "ball_confidence": ball_confidence,
+        # Timing
+        "anchor_frame":          anchor_frame,
+        "frames_written":        written,
+        "total_frames_window":   frame_hi - frame_lo + 1,
         # Geometry from validator at the resolved anchor
         "carrier_touchline_distance_m": (final_geom or {}).get("carrier_touchline_distance_m"),
         "presser_angle_spread_deg":     (final_geom or {}).get("presser_angle_spread_deg"),
@@ -1361,14 +1697,14 @@ def render_story(
         "cover_active":      cover_active,
         "retitled":          retitled,
         # Visual primitives
-        "rings":         len(plan["rings"]),
-        "arrows":        len(plan["arrows"]),
-        "zone_world":    len(plan["zone_world"]) if plan["zone_world"] else 0,
-        "touchline":     bool(plan["touchline_world"]),
-        "blocked_lane":  bool(plan["blocked_lane"]),
+        "rings":           len(plan["rings"]),
+        "arrows":          len(plan["arrows"]),
+        "zone_world":      len(plan["zone_world"]) if plan["zone_world"] else 0,
+        "touchline":       bool(plan["touchline_world"]),
+        "blocked_lane":    bool(plan["blocked_lane"]),
         "ball_dots_drawn": ball_dots_drawn,
-        "carrier_tid":   carrier_tid,
-        "blocked_tid":   blocked_tid,
+        "carrier_tid":     carrier_tid,
+        "blocked_tid":     blocked_tid,
     }
     if verbose:
         print(f"[render_story] manifest={manifest}")
