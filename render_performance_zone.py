@@ -879,6 +879,10 @@ def render_story(
             if blocked_tid is not None and blocked_tid in anchor_foot:
                 cast_with_label.append((blocked_tid, "OPTION", "BLOCKED OPTION"))
 
+    # Initialise `pressers` from current cast — guarantees the variable is
+    # always bound regardless of which validator branch we take below.
+    pressers = [t for (t, r, _) in cast_with_label if r in ("DEFENDER", "COVER")]
+
     # ── Validity-aware relocator ──────────────────────────────────────────
     # The story is validated against the geometric preconditions of its
     # declared type (pressing trap = near touchline, 2+ pressers, good angle
@@ -1045,11 +1049,24 @@ def render_story(
                 )
 
     if len(pressers) < 1:
-        raise RuntimeError(
-            "No frame satisfies even the relaxed minimum trap geometry "
-            f"(no defender within {presser_max_m}m of carrier in "
-            f"[{frame_lo}, {frame_hi}]). Try a different carrier."
-        )
+        # No declared defender survived the distance filter at the chosen
+        # anchor. We have already retitled to an honest type (1V1_PRESSURE
+        # default). Keep going — the carrier ring + retitled banner is
+        # still a useful render. Strict mode raises.
+        if strict_story_type:
+            raise RuntimeError(
+                f"No declared defender (cast tids: {[t for (t, r, _) in cast_with_label]}) "
+                f"is within {presser_max_m}m of carrier tid={carrier_tid} at frame "
+                f"{anchor_frame}. The trackIds in your story may not match "
+                "this pipeline run's track_results. Re-pick tids from "
+                f"temp/{Path(results_json).parent.parent.name}/tracking/track_results.json."
+            )
+        if verbose:
+            print(
+                f"[render_story] WARN no declared defender within {presser_max_m}m of "
+                f"carrier at F={anchor_frame}. Continuing with carrier-only render. "
+                "Likely cause: trackIds in story do not match this pipeline run."
+            )
 
     # Final validator pass at the resolved anchor — used by the manifest
     final_valid, final_type, final_geom = _validate_at(anchor_frame)
