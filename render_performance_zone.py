@@ -1608,6 +1608,9 @@ def render_story(
     frame_idx = 0
     per_frame_trace: List[dict] = []
     skipped_overlay_frames: List[dict] = []
+    _carrier_state: str = "lost"   # hysteresis: "locked" | "coasting" | "lost"
+    _carrier_coast_frames: int = 0
+    _CARRIER_COAST_MAX: int = int(story.get("carrier_coast_frames", 12))
     # 4.7c6 polish state
     trails_px: Dict[int, List[Tuple[int, int]]] = defaultdict(list)
     label_collisions_resolved = 0
@@ -1808,15 +1811,35 @@ def render_story(
                 )
 
             MIN_CARRIER_CONF = float(story.get("min_carrier_conf_per_frame", 0.55))
+            MIN_CARRIER_COAST = MIN_CARRIER_CONF - 0.15  # hysteresis floor
 
-            # Decide validity for THIS frame's overlay
+            # ── Carrier hysteresis ──────────────────────────────────────────
+            if frame_carrier_conf >= MIN_CARRIER_CONF and frame_carrier_tid is not None:
+                _carrier_state = "locked"
+                _carrier_coast_frames = 0
+            elif frame_carrier_conf >= MIN_CARRIER_COAST and _carrier_state in ("locked", "coasting"):
+                _carrier_state = "coasting"
+                _carrier_coast_frames += 1
+                if _carrier_coast_frames > _CARRIER_COAST_MAX:
+                    _carrier_state = "lost"
+            else:
+                _carrier_state = "lost"
+                _carrier_coast_frames = 0
+
+            carrier_valid = _carrier_state in ("locked", "coasting")
+
+            # ── Ball tolerance: missing OK if carrier is locked/coasting ────
+            ball_ok = (
+                frame_ball_source != "missing"
+                or carrier_valid  # ball gone but we know who has it
+            )
+
+            # ── Decide validity for THIS frame's overlay ────────────────────
             invalid_reason: Optional[str] = None
-            if frame_ball_source == "missing":
+            if not ball_ok:
                 invalid_reason = "ball_missing"
-            elif frame_carrier_conf < MIN_CARRIER_CONF:
+            elif not carrier_valid:
                 invalid_reason = "carrier_conf_low"
-            elif frame_carrier_tid is None:
-                invalid_reason = "no_carrier_tid"
             elif carrier_w is None:
                 invalid_reason = "carrier_no_world_pos"
             elif ball_carrier_dist_px is not None and ball_carrier_dist_px > BALL_CARRIER_MAX_PX:
