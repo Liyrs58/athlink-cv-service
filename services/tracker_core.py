@@ -579,11 +579,16 @@ class TrackerCore:
                     self._soft_collapse = False
                     self.identity.in_soft_collapse = False
                     self.identity.locks.in_collapse = False
-                    self._soft_recovery_frames = 60
-                    self.identity.in_soft_recovery = True
-                    self._streak_recover = 0
                     snap_len = len(self.identity._soft_snapshot) if hasattr(self.identity, '_soft_snapshot') and self.identity._soft_snapshot else 0
-                    print(f"[SoftRecovery] Frame {video_frame}: current={current_count} baseline={self._active_baseline:.1f} snapshot_slots={snap_len} revived=candidates → entering recovery mode")
+                    if snap_len == 0:
+                        self._soft_recovery_frames = 0
+                        self.identity.in_soft_recovery = False
+                        print(f"[SoftRecovery] Frame {video_frame}: snapshot empty → skip recovery, normal mode")
+                    else:
+                        self._soft_recovery_frames = 60
+                        self.identity.in_soft_recovery = True
+                        print(f"[SoftRecovery] Frame {video_frame}: current={current_count} baseline={self._active_baseline:.1f} snapshot_slots={snap_len} revived=candidates → entering recovery mode")
+                    self._streak_recover = 0
 
         # Track frames-in-collapse for match_report.json telemetry (phase 2)
         if self._soft_collapse:
