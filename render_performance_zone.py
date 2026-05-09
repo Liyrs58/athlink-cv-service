@@ -1032,10 +1032,19 @@ def render_story(
     # ── Carrier + cast resolution (with auto-resolve BLOCKED OPTION) ─────
     carrier_tid: Optional[int] = None
     cast_with_label: List[Tuple[int, str, str]] = []  # (tid, role_key, display_label)
+    # Fallback: project world_pos through H_inv for any cast tid that is
+    # missing from anchor_foot. tracker_core may have skipped a frame even
+    # though pitch_service has a world position for that tid+frame.
     for tid, raw_role in raw_cast:
         norm = _normalise_role(raw_role)
         if norm == "CARRIER" and carrier_tid is None:
             carrier_tid = tid
+        if tid not in anchor_foot:
+            wp = world_pos.get((int(tid), anchor_frame))
+            if wp is not None and H_inv_anchor is not None:
+                px = project_world_point(wp, H_inv_anchor)
+                if px is not None:
+                    anchor_foot[int(tid)] = px
         if tid in anchor_foot:
             cast_with_label.append((tid, norm, raw_role))
 
@@ -1619,149 +1628,149 @@ def render_story(
                     return None
                 return project_world_point(wp, H_inv)
 
-        # Step 2: zone hull (reproject world coords → image, or image-space fallback)
-        if plan["zone_world"]:
-            zone_px = [_proj(wp) for wp in plan["zone_world"]]
-            zone_px = [p for p in zone_px if p is not None]
-            if len(zone_px) >= 3:
-                draw_zone_hull(frame, zone_px, zone_color, alpha=zone_alpha)
-        elif plan.get("zone_image_fallback") and len(plan["zone_image_fallback"]) >= 3:
-            draw_zone_hull(frame, plan["zone_image_fallback"], zone_color, alpha=zone_alpha)
+            # Step 2: zone hull (reproject world coords → image, or image-space fallback)
+            if plan["zone_world"]:
+                zone_px = [_proj(wp) for wp in plan["zone_world"]]
+                zone_px = [p for p in zone_px if p is not None]
+                if len(zone_px) >= 3:
+                    draw_zone_hull(frame, zone_px, zone_color, alpha=zone_alpha)
+            elif plan.get("zone_image_fallback") and len(plan["zone_image_fallback"]) >= 3:
+                draw_zone_hull(frame, plan["zone_image_fallback"], zone_color, alpha=zone_alpha)
 
-        # Step 3: touchline glow (reproject world endpoints → image)
-        tl_px: Optional[Tuple[Tuple[int, int], Tuple[int, int]]] = None
-        if plan["touchline_world"] and H_inv is not None:
-            tl_a_w, tl_b_w = plan["touchline_world"]
-            tl_a_px = _proj(tl_a_w)
-            tl_b_px = _proj(tl_b_w)
-            if tl_a_px is not None and tl_b_px is not None:
-                tl_px = (tl_a_px, tl_b_px)
-                draw_glow_line(
-                    frame, tl_a_px, tl_b_px,
-                    ARROW_KIND_COLORS["pressure"], thickness=6, glow_layers=2,
+            # Step 3: touchline glow (reproject world endpoints → image)
+            tl_px: Optional[Tuple[Tuple[int, int], Tuple[int, int]]] = None
+            if plan["touchline_world"] and H_inv is not None:
+                tl_a_w, tl_b_w = plan["touchline_world"]
+                tl_a_px = _proj(tl_a_w)
+                tl_b_px = _proj(tl_b_w)
+                if tl_a_px is not None and tl_b_px is not None:
+                    tl_px = (tl_a_px, tl_b_px)
+                    draw_glow_line(
+                        frame, tl_a_px, tl_b_px,
+                        ARROW_KIND_COLORS["pressure"], thickness=6, glow_layers=2,
+                    )
+
+            # Step 4: pressure arrows (resolve world pos per-frame)
+            for a in plan["arrows"]:
+                from_w = world_pos.get((a["from_tid"], frame_idx))
+                to_w = world_pos.get((a["to_tid"], frame_idx))
+                from_px = _proj(from_w)
+                to_px = _proj(to_w)
+                if from_px is not None and to_px is not None:
+                    draw_curved_arrow(
+                        frame, from_px, to_px, a["color"],
+                        thickness=4, bend=a["bend"], stop_short_px=32,
+                    )
+
+            # Step 5: blocked passing lane (resolve per-frame)
+            blocked_px: Optional[Tuple[Tuple[int, int], Tuple[int, int]]] = None
+            if plan["blocked_lane"] is not None:
+                c_tid, b_tid = plan["blocked_lane"]
+                c_w = world_pos.get((c_tid, frame_idx))
+                b_w = world_pos.get((b_tid, frame_idx))
+                c_px = _proj(c_w)
+                b_px = _proj(b_w)
+                if c_px is not None and b_px is not None:
+                    blocked_px = (c_px, b_px)
+                    draw_blocked_lane(
+                        frame, c_px, b_px,
+                        color=ARROW_KIND_COLORS["pressure"], thickness=3,
+                    )
+
+            # Step 6: rings + role pills (resolve per-frame world pos → image)
+            carrier_px: Optional[Tuple[int, int]] = None
+            for r in plan["rings"]:
+                tid = r["tid"]
+                wp = world_pos.get((tid, frame_idx))
+                fp = _proj(wp)
+                if fp is None:
+                    # Fallback: derive foot pixel from bbox in tracking data
+                    rec = frames_data.get(frame_idx, {})
+                    for p in rec.get("players", []):
+                        p_tid = p.get("rawTrackId") or p.get("trackId")
+                        if p_tid is not None and int(p_tid) == tid:
+                            bbox = p.get("bbox")
+                            if bbox and len(bbox) == 4:
+                                x1, y1, x2, y2 = map(int, bbox)
+                                fp = ((x1 + x2) // 2, y2)
+                            break
+                if fp is None:
+                    continue
+                color = r["color"]
+                # Compute ring radius in image space from world coords
+                base_radius = 24
+                if wp is not None and H_inv is not None:
+                    rr = project_world_radius(RING_RADIUS_M, wp, H_inv)
+                    if rr is not None:
+                        base_radius = int(rr)
+                mult = ROLE_RING_RADIUS_MULT.get(r["role_key"], 1.0)
+                radius = int(base_radius * mult)
+                if r["role_key"] == "CARRIER":
+                    inner = max(3, radius // 3)
+                    cv2.ellipse(frame, fp, (inner, inner // 2), 0, 0, 360, color, -1, cv2.LINE_AA)
+                    carrier_px = fp
+                _draw_foot_ring(frame, fp, radius, color, style="solid", thickness=4)
+                below = r["role_key"] == "OPTION"
+                # Dynamic pill offset: ~half-radius at wide shots, capped low at zoom
+                pill_offset = max(int(radius * 0.55) + 12, 24)
+                draw_role_pill(
+                    frame, fp, r["label"], color,
+                    above_offset_px=pill_offset, below=below,
                 )
 
-        # Step 4: pressure arrows (resolve world pos per-frame)
-        for a in plan["arrows"]:
-            from_w = world_pos.get((a["from_tid"], frame_idx))
-            to_w = world_pos.get((a["to_tid"], frame_idx))
-            from_px = _proj(from_w)
-            to_px = _proj(to_w)
-            if from_px is not None and to_px is not None:
-                draw_curved_arrow(
-                    frame, from_px, to_px, a["color"],
-                    thickness=4, bend=a["bend"], stop_short_px=32,
+            # Step 6.5: ball dot — yellow ring + filled inner dot at ball world pos
+            if show_ball and ball_pos and H_inv is not None:
+                ball_w = ball_pos.get(frame_idx)
+                if ball_w is None:
+                    # Tolerance: ±10 frames
+                    for delta in range(1, 11):
+                        if (b1 := ball_pos.get(frame_idx - delta)) is not None:
+                            ball_w = b1; break
+                        if (b2 := ball_pos.get(frame_idx + delta)) is not None:
+                            ball_w = b2; break
+                if ball_w is not None:
+                    ball_px = _proj(ball_w)
+                    if ball_px is not None:
+                        # Outer halo + ring + filled inner dot
+                        cv2.circle(frame, ball_px, 11, (0, 0, 0), 2, cv2.LINE_AA)
+                        cv2.circle(frame, ball_px, 9, BALL, 2, cv2.LINE_AA)
+                        cv2.circle(frame, ball_px, 4, BALL, -1, cv2.LINE_AA)
+                        ball_dots_drawn += 1
+
+            # Step 7: title + subtitle banners (screen-space, not pitch-anchored)
+            for c in callouts:
+                c_lo, c_hi = c.get("frames", [frame_lo, frame_hi])
+                if not (c_lo <= frame_idx <= c_hi):
+                    continue
+                text = str(c.get("text", "")).strip()
+                if not text:
+                    continue
+                position = str(c.get("position", "top"))
+                draw_banner(frame, text, position=position)
+
+            # Step 8: anchored callouts (derived from reprojected positions)
+            if tl_px is not None:
+                tl_a, tl_b = tl_px
+                tl_mx = (tl_a[0] + tl_b[0]) // 2
+                tl_my = (tl_a[1] + tl_b[1]) // 2 - 18
+                draw_local_callout(
+                    frame, (tl_mx, tl_my), "TOUCHLINE = EXTRA DEFENDER",
+                    side="left", accent=ARROW_KIND_COLORS["pressure"],
+                )
+            if blocked_px is not None:
+                ba, bb = blocked_px
+                mx = (ba[0] + bb[0]) // 2
+                dy = bb[1] - ba[1]
+                offset = 22 if dy >= 0 else -22
+                my = (ba[1] + bb[1]) // 2 + offset
+                draw_local_callout(
+                    frame, (mx, my), "PASSING LANE CLOSED",
+                    side="right", accent=ARROW_KIND_COLORS["pressure"],
                 )
 
-        # Step 5: blocked passing lane (resolve per-frame)
-        blocked_px: Optional[Tuple[Tuple[int, int], Tuple[int, int]]] = None
-        if plan["blocked_lane"] is not None:
-            c_tid, b_tid = plan["blocked_lane"]
-            c_w = world_pos.get((c_tid, frame_idx))
-            b_w = world_pos.get((b_tid, frame_idx))
-            c_px = _proj(c_w)
-            b_px = _proj(b_w)
-            if c_px is not None and b_px is not None:
-                blocked_px = (c_px, b_px)
-                draw_blocked_lane(
-                    frame, c_px, b_px,
-                    color=ARROW_KIND_COLORS["pressure"], thickness=3,
-                )
-
-        # Step 6: rings + role pills (resolve per-frame world pos → image)
-        carrier_px: Optional[Tuple[int, int]] = None
-        for r in plan["rings"]:
-            tid = r["tid"]
-            wp = world_pos.get((tid, frame_idx))
-            fp = _proj(wp)
-            if fp is None:
-                # Fallback: derive foot pixel from bbox in tracking data
-                rec = frames_data.get(frame_idx, {})
-                for p in rec.get("players", []):
-                    p_tid = p.get("rawTrackId") or p.get("trackId")
-                    if p_tid is not None and int(p_tid) == tid:
-                        bbox = p.get("bbox")
-                        if bbox and len(bbox) == 4:
-                            x1, y1, x2, y2 = map(int, bbox)
-                            fp = ((x1 + x2) // 2, y2)
-                        break
-            if fp is None:
-                continue
-            color = r["color"]
-            # Compute ring radius in image space from world coords
-            base_radius = 24
-            if wp is not None and H_inv is not None:
-                rr = project_world_radius(RING_RADIUS_M, wp, H_inv)
-                if rr is not None:
-                    base_radius = int(rr)
-            mult = ROLE_RING_RADIUS_MULT.get(r["role_key"], 1.0)
-            radius = int(base_radius * mult)
-            if r["role_key"] == "CARRIER":
-                inner = max(3, radius // 3)
-                cv2.ellipse(frame, fp, (inner, inner // 2), 0, 0, 360, color, -1, cv2.LINE_AA)
-                carrier_px = fp
-            _draw_foot_ring(frame, fp, radius, color, style="solid", thickness=4)
-            below = r["role_key"] == "OPTION"
-            # Dynamic pill offset: ~half-radius at wide shots, capped low at zoom
-            pill_offset = max(int(radius * 0.55) + 12, 24)
-            draw_role_pill(
-                frame, fp, r["label"], color,
-                above_offset_px=pill_offset, below=below,
-            )
-
-        # Step 6.5: ball dot — yellow ring + filled inner dot at ball world pos
-        if show_ball and ball_pos and H_inv is not None:
-            ball_w = ball_pos.get(frame_idx)
-            if ball_w is None:
-                # Tolerance: ±10 frames
-                for delta in range(1, 11):
-                    if (b1 := ball_pos.get(frame_idx - delta)) is not None:
-                        ball_w = b1; break
-                    if (b2 := ball_pos.get(frame_idx + delta)) is not None:
-                        ball_w = b2; break
-            if ball_w is not None:
-                ball_px = _proj(ball_w)
-                if ball_px is not None:
-                    # Outer halo + ring + filled inner dot
-                    cv2.circle(frame, ball_px, 11, (0, 0, 0), 2, cv2.LINE_AA)
-                    cv2.circle(frame, ball_px, 9, BALL, 2, cv2.LINE_AA)
-                    cv2.circle(frame, ball_px, 4, BALL, -1, cv2.LINE_AA)
-                    ball_dots_drawn += 1
-
-        # Step 7: title + subtitle banners (screen-space, not pitch-anchored)
-        for c in callouts:
-            c_lo, c_hi = c.get("frames", [frame_lo, frame_hi])
-            if not (c_lo <= frame_idx <= c_hi):
-                continue
-            text = str(c.get("text", "")).strip()
-            if not text:
-                continue
-            position = str(c.get("position", "top"))
-            draw_banner(frame, text, position=position)
-
-        # Step 8: anchored callouts (derived from reprojected positions)
-        if tl_px is not None:
-            tl_a, tl_b = tl_px
-            tl_mx = (tl_a[0] + tl_b[0]) // 2
-            tl_my = (tl_a[1] + tl_b[1]) // 2 - 18
-            draw_local_callout(
-                frame, (tl_mx, tl_my), "TOUCHLINE = EXTRA DEFENDER",
-                side="left", accent=ARROW_KIND_COLORS["pressure"],
-            )
-        if blocked_px is not None:
-            ba, bb = blocked_px
-            mx = (ba[0] + bb[0]) // 2
-            dy = bb[1] - ba[1]
-            offset = 22 if dy >= 0 else -22
-            my = (ba[1] + bb[1]) // 2 + offset
-            draw_local_callout(
-                frame, (mx, my), "PASSING LANE CLOSED",
-                side="right", accent=ARROW_KIND_COLORS["pressure"],
-            )
-
-        out.write(frame)
-        written += 1
-        frame_idx += 1
+            out.write(frame)
+            written += 1
+            frame_idx += 1
 
     cap.release()
     out.release()
