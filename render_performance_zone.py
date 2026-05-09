@@ -1206,6 +1206,8 @@ def render_story(
             world_pos, fi, int(carrier_tid), declared_defender_tids
         )
 
+    lock_anchor = bool(story.get("lock_anchor", False))
+
     is_valid, recommended_type, geom = _validate_at(anchor_frame)
     if verbose:
         print(
@@ -1213,7 +1215,11 @@ def render_story(
             f"valid={is_valid} type={recommended_type} geom={geom}"
         )
 
-    if not is_valid:
+    if lock_anchor and not is_valid:
+        if verbose:
+            print(f"[render_story] lock_anchor=True — skipping relocator, keeping F={anchor_frame}")
+
+    if not is_valid and not lock_anchor:
         # Scan frame_range first, then full video, scoring every frame
         scan_ranges = [
             (max(0, frame_lo), min(total - 1, frame_hi) if total else frame_hi),
