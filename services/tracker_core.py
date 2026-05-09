@@ -170,8 +170,18 @@ class ReIDExtractor:
         return features_list
 
 
+class _NoOpIdentity:
+    """Drop-in stub when use_identity=False — all calls are no-ops."""
+    def __getattr__(self, name):
+        return lambda *a, **kw: None
+    def assign_tracks(self, *a, **kw):
+        return {}
+    def end_run_summary(self):
+        pass
+
+
 class TrackerCore:
-    def __init__(self, yolo_path, device="cpu"):
+    def __init__(self, yolo_path, device="cpu", use_identity=True):
         self.device = device
 
         yolo_path = os.path.abspath(yolo_path)
@@ -215,8 +225,9 @@ class TrackerCore:
         # VLM: game state only (scene detection)
         self.vlm = VLMStateMachine(device=device)
         # Identity core: deterministic ID assignment via ReID + position
-        self.identity = IdentityCore()
-        self.reid = ReIDExtractor(device=device)
+        self.identity = IdentityCore() if use_identity else _NoOpIdentity()
+        self.reid = ReIDExtractor(device=device) if use_identity else None
+        self._use_identity = use_identity
         self.suppressor = TrackSuppressor()
         self.role_filter = RoleFilter()
         self.crop_quality = CropQualityGate()
@@ -349,7 +360,7 @@ class TrackerCore:
             tids.append(tr.track_id)
             crops.append(crop)
 
-        if self.reid.mode in ("OSNet", "ResNet50"):
+        if self.reid is not None and self.reid.mode in ("OSNet", "ResNet50"):
             feats = self.reid.extract(crops)
             if len(feats) == len(tids):
                 return {tids[i]: feats[i] for i in range(len(tids))}
@@ -648,7 +659,8 @@ class TrackerCore:
         # Pass pitch coords and team labels to identity core
         self.identity.pitch_positions = pitch_positions
         self.identity.team_labels = team_labels
-        self.identity.reid_mode = self.reid.mode
+        if self.reid is not None:
+            self.identity.reid_mode = self.reid.mode
 
         # Clear scene recovery protection after 60 frames
         if (self.identity.in_scene_recovery
@@ -901,7 +913,7 @@ def _probe_first_frames_for_players(tracker: "TrackerCore", cap, n_frames: int =
     return n_players
 
 
-def run_tracking(video_path, job_id, frame_stride=1, max_frames=None, device="cpu"):
+def run_tracking(video_path, job_id, frame_stride=1, max_frames=None, device="cpu", use_identity=True):
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
         raise FileNotFoundError(f"Video not found: {video_path}")
@@ -911,7 +923,7 @@ def run_tracking(video_path, job_id, frame_stride=1, max_frames=None, device="cp
     fallback = "yolov8m.pt" if os.path.exists("yolov8m.pt") else "models/yolov8m.pt"
     yolo_path = _resolve_model_path(primary, fallback)
 
-    tracker = TrackerCore(yolo_path=yolo_path, device=device)
+    tracker = TrackerCore(yolo_path=yolo_path, device=device, use_identity=use_identity)
 
     # Fallback probe: if the primary model returns zero player detections on
     # the first 3 sampled frames, swap to yolov8m (COCO 'person' class) and
