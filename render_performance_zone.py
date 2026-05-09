@@ -1482,6 +1482,8 @@ def render_story(
     written = 0
     ball_dots_drawn = 0
     frame_idx = 0
+    per_frame_trace: List[dict] = []
+    skipped_overlay_frames: List[dict] = []
     if verbose:
         print(
             f"[render_story] anchor_frame={anchor_frame}  window=[{frame_lo}, {frame_hi}]  "
@@ -1617,7 +1619,7 @@ def render_story(
                 nearest = min(H_inv_by_frame.keys(), key=lambda k: abs(k - frame_idx))
                 H_inv = H_inv_by_frame[nearest]
 
-            # Step 1: dim
+            # Step 1: dim background (always, even on invalid overlay frames)
             if dim_alpha > 0:
                 black = np.zeros_like(frame)
                 cv2.addWeighted(black, dim_alpha, frame, 1.0 - dim_alpha, 0, frame)
@@ -1628,17 +1630,137 @@ def render_story(
                     return None
                 return project_world_point(wp, H_inv)
 
-            # Step 2: zone hull (reproject world coords → image, or image-space fallback)
-            if plan["zone_world"]:
-                zone_px = [_proj(wp) for wp in plan["zone_world"]]
+            # ── Per-frame truth lookup (4.7c5) ───────────────────────────
+            ba_entry = carrier_by_frame.get(frame_idx, {}) if carrier_by_frame else {}
+            frame_ball_source = ba_entry.get("ball_source", "missing")
+            frame_carrier_conf = float(ba_entry.get("carrier_confidence", 0) or 0)
+            frame_carrier_tid_raw = ba_entry.get("carrier_tid")
+            frame_carrier_tid = int(frame_carrier_tid_raw) if frame_carrier_tid_raw is not None else None
+
+            frame_ball_world = ball_pos.get(frame_idx) if ball_pos else None
+            if frame_ball_world is None and ball_pos:
+                # Tolerance: ±10 frames so the ball doesn't strobe on a 1-frame gap
+                for delta in range(1, 11):
+                    if (b1 := ball_pos.get(frame_idx - delta)) is not None:
+                        frame_ball_world = b1; break
+                    if (b2 := ball_pos.get(frame_idx + delta)) is not None:
+                        frame_ball_world = b2; break
+            frame_ball_px = _proj(frame_ball_world) if frame_ball_world else None
+
+            # Carrier world pos — prefer ball_assignments' carrier_tid, fall
+            # back to the story's anchor carrier if assignment is missing.
+            carrier_for_frame = frame_carrier_tid if frame_carrier_tid is not None else int(carrier_tid)
+            carrier_w = world_pos.get((carrier_for_frame, frame_idx))
+            carrier_fp = _proj(carrier_w)
+
+            # Active pressers AT THIS FRAME (declared pressers within range
+            # of the current carrier, in world coords).
+            frame_pressers: List[int] = []
+            ball_carrier_dist_m: Optional[float] = None
+            if carrier_w is not None:
+                cx_w, cy_w = carrier_w
+                for ptid in declared_defender_tids:
+                    pw = world_pos.get((int(ptid), frame_idx))
+                    if pw is None:
+                        continue
+                    d = float(np.hypot(pw[0] - cx_w, pw[1] - cy_w))
+                    if d <= presser_max_m:
+                        frame_pressers.append(int(ptid))
+                if frame_ball_world is not None:
+                    ball_carrier_dist_m = float(
+                        np.hypot(frame_ball_world[0] - cx_w, frame_ball_world[1] - cy_w)
+                    )
+
+            # Image-space ball-vs-carrier sanity (catches bad H or bad carrier_tid)
+            BALL_CARRIER_MAX_PX = float(story.get("ball_carrier_max_px", 90.0))
+            ball_carrier_dist_px: Optional[float] = None
+            if carrier_fp is not None and frame_ball_px is not None:
+                ball_carrier_dist_px = float(
+                    np.hypot(carrier_fp[0] - frame_ball_px[0], carrier_fp[1] - frame_ball_px[1])
+                )
+
+            MIN_CARRIER_CONF = float(story.get("min_carrier_conf_per_frame", 0.55))
+
+            # Decide validity for THIS frame's overlay
+            invalid_reason: Optional[str] = None
+            if frame_ball_source == "missing":
+                invalid_reason = "ball_missing"
+            elif frame_carrier_conf < MIN_CARRIER_CONF:
+                invalid_reason = "carrier_conf_low"
+            elif frame_carrier_tid is None:
+                invalid_reason = "no_carrier_tid"
+            elif carrier_w is None:
+                invalid_reason = "carrier_no_world_pos"
+            elif ball_carrier_dist_px is not None and ball_carrier_dist_px > BALL_CARRIER_MAX_PX:
+                invalid_reason = "ball_far_from_carrier"
+            elif len(frame_pressers) < 1:
+                invalid_reason = "no_active_pressers"
+
+            frame_overlay_valid = invalid_reason is None
+
+            # Trace this frame for the manifest
+            per_frame_trace.append({
+                "f": frame_idx,
+                "ball_source": frame_ball_source,
+                "carrier_tid": frame_carrier_tid,
+                "carrier_conf": round(frame_carrier_conf, 3),
+                "ball_carrier_dist_m": round(ball_carrier_dist_m, 2) if ball_carrier_dist_m is not None else None,
+                "ball_carrier_dist_px": round(ball_carrier_dist_px, 1) if ball_carrier_dist_px is not None else None,
+                "pressers_active": len(frame_pressers),
+                "overlay_drawn": frame_overlay_valid,
+            })
+
+            if not frame_overlay_valid:
+                skipped_overlay_frames.append({"f": frame_idx, "reason": invalid_reason})
+                # Title still draws (the clip is about THIS sequence) but no
+                # tactical claim is made on this frame.
+                for c in callouts:
+                    c_lo, c_hi = c.get("frames", [frame_lo, frame_hi])
+                    if not (c_lo <= frame_idx <= c_hi):
+                        continue
+                    text = str(c.get("text", "")).strip()
+                    if not text:
+                        continue
+                    position = str(c.get("position", "top"))
+                    draw_banner(frame, text, position=position)
+                out.write(frame)
+                written += 1
+                frame_idx += 1
+                continue
+
+            # ── Per-frame geometry build (4.7c5) ─────────────────────────
+            # Collect ring specs filtered by current presser validity. Carrier
+            # uses the per-frame carrier_tid (not the anchor's, which may be stale).
+            frame_rings: List[dict] = []
+            # Carrier first
+            frame_rings.append({
+                "tid": carrier_for_frame,
+                "color": _team_color(team_map.get(int(carrier_for_frame))),
+                "role_key": "CARRIER",
+                "label": "BALL CARRIER",
+            })
+            # Surviving pressers (declared & within range now). Map back to display label.
+            for r in plan["rings"]:
+                if r["role_key"] in ("DEFENDER", "COVER") and int(r["tid"]) in frame_pressers:
+                    frame_rings.append(r)
+
+            # Step 2: zone hull — recompute from CURRENT carrier + active pressers
+            zone_world_now = [carrier_w]
+            for ptid in frame_pressers:
+                pw = world_pos.get((int(ptid), frame_idx))
+                if pw is not None:
+                    zone_world_now.append(pw)
+            if len(zone_world_now) >= 3:
+                zone_shrink = float(story.get("zone_shrink", 0.72))
+                shrunk = _shrink_polygon(zone_world_now, factor=zone_shrink)
+                zone_px = [_proj(wp) for wp in shrunk]
                 zone_px = [p for p in zone_px if p is not None]
                 if len(zone_px) >= 3:
                     draw_zone_hull(frame, zone_px, zone_color, alpha=zone_alpha)
-            elif plan.get("zone_image_fallback") and len(plan["zone_image_fallback"]) >= 3:
-                draw_zone_hull(frame, plan["zone_image_fallback"], zone_color, alpha=zone_alpha)
 
-            # Step 3: touchline glow (reproject world endpoints → image)
-            tl_px: Optional[Tuple[Tuple[int, int], Tuple[int, int]]] = None
+            # Step 3: touchline glow (only meaningful for PRESSING_TRAP — story
+            # already gates this via show_touchline). Reproject world segment.
+            tl_px = None
             if plan["touchline_world"] and H_inv is not None:
                 tl_a_w, tl_b_w = plan["touchline_world"]
                 tl_a_px = _proj(tl_a_w)
@@ -1650,41 +1772,41 @@ def render_story(
                         ARROW_KIND_COLORS["pressure"], thickness=6, glow_layers=2,
                     )
 
-            # Step 4: pressure arrows (resolve world pos per-frame)
-            for a in plan["arrows"]:
-                from_w = world_pos.get((a["from_tid"], frame_idx))
-                to_w = world_pos.get((a["to_tid"], frame_idx))
+            # Step 4: pressure arrows from each ACTIVE presser to current carrier
+            for i, ptid in enumerate(frame_pressers):
+                from_w = world_pos.get((int(ptid), frame_idx))
                 from_px = _proj(from_w)
-                to_px = _proj(to_w)
-                if from_px is not None and to_px is not None:
-                    draw_curved_arrow(
-                        frame, from_px, to_px, a["color"],
-                        thickness=4, bend=a["bend"], stop_short_px=32,
-                    )
+                if from_px is None or carrier_fp is None:
+                    continue
+                bend = 0.30 if i % 2 == 0 else -0.30
+                draw_curved_arrow(
+                    frame, from_px, carrier_fp, ARROW_KIND_COLORS["pressure"],
+                    thickness=4, bend=bend, stop_short_px=32,
+                )
 
-            # Step 5: blocked passing lane (resolve per-frame)
-            blocked_px: Optional[Tuple[Tuple[int, int], Tuple[int, int]]] = None
+            # Step 5: blocked passing lane (current carrier → blocked option,
+            # only if the option is still within plausible passing range)
+            blocked_px = None
             if plan["blocked_lane"] is not None:
-                c_tid, b_tid = plan["blocked_lane"]
-                c_w = world_pos.get((c_tid, frame_idx))
-                b_w = world_pos.get((b_tid, frame_idx))
-                c_px = _proj(c_w)
-                b_px = _proj(b_w)
-                if c_px is not None and b_px is not None:
-                    blocked_px = (c_px, b_px)
-                    draw_blocked_lane(
-                        frame, c_px, b_px,
-                        color=ARROW_KIND_COLORS["pressure"], thickness=3,
-                    )
+                _c_tid_anchor, b_tid = plan["blocked_lane"]
+                # Use current carrier, not anchor's
+                b_w = world_pos.get((int(b_tid), frame_idx))
+                if (b_w is not None and carrier_w is not None
+                    and float(np.hypot(b_w[0] - carrier_w[0], b_w[1] - carrier_w[1])) <= option_max_m):
+                    b_px = _proj(b_w)
+                    if carrier_fp is not None and b_px is not None:
+                        blocked_px = (carrier_fp, b_px)
+                        draw_blocked_lane(
+                            frame, carrier_fp, b_px,
+                            color=ARROW_KIND_COLORS["pressure"], thickness=3,
+                        )
 
-            # Step 6: rings + role pills (resolve per-frame world pos → image)
-            carrier_px: Optional[Tuple[int, int]] = None
-            for r in plan["rings"]:
+            # Step 6: rings + role pills — current carrier_tid + surviving pressers
+            for r in frame_rings:
                 tid = r["tid"]
                 wp = world_pos.get((tid, frame_idx))
                 fp = _proj(wp)
                 if fp is None:
-                    # Fallback: derive foot pixel from bbox in tracking data
                     rec = frames_data.get(frame_idx, {})
                     for p in rec.get("players", []):
                         p_tid = p.get("rawTrackId") or p.get("trackId")
@@ -1697,7 +1819,6 @@ def render_story(
                 if fp is None:
                     continue
                 color = r["color"]
-                # Compute ring radius in image space from world coords
                 base_radius = 24
                 if wp is not None and H_inv is not None:
                     rr = project_world_radius(RING_RADIUS_M, wp, H_inv)
@@ -1708,36 +1829,22 @@ def render_story(
                 if r["role_key"] == "CARRIER":
                     inner = max(3, radius // 3)
                     cv2.ellipse(frame, fp, (inner, inner // 2), 0, 0, 360, color, -1, cv2.LINE_AA)
-                    carrier_px = fp
                 _draw_foot_ring(frame, fp, radius, color, style="solid", thickness=4)
                 below = r["role_key"] == "OPTION"
-                # Dynamic pill offset: ~half-radius at wide shots, capped low at zoom
                 pill_offset = max(int(radius * 0.55) + 12, 24)
                 draw_role_pill(
                     frame, fp, r["label"], color,
                     above_offset_px=pill_offset, below=below,
                 )
 
-            # Step 6.5: ball dot — yellow ring + filled inner dot at ball world pos
-            if show_ball and ball_pos and H_inv is not None:
-                ball_w = ball_pos.get(frame_idx)
-                if ball_w is None:
-                    # Tolerance: ±10 frames
-                    for delta in range(1, 11):
-                        if (b1 := ball_pos.get(frame_idx - delta)) is not None:
-                            ball_w = b1; break
-                        if (b2 := ball_pos.get(frame_idx + delta)) is not None:
-                            ball_w = b2; break
-                if ball_w is not None:
-                    ball_px = _proj(ball_w)
-                    if ball_px is not None:
-                        # Outer halo + ring + filled inner dot
-                        cv2.circle(frame, ball_px, 11, (0, 0, 0), 2, cv2.LINE_AA)
-                        cv2.circle(frame, ball_px, 9, BALL, 2, cv2.LINE_AA)
-                        cv2.circle(frame, ball_px, 4, BALL, -1, cv2.LINE_AA)
-                        ball_dots_drawn += 1
+            # Step 6.5: ball dot — already projected above
+            if show_ball and frame_ball_px is not None:
+                cv2.circle(frame, frame_ball_px, 11, (0, 0, 0), 2, cv2.LINE_AA)
+                cv2.circle(frame, frame_ball_px, 9, BALL, 2, cv2.LINE_AA)
+                cv2.circle(frame, frame_ball_px, 4, BALL, -1, cv2.LINE_AA)
+                ball_dots_drawn += 1
 
-            # Step 7: title + subtitle banners (screen-space, not pitch-anchored)
+            # Step 7: title + subtitle banners
             for c in callouts:
                 c_lo, c_hi = c.get("frames", [frame_lo, frame_hi])
                 if not (c_lo <= frame_idx <= c_hi):
@@ -1748,7 +1855,7 @@ def render_story(
                 position = str(c.get("position", "top"))
                 draw_banner(frame, text, position=position)
 
-            # Step 8: anchored callouts (derived from reprojected positions)
+            # Step 8: anchored callouts
             if tl_px is not None:
                 tl_a, tl_b = tl_px
                 tl_mx = (tl_a[0] + tl_b[0]) // 2
@@ -1844,6 +1951,48 @@ def render_story(
         "product_mode":           not debug_allow_invalid_story,
         "zone_image_fallback":    len(plan.get("zone_image_fallback", []) or []),
     }
+
+    # Phase 4.7c5: per-frame truth trace + aggregates
+    overlay_drawn_count = sum(1 for t in per_frame_trace if t.get("overlay_drawn"))
+    overlay_drawn_ratio = round(overlay_drawn_count / max(1, len(per_frame_trace)), 3)
+    drawn_dists = [t["ball_carrier_dist_m"] for t in per_frame_trace
+                   if t.get("overlay_drawn") and t.get("ball_carrier_dist_m") is not None]
+    if drawn_dists:
+        drawn_dists_sorted = sorted(drawn_dists)
+        p95_idx = max(0, int(len(drawn_dists_sorted) * 0.95) - 1)
+        bc_p95 = round(drawn_dists_sorted[p95_idx], 2)
+    else:
+        bc_p95 = None
+    manifest["rendered_frame_count"]  = written
+    manifest["overlay_drawn_frames"]  = overlay_drawn_count
+    manifest["overlay_drawn_ratio"]   = overlay_drawn_ratio
+    manifest["skipped_overlay_frames"] = skipped_overlay_frames
+    manifest["ball_carrier_dist_p95_m"] = bc_p95
+    manifest["per_frame_trace"]       = per_frame_trace
+
+    # ── Acceptance gate (4.7c5) — refuse to ship a misleading clip ────
+    if not debug_allow_invalid_story:
+        accept_failures: List[str] = []
+        if overlay_drawn_ratio < 0.80:
+            accept_failures.append(
+                f"overlay_drawn_ratio={overlay_drawn_ratio} < 0.80 — "
+                f"the overlay was hidden on more than 20% of rendered frames "
+                f"because per-frame truth was missing or inconsistent."
+            )
+        if bc_p95 is not None and bc_p95 > 6.0:
+            accept_failures.append(
+                f"ball_carrier_dist_p95_m={bc_p95} > 6.0 — "
+                "ball is too far from labeled carrier on the worst 5% of frames."
+            )
+        if accept_failures:
+            manifest["story_failed_reason"] = "; ".join(accept_failures)
+            manifest["story_valid"] = False
+            if verbose:
+                for r in accept_failures:
+                    print(f"[render_story] ACCEPTANCE FAIL: {r}")
+            # Don't delete the MP4 — caller may want to inspect it — but
+            # surface the failure clearly so the cell sees story_valid=False.
+            # (We do not raise: the MP4 is already written. Caller decides.)
     if verbose:
         print(f"[render_story] manifest={manifest}")
         # Hard pass/fail signals — always print when triggered
