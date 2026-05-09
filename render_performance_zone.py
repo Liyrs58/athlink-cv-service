@@ -1039,7 +1039,11 @@ def render_story(
         validate_pressing_trap,
     )
 
-    declared_story_type = "PRESSING_TRAP"  # only PRESSING_TRAP is implemented
+    # Derive declared_story_type from the story JSON title so callers can
+    # author PRESSING_TRIANGLE / WIDE_CHANNEL_CHASE etc. directly.
+    _title_to_type = {v[0].upper(): k for k, v in STORY_TYPE_TITLE.items()}
+    _raw_title = str(story.get("title", "PRESSING TRAP")).upper()
+    declared_story_type = _title_to_type.get(_raw_title, "PRESSING_TRAP")
     strict_story_type = bool(story.get("strict_story_type", False))
     declared_defender_tids = [
         tid for (tid, raw_role) in raw_cast
@@ -1047,6 +1051,16 @@ def render_story(
     ]
 
     def _validate_at(fi: int) -> Tuple[bool, str, dict]:
+        from services.story_validators import (
+            validate_pressing_triangle, validate_goalmouth_pressure,
+            validate_transition_carry,
+        )
+        if declared_story_type == "PRESSING_TRIANGLE":
+            return validate_pressing_triangle(world_pos, fi, int(carrier_tid), declared_defender_tids)
+        if declared_story_type == "GOALMOUTH_PRESSURE":
+            return validate_goalmouth_pressure(world_pos, fi, int(carrier_tid), declared_defender_tids)
+        if declared_story_type == "TRANSITION_CARRY":
+            return validate_transition_carry(world_pos, fi, int(carrier_tid), declared_defender_tids)
         return validate_pressing_trap(
             world_pos, fi, int(carrier_tid), declared_defender_tids
         )
