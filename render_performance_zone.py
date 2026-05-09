@@ -1042,6 +1042,29 @@ def render_story(
                         f"{len(override)} frames "
                         f"(interpolated +{interp_ball} ball, +{interp_carrier} carrier)"
                     )
+
+            # ── Carrier-tid temporal smoother (4.7c8) ──────────────────
+            # Collapse 1-3 frame carrier_tid flips before downstream
+            # hysteresis sees them. Window = 2*W+1 frames.
+            try:
+                from services.ball_assignments_smoother import (
+                    smooth_carrier_assignments,
+                )
+                smoother_window = int(story.get("carrier_smoother_window", 6))
+                carrier_by_frame, smoother_stats = smooth_carrier_assignments(
+                    carrier_by_frame, window=smoother_window
+                )
+                ball_interp_stats["smoother_stats"] = smoother_stats
+                if verbose:
+                    print(
+                        f"[ball_smoother] {smoother_stats['total_frames']} frames, "
+                        f"{smoother_stats['tid_switches_in_raw']} raw tid switches "
+                        f"→ {smoother_stats['tid_switches_in_smoothed']} smoothed "
+                        f"({smoother_stats['noise_reduction_ratio']*100:.0f}% noise reduction)"
+                    )
+            except Exception as e:
+                if verbose:
+                    print(f"[render_story] WARN carrier smoother failed: {e}")
         except Exception as e:
             if verbose:
                 print(f"[render_story] WARN failed to load ball_assignments.json: {e}")
@@ -2281,6 +2304,8 @@ def render_story(
     }
     manifest["interpolated_ball_frames"]    = ball_interp_stats["interpolated_ball_frames"]
     manifest["interpolated_carrier_frames"] = ball_interp_stats["interpolated_carrier_frames"]
+    if "smoother_stats" in ball_interp_stats:
+        manifest["carrier_smoother_stats"] = ball_interp_stats["smoother_stats"]
 
     # ── Acceptance gate (4.7c5) — refuse to ship a misleading clip ────
     if not debug_allow_invalid_story:
