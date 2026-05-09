@@ -122,6 +122,127 @@ class OverlayCompositor:
         # Outline
         cv2.polylines(self._layer(layer), [hull], True, self._bgra(color, 210), 3 * self.scale, cv2.LINE_AA)
 
+    def fill_circle(
+        self,
+        center: Tuple[int, int],
+        radius: int,
+        color: Tuple[int, int, int],
+        *,
+        alpha: int = 255,
+        layer: int = LAYER_RINGS,
+    ) -> None:
+        sc = self._s(center)
+        r_s = max(1, radius * self.scale)
+        cv2.circle(self._layer(layer), sc, r_s, self._bgra(color, alpha), -1, cv2.LINE_AA)
+
+    def fill_ellipse(
+        self,
+        center: Tuple[int, int],
+        axes: Tuple[int, int],
+        color: Tuple[int, int, int],
+        *,
+        alpha: int = 255,
+        layer: int = LAYER_RINGS,
+    ) -> None:
+        sc = self._s(center)
+        sa = (max(1, axes[0] * self.scale), max(1, axes[1] * self.scale))
+        cv2.ellipse(self._layer(layer), sc, sa, 0, 0, 360,
+                    self._bgra(color, alpha), -1, cv2.LINE_AA)
+
+    def draw_curved_arrow(
+        self,
+        p1: Tuple[int, int],
+        p2: Tuple[int, int],
+        color: Tuple[int, int, int],
+        *,
+        thickness: int = 4,
+        bend: float = 0.30,
+        alpha: int = 255,
+        stop_short_px: int = 32,
+        layer: int = LAYER_LINES,
+    ) -> None:
+        """Quadratic-Bezier arrow with shadow halo + arrowhead."""
+        sp1, sp2 = self._s(p1), self._s(p2)
+        t_s = max(1, thickness * self.scale)
+        stop_s = stop_short_px * self.scale
+        # Trim end to leave headroom around target ring
+        dx, dy = sp2[0] - sp1[0], sp2[1] - sp1[1]
+        norm = (dx * dx + dy * dy) ** 0.5
+        if norm > stop_s + 4:
+            f = (norm - stop_s) / norm
+            sp2 = (int(sp1[0] + dx * f), int(sp1[1] + dy * f))
+        # Bezier control: perpendicular offset by bend * length
+        mx, my = (sp1[0] + sp2[0]) // 2, (sp1[1] + sp2[1]) // 2
+        nx, ny = -dy / max(1, norm), dx / max(1, norm)
+        cx = int(mx + nx * bend * norm)
+        cy = int(my + ny * bend * norm)
+        # Sample 24 points
+        pts: List[Tuple[int, int]] = []
+        for i in range(25):
+            t = i / 24.0
+            u = 1.0 - t
+            bx = int(u * u * sp1[0] + 2 * u * t * cx + t * t * sp2[0])
+            by = int(u * u * sp1[1] + 2 * u * t * cy + t * t * sp2[1])
+            pts.append((bx, by))
+        lyr = self._layer(layer)
+        # Shadow first (darker, thicker)
+        for i in range(len(pts) - 1):
+            cv2.line(lyr, pts[i], pts[i + 1], (0, 0, 0, 180),
+                     t_s + 2 * self.scale, cv2.LINE_AA)
+        # Bright core
+        for i in range(len(pts) - 1):
+            cv2.line(lyr, pts[i], pts[i + 1], self._bgra(color, alpha),
+                     t_s, cv2.LINE_AA)
+        # Arrowhead
+        tip = pts[-1]
+        before = pts[-3]
+        ang = np.arctan2(tip[1] - before[1], tip[0] - before[0])
+        head_len = 12 * self.scale
+        head_ang = 0.45  # rad
+        a1 = (int(tip[0] - head_len * np.cos(ang - head_ang)),
+              int(tip[1] - head_len * np.sin(ang - head_ang)))
+        a2 = (int(tip[0] - head_len * np.cos(ang + head_ang)),
+              int(tip[1] - head_len * np.sin(ang + head_ang)))
+        cv2.line(lyr, tip, a1, self._bgra(color, alpha), t_s, cv2.LINE_AA)
+        cv2.line(lyr, tip, a2, self._bgra(color, alpha), t_s, cv2.LINE_AA)
+
+    def draw_pill(
+        self,
+        center: Tuple[int, int],
+        text: str,
+        color: Tuple[int, int, int],
+        *,
+        font_scale: float = 0.48,
+        alpha: int = 230,
+        layer: int = LAYER_LABELS,
+    ) -> None:
+        """Solid coloured pill with white text, supersampled."""
+        if not text:
+            return
+        sp = self._s(center)
+        fs = font_scale * self.scale
+        th = max(1, int(round(self.scale)))
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        (tw, hh), _ = cv2.getTextSize(text.upper(), font, fs, th)
+        pad_x, pad_y = 10 * self.scale, 6 * self.scale
+        bw, bh = tw + 2 * pad_x, hh + 2 * pad_y
+        x1, y1 = sp[0] - bw // 2, sp[1] - bh
+        x2, y2 = sp[0] + bw // 2, sp[1]
+        lyr = self._layer(layer)
+        # Shadow
+        cv2.rectangle(lyr, (x1 + self.scale, y1 + self.scale),
+                      (x2 + self.scale, y2 + self.scale),
+                      (0, 0, 0, 160), -1)
+        # Pill body
+        cv2.rectangle(lyr, (x1, y1), (x2, y2), self._bgra(color, alpha), -1)
+        # Text — black halo behind for legibility
+        tx = x1 + pad_x
+        ty = y2 - pad_y
+        cv2.putText(lyr, text.upper(), (tx + 1, ty + 1), font, fs,
+                    (0, 0, 0, 220), th + self.scale, cv2.LINE_AA)
+        cv2.putText(lyr, text.upper(), (tx, ty), font, fs,
+                    (255, 255, 255, 255), th, cv2.LINE_AA)
+
     def draw_text(
         self,
         text: str,

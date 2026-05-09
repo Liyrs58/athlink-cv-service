@@ -36,12 +36,23 @@ from services.tactical_overlay import (
     draw_banner,
     draw_blocked_lane,
     draw_caption,
-    draw_curved_arrow,
     draw_dashed_path,
     draw_glow_line,
     draw_local_callout,
+    draw_player_trail,
     draw_role_pill,
     draw_zone_hull,
+)
+from services.broadcast_compositor import (
+    LAYER_GLOW,
+    LAYER_LABELS,
+    LAYER_LINES,
+    LAYER_RINGS,
+    LAYER_TITLES,
+    LAYER_ZONE_FILL,
+    LabelSpec,
+    OverlayCompositor,
+    solve_label_positions,
 )
 from services.world_to_image import (
     invert_homography,
@@ -1438,19 +1449,60 @@ def render_story(
         "callouts":      (65,  78),
     }
 
+    # Live-mode timeline (frame_offset = frame_idx - frame_lo). Tuned for
+    # broadcast pacing: title slides in instantly, cast staggers over the
+    # first second, everything fades out in the last 12 frames.
+    _live_window_len = max(1, frame_hi - frame_lo + 1)
+    _live_outro_lo = max(0, _live_window_len - 12)
+    _live_outro_hi = _live_window_len - 1
+    ANIM_LIVE = {
+        "title_fade":     (0,                       12),
+        "subtitle_fade":  (8,                       22),
+        "carrier_ring":   (4,                       12),
+        "presser_rings":  (10,                      18),  # PRESSER (offset 0)
+        "presser_rings2": (12,                      20),  # COVER  (offset +2 stagger)
+        "zone_fade":      (14,                      24),
+        "arrows_draw":    (18,                      30),
+        "blocked_lane":   (28,                      38),
+        "trails_fade":    (6,                       16),
+        "outro_fade":     (_live_outro_lo,          _live_outro_hi),
+    }
+
     def _smoothstep(t: float) -> float:
         """Cubic smoothstep easing: 0→1 with zero derivative at endpoints."""
         t = max(0.0, min(1.0, t))
         return t * t * (3.0 - 2.0 * t)
 
     def _anim_alpha(key: str, offset: int) -> float:
-        """Return [0,1] progress for a named animation stage at this offset."""
+        """Return [0,1] progress for a named animation stage at this offset.
+        Reads ANIM (freeze-frame). Live mode uses _anim_alpha_live."""
         start, end = ANIM[key]
         if offset < start:
             return 0.0
         if offset >= end:
             return 1.0
         return _smoothstep((offset - start) / max(1, end - start))
+
+    def _anim_alpha_live(key: str, offset: int) -> float:
+        """Live-mode alpha. Same as _anim_alpha but reads ANIM_LIVE."""
+        if key not in ANIM_LIVE:
+            return 1.0
+        start, end = ANIM_LIVE[key]
+        if offset < start:
+            return 0.0
+        if offset >= end:
+            return 1.0
+        return _smoothstep((offset - start) / max(1, end - start))
+
+    def _live_outro_factor(offset: int) -> float:
+        """Returns 1.0 during the body of the clip, ramps down 1→0 in the
+        last 12 frames so the overlay fades out cleanly."""
+        if offset < _live_outro_lo:
+            return 1.0
+        if offset >= _live_outro_hi:
+            return 0.0
+        t = (offset - _live_outro_lo) / max(1, _live_outro_hi - _live_outro_lo)
+        return 1.0 - _smoothstep(t)
 
     # ── Freeze-frame: capture anchor background once ──────────────────────
     freeze_bg: Optional[np.ndarray] = None
@@ -1484,6 +1536,10 @@ def render_story(
     frame_idx = 0
     per_frame_trace: List[dict] = []
     skipped_overlay_frames: List[dict] = []
+    # 4.7c6 polish state
+    trails_px: Dict[int, List[Tuple[int, int]]] = defaultdict(list)
+    label_collisions_resolved = 0
+    trails_drawn_total = 0
     if verbose:
         print(
             f"[render_story] anchor_frame={anchor_frame}  window=[{frame_lo}, {frame_hi}]  "
@@ -1728,38 +1784,84 @@ def render_story(
                 frame_idx += 1
                 continue
 
-            # ── Per-frame geometry build (4.7c5) ─────────────────────────
+            # ── Per-frame geometry build (4.7c5/c6) ─────────────────────
             # Collect ring specs filtered by current presser validity. Carrier
             # uses the per-frame carrier_tid (not the anchor's, which may be stale).
             frame_rings: List[dict] = []
-            # Carrier first
             frame_rings.append({
                 "tid": carrier_for_frame,
                 "color": _team_color(team_map.get(int(carrier_for_frame))),
                 "role_key": "CARRIER",
                 "label": "BALL CARRIER",
             })
-            # Surviving pressers (declared & within range now). Map back to display label.
             for r in plan["rings"]:
                 if r["role_key"] in ("DEFENDER", "COVER") and int(r["tid"]) in frame_pressers:
                     frame_rings.append(r)
 
-            # Step 2: zone hull — recompute from CURRENT carrier + active pressers
-            zone_world_now = [carrier_w]
-            for ptid in frame_pressers:
-                pw = world_pos.get((int(ptid), frame_idx))
-                if pw is not None:
-                    zone_world_now.append(pw)
-            if len(zone_world_now) >= 3:
-                zone_shrink = float(story.get("zone_shrink", 0.72))
-                shrunk = _shrink_polygon(zone_world_now, factor=zone_shrink)
-                zone_px = [_proj(wp) for wp in shrunk]
-                zone_px = [p for p in zone_px if p is not None]
-                if len(zone_px) >= 3:
-                    draw_zone_hull(frame, zone_px, zone_color, alpha=zone_alpha)
+            # Live-mode animation timeline — outro multiplier dims everything
+            # together in the last 12 frames.
+            outro = _live_outro_factor(frame_offset)
+            a_carrier  = _anim_alpha_live("carrier_ring",  frame_offset) * outro
+            a_pres1    = _anim_alpha_live("presser_rings", frame_offset) * outro
+            a_pres2    = _anim_alpha_live("presser_rings2", frame_offset) * outro
+            a_zone     = _anim_alpha_live("zone_fade",     frame_offset) * outro
+            a_arrows   = _anim_alpha_live("arrows_draw",   frame_offset) * outro
+            a_blocked  = _anim_alpha_live("blocked_lane",  frame_offset) * outro
+            a_title    = _anim_alpha_live("title_fade",    frame_offset) * outro
+            a_subtitle = _anim_alpha_live("subtitle_fade", frame_offset) * outro
+            a_trails   = _anim_alpha_live("trails_fade",   frame_offset) * outro
 
-            # Step 3: touchline glow (only meaningful for PRESSING_TRAP — story
-            # already gates this via show_touchline). Reproject world segment.
+            # ── Trails: maintain history, draw on broadcast frame BEFORE compositor
+            # so the supersampled overlay sits on top of the trail.
+            for r in frame_rings:
+                tid = int(r["tid"])
+                wp_t = world_pos.get((tid, frame_idx))
+                fp_t = _proj(wp_t)
+                if fp_t is not None:
+                    hist = trails_px[tid]
+                    if not hist or hist[-1] != fp_t:
+                        hist.append(fp_t)
+                    if len(hist) > 12:
+                        del hist[: len(hist) - 12]
+            if a_trails > 0:
+                for r in frame_rings:
+                    tid = int(r["tid"])
+                    if r["role_key"] == "OPTION":
+                        continue  # OPTION doesn't show trails
+                    pts = trails_px.get(tid, [])
+                    if len(pts) >= 2:
+                        # Modulate trail brightness by a_trails (cheap: pick a
+                        # darker colour at low alpha)
+                        col = r["color"]
+                        if a_trails < 0.99:
+                            col = tuple(int(c * (0.4 + 0.6 * a_trails)) for c in col)
+                        draw_player_trail(frame, pts, col,
+                                          thickness=2, seg_len=5, gap=3)
+                        trails_drawn_total += 1
+
+            # ── Build OverlayCompositor and stack primitives at 2x supersample
+            comp = OverlayCompositor(w=w, h=h, scale=2)
+
+            # 1. Zone fill (recomputed each frame from CURRENT positions)
+            if a_zone > 0:
+                zone_world_now = [carrier_w]
+                for ptid in frame_pressers:
+                    pw = world_pos.get((int(ptid), frame_idx))
+                    if pw is not None:
+                        zone_world_now.append(pw)
+                if len(zone_world_now) >= 3:
+                    zone_shrink = float(story.get("zone_shrink", 0.72))
+                    shrunk = _shrink_polygon(zone_world_now, factor=zone_shrink)
+                    zone_px = [_proj(wp) for wp in shrunk]
+                    zone_px = [p for p in zone_px if p is not None]
+                    if len(zone_px) >= 3:
+                        comp.fill_polygon(
+                            zone_px, color=zone_color,
+                            alpha=int(zone_alpha * 255 * a_zone),
+                            layer=LAYER_ZONE_FILL,
+                        )
+
+            # 2. Touchline glow
             tl_px = None
             if plan["touchline_world"] and H_inv is not None:
                 tl_a_w, tl_b_w = plan["touchline_world"]
@@ -1767,42 +1869,57 @@ def render_story(
                 tl_b_px = _proj(tl_b_w)
                 if tl_a_px is not None and tl_b_px is not None:
                     tl_px = (tl_a_px, tl_b_px)
-                    draw_glow_line(
-                        frame, tl_a_px, tl_b_px,
-                        ARROW_KIND_COLORS["pressure"], thickness=6, glow_layers=2,
+                    comp.draw_glow_line(
+                        tl_a_px, tl_b_px,
+                        ARROW_KIND_COLORS["pressure"],
+                        thickness=6, glow_radius=14,
+                        glow_alpha=0.45 * a_pres1, layer=LAYER_GLOW,
                     )
 
-            # Step 4: pressure arrows from each ACTIVE presser to current carrier
-            for i, ptid in enumerate(frame_pressers):
-                from_w = world_pos.get((int(ptid), frame_idx))
-                from_px = _proj(from_w)
-                if from_px is None or carrier_fp is None:
-                    continue
-                bend = 0.30 if i % 2 == 0 else -0.30
-                draw_curved_arrow(
-                    frame, from_px, carrier_fp, ARROW_KIND_COLORS["pressure"],
-                    thickness=4, bend=bend, stop_short_px=32,
-                )
+            # 3. Pressure arrows — fade in collectively
+            if a_arrows > 0 and carrier_fp is not None:
+                arrow_alpha = int(255 * a_arrows)
+                for i, ptid in enumerate(frame_pressers):
+                    from_w = world_pos.get((int(ptid), frame_idx))
+                    from_px = _proj(from_w)
+                    if from_px is None:
+                        continue
+                    bend = 0.30 if i % 2 == 0 else -0.30
+                    comp.draw_curved_arrow(
+                        from_px, carrier_fp,
+                        ARROW_KIND_COLORS["pressure"],
+                        thickness=4, bend=bend, alpha=arrow_alpha,
+                        stop_short_px=32, layer=LAYER_LINES,
+                    )
 
-            # Step 5: blocked passing lane (current carrier → blocked option,
-            # only if the option is still within plausible passing range)
+            # 4. Blocked passing lane — recomputed from CURRENT carrier
             blocked_px = None
-            if plan["blocked_lane"] is not None:
+            if plan["blocked_lane"] is not None and a_blocked > 0:
                 _c_tid_anchor, b_tid = plan["blocked_lane"]
-                # Use current carrier, not anchor's
                 b_w = world_pos.get((int(b_tid), frame_idx))
                 if (b_w is not None and carrier_w is not None
                     and float(np.hypot(b_w[0] - carrier_w[0], b_w[1] - carrier_w[1])) <= option_max_m):
                     b_px = _proj(b_w)
                     if carrier_fp is not None and b_px is not None:
                         blocked_px = (carrier_fp, b_px)
-                        draw_blocked_lane(
-                            frame, carrier_fp, b_px,
-                            color=ARROW_KIND_COLORS["pressure"], thickness=3,
-                        )
+                        # Use existing draw_blocked_lane (no compositor variant)
+                        # but gate on a_blocked. Draw on a copy so we can alpha-fade.
+                        if a_blocked >= 0.99:
+                            draw_blocked_lane(
+                                frame, carrier_fp, b_px,
+                                color=ARROW_KIND_COLORS["pressure"], thickness=3,
+                            )
+                        else:
+                            tmp = frame.copy()
+                            draw_blocked_lane(
+                                tmp, carrier_fp, b_px,
+                                color=ARROW_KIND_COLORS["pressure"], thickness=3,
+                            )
+                            cv2.addWeighted(tmp, a_blocked, frame, 1.0 - a_blocked, 0, frame)
 
-            # Step 6: rings + role pills — current carrier_tid + surviving pressers
-            for r in frame_rings:
+            # 5. Rings + label specs (carrier always solid; pressers staggered)
+            ring_records: List[Tuple[dict, Tuple[int, int], int, int]] = []  # (ring_spec, fp, radius, ring_alpha)
+            for ring_idx, r in enumerate(frame_rings):
                 tid = r["tid"]
                 wp = world_pos.get((tid, frame_idx))
                 fp = _proj(wp)
@@ -1826,25 +1943,93 @@ def render_story(
                         base_radius = int(rr)
                 mult = ROLE_RING_RADIUS_MULT.get(r["role_key"], 1.0)
                 radius = int(base_radius * mult)
+                # Per-role alpha: carrier uses its own ramp, pressers stagger.
+                if r["role_key"] == "CARRIER":
+                    role_a = a_carrier
+                elif r["role_key"] == "DEFENDER":
+                    role_a = a_pres1
+                elif r["role_key"] == "COVER":
+                    role_a = a_pres2
+                else:
+                    role_a = max(a_pres1, a_pres2)
+                ring_alpha = int(255 * role_a)
+                if ring_alpha <= 0:
+                    continue
+                # Carrier inner solid pulse
                 if r["role_key"] == "CARRIER":
                     inner = max(3, radius // 3)
-                    cv2.ellipse(frame, fp, (inner, inner // 2), 0, 0, 360, color, -1, cv2.LINE_AA)
-                _draw_foot_ring(frame, fp, radius, color, style="solid", thickness=4)
-                below = r["role_key"] == "OPTION"
-                pill_offset = max(int(radius * 0.55) + 12, 24)
-                draw_role_pill(
-                    frame, fp, r["label"], color,
-                    above_offset_px=pill_offset, below=below,
+                    comp.fill_ellipse(
+                        fp, (inner, inner // 2), color,
+                        alpha=ring_alpha, layer=LAYER_RINGS,
+                    )
+                comp.draw_circle(
+                    fp, radius, color,
+                    thickness=4, alpha=ring_alpha, layer=LAYER_RINGS,
                 )
+                ring_records.append((r, fp, radius, ring_alpha))
 
-            # Step 6.5: ball dot — already projected above
-            if show_ball and frame_ball_px is not None:
-                cv2.circle(frame, frame_ball_px, 11, (0, 0, 0), 2, cv2.LINE_AA)
-                cv2.circle(frame, frame_ball_px, 9, BALL, 2, cv2.LINE_AA)
-                cv2.circle(frame, frame_ball_px, 4, BALL, -1, cv2.LINE_AA)
+            # 6. Ball dot — composited on top of rings layer (so the ball reads
+            # cleanly even on cluttered frames). Only draw if carrier ring is
+            # already at least partly faded in.
+            if show_ball and frame_ball_px is not None and a_carrier > 0.05:
+                # Halo
+                comp.draw_circle(
+                    frame_ball_px, 11, (0, 0, 0),
+                    thickness=2, alpha=int(220 * a_carrier), layer=LAYER_RINGS,
+                )
+                comp.draw_circle(
+                    frame_ball_px, 9, BALL,
+                    thickness=2, alpha=int(255 * a_carrier), layer=LAYER_RINGS,
+                )
+                comp.fill_circle(
+                    frame_ball_px, 4, BALL,
+                    alpha=int(255 * a_carrier), layer=LAYER_RINGS,
+                )
                 ball_dots_drawn += 1
 
-            # Step 7: title + subtitle banners
+            # 7. Role pills — solve collisions against scoreboard + each other
+            label_specs: List[LabelSpec] = []
+            for (r, fp, radius, _ring_alpha) in ring_records:
+                priority = 10 if r["role_key"] == "CARRIER" else \
+                           5 if r["role_key"] == "DEFENDER" else \
+                           4 if r["role_key"] == "COVER" else 1
+                label_specs.append(LabelSpec(
+                    anchor=fp,
+                    text=r["label"],
+                    priority=priority,
+                    ring_radius=radius,
+                    color=r["color"],
+                ))
+            if label_specs:
+                solved = solve_label_positions(label_specs, frame_w=w, frame_h=h)
+                for spec in solved:
+                    if spec.resolved_pos is None:
+                        continue
+                    if spec.resolved_side != "above":
+                        label_collisions_resolved += 1
+                    # Pill alpha follows the ring's role alpha
+                    role = next((rec[0]["role_key"] for rec in ring_records
+                                 if rec[1] == spec.anchor), None)
+                    if role == "CARRIER":
+                        pill_a = a_carrier
+                    elif role == "DEFENDER":
+                        pill_a = a_pres1
+                    elif role == "COVER":
+                        pill_a = a_pres2
+                    else:
+                        pill_a = a_carrier
+                    if pill_a <= 0.02:
+                        continue
+                    comp.draw_pill(
+                        spec.resolved_pos, spec.text, spec.color,
+                        font_scale=0.48,
+                        alpha=int(230 * pill_a),
+                        layer=LAYER_LABELS,
+                    )
+
+            # 8. Title + subtitle banners — drawn directly on frame for now;
+            # draw_banner has its own background, can't easily route through
+            # compositor without a re-layout. Banners get their own alpha.
             for c in callouts:
                 c_lo, c_hi = c.get("frames", [frame_lo, frame_hi])
                 if not (c_lo <= frame_idx <= c_hi):
@@ -1853,10 +2038,18 @@ def render_story(
                 if not text:
                     continue
                 position = str(c.get("position", "top"))
-                draw_banner(frame, text, position=position)
+                banner_a = a_title if position == "top" else a_subtitle
+                if banner_a <= 0.02:
+                    continue
+                if banner_a >= 0.99:
+                    draw_banner(frame, text, position=position)
+                else:
+                    tmp = frame.copy()
+                    draw_banner(tmp, text, position=position)
+                    cv2.addWeighted(tmp, banner_a, frame, 1.0 - banner_a, 0, frame)
 
-            # Step 8: anchored callouts
-            if tl_px is not None:
+            # 9. Anchored callouts (still direct — these appear briefly)
+            if tl_px is not None and a_pres1 > 0.5:
                 tl_a, tl_b = tl_px
                 tl_mx = (tl_a[0] + tl_b[0]) // 2
                 tl_my = (tl_a[1] + tl_b[1]) // 2 - 18
@@ -1864,7 +2057,7 @@ def render_story(
                     frame, (tl_mx, tl_my), "TOUCHLINE = EXTRA DEFENDER",
                     side="left", accent=ARROW_KIND_COLORS["pressure"],
                 )
-            if blocked_px is not None:
+            if blocked_px is not None and a_blocked > 0.5:
                 ba, bb = blocked_px
                 mx = (ba[0] + bb[0]) // 2
                 dy = bb[1] - ba[1]
@@ -1874,6 +2067,9 @@ def render_story(
                     frame, (mx, my), "PASSING LANE CLOSED",
                     side="right", accent=ARROW_KIND_COLORS["pressure"],
                 )
+
+            # Composite supersampled overlay onto the broadcast frame
+            frame = comp.composite(frame)
 
             out.write(frame)
             written += 1
@@ -1969,6 +2165,17 @@ def render_story(
     manifest["skipped_overlay_frames"] = skipped_overlay_frames
     manifest["ball_carrier_dist_p95_m"] = bc_p95
     manifest["per_frame_trace"]       = per_frame_trace
+    # 4.7c6 polish fields
+    manifest["compositor_used"]              = (render_mode == "live_reprojected")
+    manifest["compositor_supersample"]       = 2 if manifest["compositor_used"] else 1
+    manifest["label_collisions_resolved"]    = label_collisions_resolved
+    manifest["trails_drawn_total"]           = trails_drawn_total
+    manifest["trails_drawn_per_frame"]       = round(
+        trails_drawn_total / max(1, overlay_drawn_count), 2
+    )
+    manifest["animation_timeline"] = {
+        k: list(v) for k, v in ANIM_LIVE.items()
+    }
 
     # ── Acceptance gate (4.7c5) — refuse to ship a misleading clip ────
     if not debug_allow_invalid_story:

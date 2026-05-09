@@ -133,6 +133,26 @@ def draw_dashed_path(
             t = t1 + gap
 
 
+def draw_player_trail(
+    img: np.ndarray,
+    points_px: List[Tuple[int, int]],
+    color: Tuple[int, int, int],
+    *,
+    thickness: int = 2,
+    seg_len: int = 5,
+    gap: int = 3,
+) -> None:
+    """Fading dashed trail behind a tracked player — UEFA-style direction
+    indicator. Tail dims to ~25%, head sits at full brightness. Caller
+    supplies the recent foot pixel history (oldest first, newest last);
+    the helper trims to the last 12 points internally if longer."""
+    if not points_px or len(points_px) < 2:
+        return
+    pts = list(points_px)[-12:]
+    draw_dashed_path(img, pts, color, thickness=thickness,
+                     seg_len=seg_len, gap=gap, fade=True)
+
+
 # ── zone hulls + banners ──────────────────────────────────────────────────
 
 def draw_glow_line(
