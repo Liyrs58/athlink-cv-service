@@ -1216,17 +1216,20 @@ def render_story(
     final_valid, final_type, final_geom = _validate_at(anchor_frame)
 
     # ── Product-mode gate ────────────────────────────────────────────────
-    # In product mode (debug_allow_invalid_story not set), an invalid story
-    # must NOT produce a rendered clip. We raise here — before opening the
-    # VideoWriter — so no partial MP4 is written.
+    # A story passes product mode if:
+    #   (a) geometry is satisfied for SOME known story type (final_valid=True),
+    #       even if the declared type was downgraded to an honest type, AND
+    #   (b) ball tracking is sufficient (ball_ok).
+    # Requiring declared_type == final_type would reject every honest retitle,
+    # which defeats the whole point of the validity gate.
     story_is_valid = bool(final_valid) and ball_ok
-    if not story_is_valid and not debug_allow_invalid_story:
-        cap.release()
+    story_failed_reason: Optional[str] = None
+    if not story_is_valid:
         failing_reasons = []
         if not final_valid:
             failing_reasons.append(
-                f"story_type={declared_story_type} failed geometry validation "
-                f"(best frame F={anchor_frame} qualifies as '{final_type}'). "
+                f"story_type={declared_story_type} failed geometry — "
+                f"best frame F={anchor_frame} qualifies as '{final_type}'. "
                 f"Geometry: {final_geom}"
             )
         if not ball_ok:
@@ -1234,6 +1237,10 @@ def render_story(
                 f"ball_source='{ball_source}' (confidence={ball_confidence:.0%}) — "
                 "ball tracking too sparse to claim a tactical story."
             )
+        story_failed_reason = "; ".join(failing_reasons)
+
+    if not story_is_valid and not debug_allow_invalid_story:
+        cap.release()
         raise RuntimeError(
             "[render_story] Story failed product-mode gate — no MP4 written.\n"
             + "\n".join(f"  • {r}" for r in failing_reasons)
@@ -1695,7 +1702,9 @@ def render_story(
         "pressers_active":   active_pressers,
         "cover_declared":    cover_declared,
         "cover_active":      cover_active,
-        "retitled":          retitled,
+        "retitled":              retitled,
+        "validated_story_type":  final_type,
+        "story_failed_reason":   story_failed_reason,
         # Visual primitives
         "rings":           len(plan["rings"]),
         "arrows":          len(plan["arrows"]),
