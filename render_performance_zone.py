@@ -1761,12 +1761,21 @@ def render_story(
                     return None
                 return project_world_point(wp, H_inv)
 
-            # ── Per-frame truth lookup (4.7c5) ───────────────────────────
+            # ── Per-frame truth lookup (4.7c7) ───────────────────────────
             ba_entry = carrier_by_frame.get(frame_idx, {}) if carrier_by_frame else {}
             frame_ball_source = ba_entry.get("ball_source", "missing")
-            frame_carrier_conf = float(ba_entry.get("carrier_confidence", 0) or 0)
-            frame_carrier_tid_raw = ba_entry.get("carrier_tid")
-            frame_carrier_tid = int(frame_carrier_tid_raw) if frame_carrier_tid_raw is not None else None
+
+            # Carrier confidence: use ball_assignments only when its carrier_tid
+            # matches the declared story carrier. Foreign carriers (noisy nearest-
+            # player assignments) must not reset the hysteresis state.
+            ba_carrier_tid_raw = ba_entry.get("carrier_tid")
+            ba_carrier_tid = int(ba_carrier_tid_raw) if ba_carrier_tid_raw is not None else None
+            if ba_carrier_tid == int(carrier_tid):
+                frame_carrier_conf = float(ba_entry.get("carrier_confidence", 0) or 0)
+            else:
+                # Foreign assignment — confidence decays to 0.45 (below locked, above lost)
+                frame_carrier_conf = 0.45
+            frame_carrier_tid = int(carrier_tid)  # always lock to declared carrier
 
             frame_ball_world = ball_pos.get(frame_idx) if ball_pos else None
             if frame_ball_world is None and ball_pos:
@@ -1778,9 +1787,8 @@ def render_story(
                         frame_ball_world = b2; break
             frame_ball_px = _proj(frame_ball_world) if frame_ball_world else None
 
-            # Carrier world pos — prefer ball_assignments' carrier_tid, fall
-            # back to the story's anchor carrier if assignment is missing.
-            carrier_for_frame = frame_carrier_tid if frame_carrier_tid is not None else int(carrier_tid)
+            # Carrier world pos — always use declared story carrier_tid.
+            carrier_for_frame = int(carrier_tid)
             carrier_w = world_pos.get((carrier_for_frame, frame_idx))
             carrier_fp = _proj(carrier_w)
 
