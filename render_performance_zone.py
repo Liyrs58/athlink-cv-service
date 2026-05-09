@@ -932,6 +932,7 @@ def render_story(
     # ball_world directly; if absent but ball_image present, project through
     # H to world. Build per-frame side dict for the manifest.
     carrier_by_frame: Dict[int, dict] = {}
+    ball_interp_stats = {"interpolated_ball_frames": 0, "interpolated_carrier_frames": 0}
     if ball_assignments_json:
         try:
             with open(ball_assignments_json) as f:
@@ -975,12 +976,71 @@ def render_story(
                             except Exception:
                                 pass
                 carrier_by_frame[fi] = entry
+
+            # ── Ball interpolation across short gaps (4.7c6.2) ───────────
+            # Linear-interpolate ball_world AND propagate carrier metadata
+            # through gaps ≤ MAX_GAP frames. Prevents the per-frame validity
+            # gate from skipping otherwise-good frames just because the
+            # detector blinked for 1-8 frames.
+            MAX_GAP = int(story.get("ball_interp_max_gap", 8))
+            interp_ball = 0
+            interp_carrier = 0
+            if override and MAX_GAP > 0:
+                detected_frames = sorted(override.keys())
+                for k in range(len(detected_frames) - 1):
+                    f0, f1 = detected_frames[k], detected_frames[k + 1]
+                    gap = f1 - f0 - 1
+                    if gap <= 0 or gap > MAX_GAP:
+                        continue
+                    x0, y0 = override[f0]
+                    x1, y1 = override[f1]
+                    src_carrier = carrier_by_frame.get(f0, {})
+                    dst_carrier = carrier_by_frame.get(f1, {})
+                    # Use the source frame's carrier_tid if both endpoints
+                    # agree; otherwise fall back to the source's.
+                    src_tid = src_carrier.get("carrier_tid")
+                    dst_tid = dst_carrier.get("carrier_tid")
+                    inherit_tid = src_tid if src_tid == dst_tid else src_tid
+                    src_conf = float(src_carrier.get("carrier_confidence", 0) or 0)
+                    dst_conf = float(dst_carrier.get("carrier_confidence", 0) or 0)
+                    for j in range(1, gap + 1):
+                        fi_mid = f0 + j
+                        if fi_mid in override:
+                            continue  # respected if real detection exists
+                        t = j / (gap + 1)
+                        override[fi_mid] = (
+                            x0 + (x1 - x0) * t,
+                            y0 + (y1 - y0) * t,
+                        )
+                        interp_ball += 1
+                        # Propagate a synthetic carrier_by_frame entry so the
+                        # per-frame gate sees ball_source="interpolated" and
+                        # carrier_conf decays linearly across the gap.
+                        if inherit_tid is not None and fi_mid not in carrier_by_frame:
+                            mid_conf = src_conf + (dst_conf - src_conf) * t
+                            # Apply a small penalty so interpolated frames
+                            # don't pretend to be as confident as detector.
+                            mid_conf = max(0.0, mid_conf - 0.05)
+                            carrier_by_frame[fi_mid] = {
+                                "frameIndex": fi_mid,
+                                "ball_source": "interpolated",
+                                "carrier_tid": int(inherit_tid),
+                                "carrier_confidence": round(mid_conf, 3),
+                                "ball_world": list(override[fi_mid]),
+                                "interpolated": True,
+                                "gap_size": gap,
+                            }
+                            interp_carrier += 1
+
+            ball_interp_stats["interpolated_ball_frames"] = interp_ball
+            ball_interp_stats["interpolated_carrier_frames"] = interp_carrier
             if override:
                 ball_pos = override
                 if verbose:
                     print(
                         f"[render_story] ball_pos overridden from ball_assignments.json: "
-                        f"{len(override)} frames"
+                        f"{len(override)} frames "
+                        f"(interpolated +{interp_ball} ball, +{interp_carrier} carrier)"
                     )
         except Exception as e:
             if verbose:
@@ -1453,8 +1513,14 @@ def render_story(
     # broadcast pacing: title slides in instantly, cast staggers over the
     # first second, everything fades out in the last 12 frames.
     _live_window_len = max(1, frame_hi - frame_lo + 1)
-    _live_outro_lo = max(0, _live_window_len - 12)
-    _live_outro_hi = _live_window_len - 1
+    # Only run outro fade if the clip is long enough that intro + outro
+    # don't overlap. Below 24 frames, skip outro entirely (factor stays 1).
+    if _live_window_len >= 24:
+        _live_outro_lo = _live_window_len - 12
+        _live_outro_hi = _live_window_len - 1
+    else:
+        _live_outro_lo = _live_window_len  # never triggers
+        _live_outro_hi = _live_window_len
     ANIM_LIVE = {
         "title_fade":     (0,                       12),
         "subtitle_fade":  (8,                       22),
@@ -2176,6 +2242,8 @@ def render_story(
     manifest["animation_timeline"] = {
         k: list(v) for k, v in ANIM_LIVE.items()
     }
+    manifest["interpolated_ball_frames"]    = ball_interp_stats["interpolated_ball_frames"]
+    manifest["interpolated_carrier_frames"] = ball_interp_stats["interpolated_carrier_frames"]
 
     # ── Acceptance gate (4.7c5) — refuse to ship a misleading clip ────
     if not debug_allow_invalid_story:
