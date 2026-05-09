@@ -810,6 +810,7 @@ def render_story(
     story_json: str,
     output_path: str,
     *,
+    ball_assignments_json: Optional[str] = None,
     verbose: bool = True,
 ) -> dict:
     """Anchor-derived, per-frame-reprojected tactical clip render.
@@ -913,6 +914,66 @@ def render_story(
 
     H_inv_by_frame, world_pos, ball_pos = _load_pitch_map(pitch_map_json)
     team_map = _load_team_map(team_results_json)
+
+    # ── Optional: override ball_pos from Phase 4.7 ball_assignments.json ──
+    # ball_assignments has authoritative per-frame {ball_world, ball_image,
+    # ball_source, carrier_tid, carrier_confidence}. When supplied, prefer
+    # ball_world directly; if absent but ball_image present, project through
+    # H to world. Build per-frame side dict for the manifest.
+    carrier_by_frame: Dict[int, dict] = {}
+    if ball_assignments_json:
+        try:
+            with open(ball_assignments_json) as f:
+                ba_data = json.load(f)
+            ba_entries = ba_data if isinstance(ba_data, list) else ba_data.get("assignments", [])
+            with open(pitch_map_json) as f:
+                pm = json.load(f)
+            H_by_frame: Dict[int, np.ndarray] = {}
+            for fi_str, H_list in (pm.get("homographies") or {}).items():
+                try:
+                    H_by_frame[int(fi_str)] = np.asarray(H_list, dtype=np.float64)
+                except Exception:
+                    continue
+            override: Dict[int, Tuple[float, float]] = {}
+            for entry in ba_entries:
+                fi = entry.get("frameIndex")
+                if fi is None:
+                    fi = entry.get("frame_index")
+                if fi is None:
+                    continue
+                fi = int(fi)
+                src = entry.get("ball_source", "missing")
+                if src == "missing":
+                    continue
+                bw = entry.get("ball_world")
+                if bw and len(bw) == 2:
+                    override[fi] = (float(bw[0]), float(bw[1]))
+                else:
+                    bi = entry.get("ball_image")
+                    if bi and len(bi) == 2:
+                        H = H_by_frame.get(fi)
+                        if H is None and H_by_frame:
+                            nearest = min(H_by_frame.keys(), key=lambda k: abs(k - fi))
+                            H = H_by_frame[nearest]
+                        if H is not None:
+                            try:
+                                pt = np.array([float(bi[0]), float(bi[1]), 1.0])
+                                wp = H @ pt
+                                if wp[2] != 0:
+                                    override[fi] = (float(wp[0] / wp[2]), float(wp[1] / wp[2]))
+                            except Exception:
+                                pass
+                carrier_by_frame[fi] = entry
+            if override:
+                ball_pos = override
+                if verbose:
+                    print(
+                        f"[render_story] ball_pos overridden from ball_assignments.json: "
+                        f"{len(override)} frames"
+                    )
+        except Exception as e:
+            if verbose:
+                print(f"[render_story] WARN failed to load ball_assignments.json: {e}")
 
     # ── Ball-data pre-flight ──────────────────────────────────────────────
     # Classify ball tracking quality at load time. Anything below "detector"
@@ -1286,12 +1347,30 @@ def render_story(
     # Shrink toward centroid so the zone reads as the LOCAL trap.
     zone_tids = [t for (t, r, _) in cast_with_label if r in ("CARRIER", "DEFENDER", "COVER")]
     zone_world_raw = [world_pos.get((int(t), anchor_frame)) for t in zone_tids]
-    zone_world_raw = [wp for wp in zone_world_raw if wp is not None]
-    if len(zone_world_raw) >= 3:
+    zone_world_raw_filtered = [wp for wp in zone_world_raw if wp is not None]
+    if len(zone_world_raw_filtered) >= 3:
         zone_shrink = float(story.get("zone_shrink", 0.72))
-        plan["zone_world"] = _shrink_polygon(zone_world_raw, factor=zone_shrink)
+        plan["zone_world"] = _shrink_polygon(zone_world_raw_filtered, factor=zone_shrink)
     else:
         plan["zone_world"] = []
+        # Image-space fallback: if at least 3 cast members have anchor_foot
+        # pixels but world_pos lookup failed for some, build hull in pixels so
+        # the triangle still renders. This will NOT reproject through the
+        # camera pan (it stays at anchor view), but it proves the geometry
+        # exists where freeze-frame rendering is used.
+        anchor_px_pts = [anchor_foot.get(int(t)) for t in zone_tids]
+        anchor_px_pts = [p for p in anchor_px_pts if p is not None]
+        if len(anchor_px_pts) >= 3:
+            plan["zone_image_fallback"] = anchor_px_pts
+            if verbose:
+                print(
+                    f"[render_story] WARN zone_world has only "
+                    f"{len(zone_world_raw_filtered)}/{len(zone_tids)} world points at "
+                    f"F={anchor_frame}; using image-space hull fallback "
+                    f"({len(anchor_px_pts)} pixel points)."
+                )
+        else:
+            plan["zone_image_fallback"] = []
 
     # Pressure arrows: store track IDs, not pixel coords
     arrow_specs: List[dict] = []
@@ -1540,12 +1619,14 @@ def render_story(
                     return None
                 return project_world_point(wp, H_inv)
 
-        # Step 2: zone hull (reproject world coords → image)
+        # Step 2: zone hull (reproject world coords → image, or image-space fallback)
         if plan["zone_world"]:
             zone_px = [_proj(wp) for wp in plan["zone_world"]]
             zone_px = [p for p in zone_px if p is not None]
             if len(zone_px) >= 3:
                 draw_zone_hull(frame, zone_px, zone_color, alpha=zone_alpha)
+        elif plan.get("zone_image_fallback") and len(plan["zone_image_fallback"]) >= 3:
+            draw_zone_hull(frame, plan["zone_image_fallback"], zone_color, alpha=zone_alpha)
 
         # Step 3: touchline glow (reproject world endpoints → image)
         tl_px: Optional[Tuple[Tuple[int, int], Tuple[int, int]]] = None
@@ -1695,6 +1776,21 @@ def render_story(
     final_story_type = recommended_type if not is_valid else declared_story_type
     retitled = (final_story_type != declared_story_type) or (not is_valid and final_valid is False)
 
+    # Homography trust at the resolved anchor: "ok" if direct hit,
+    # "interpolated" if we used the nearest neighbour, "missing" if no H at all.
+    if H_inv_by_frame and anchor_frame in H_inv_by_frame:
+        homography_confidence_str = "ok"
+    elif H_inv_by_frame:
+        homography_confidence_str = "interpolated"
+    else:
+        homography_confidence_str = "missing"
+
+    # Carrier metadata from ball_assignments at the anchor (if available)
+    anchor_carrier_meta = carrier_by_frame.get(anchor_frame, {})
+    carrier_grace_frames_val = int(anchor_carrier_meta.get("grace_frames", 0) or 0)
+    anchor_carrier_conf = anchor_carrier_meta.get("carrier_confidence")
+    anchor_ball_source  = anchor_carrier_meta.get("ball_source")
+
     manifest = {
         # Quality gate fields (must all be truthy for a valid product render)
         "story_valid":     story_is_valid,
@@ -1726,8 +1822,18 @@ def render_story(
         "touchline":       bool(plan["touchline_world"]),
         "blocked_lane":    bool(plan["blocked_lane"]),
         "ball_dots_drawn": ball_dots_drawn,
+        "ball_dots_per_written": round(ball_dots_drawn / max(1, written), 3),
         "carrier_tid":     carrier_tid,
         "blocked_tid":     blocked_tid,
+        # Phase 4.7c4 truth-trace fields
+        "homography_confidence":  homography_confidence_str,
+        "carrier_grace_frames":   carrier_grace_frames_val,
+        "anchor_carrier_confidence": anchor_carrier_conf,
+        "anchor_ball_source":     anchor_ball_source,
+        "ball_assignments_used":  bool(ball_assignments_json),
+        "frames_window":          [frame_lo, frame_hi],
+        "product_mode":           not debug_allow_invalid_story,
+        "zone_image_fallback":    len(plan.get("zone_image_fallback", []) or []),
     }
     if verbose:
         print(f"[render_story] manifest={manifest}")
