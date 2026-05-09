@@ -996,12 +996,14 @@ def _run_tracking_impl(
                 _raw_confs = []
                 _raw_n = 0
 
-            # After class filter (keep 1,2,3)
-            _kept_classes = [c for c in _raw_classes if c in (1, 2, 3)]
+            # After class filter — uses dynamic player_classes (already chosen
+            # at line 720 from _using_football_model) so debug matches runtime.
+            _player_set = tuple(player_classes)
+            _kept_classes = [c for c in _raw_classes if c in _player_set]
             _after_class_n = len(_kept_classes)
 
             # After conf filter (base_conf=0.10)
-            _after_conf_confs = [v for c, v in zip(_raw_classes, _raw_confs) if c in (1, 2, 3) and v >= 0.10]
+            _after_conf_confs = [v for c, v in zip(_raw_classes, _raw_confs) if c in _player_set and v >= 0.10]
             _after_conf_n = len(_after_conf_confs)
 
             # Boundary filter preview — compute foot projections for kept dets
@@ -1039,8 +1041,9 @@ def _run_tracking_impl(
             dets_np = _get_detections_with_rescue(model, detect_frame)
             if len(dets_np) > 0:
                 # roboflow_players.pt defines: 0=ball, 1=goalkeeper, 2=player, 3=referee
-                # Filter to people classes: 1, 2, 3
-                dets_np = dets_np[np.isin(dets_np[:, 5], [1, 2, 3])]
+                # COCO yolov8: 0=person. player_classes is set at line 720 from
+                # _using_football_model so the filter follows whichever model loaded.
+                dets_np = dets_np[np.isin(dets_np[:, 5], list(player_classes))]
         else:
             logger.info("Frame %d: cutaway detected, coasting Kalman filters", current_frame_idx)
             dets_np = np.empty((0, 6))

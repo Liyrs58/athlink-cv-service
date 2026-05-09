@@ -15,8 +15,12 @@ def get_tracking_model():
     if _tracking_model is None:
         model_path = os.getenv('YOLO_MODEL_PATH', 'models/roboflow_players.pt')
         logger.info(f"Loading tracking model: {model_path}")
+        if not os.path.exists(model_path):
+            fallback = os.getenv('YOLO_FALLBACK_PATH', 'yolov8m.pt')
+            logger.warning(f"Primary model missing; using fallback: {fallback}")
+            model_path = fallback
         _tracking_model = YOLO(model_path)
-        logger.info("Tracking model loaded and cached")
+        logger.info(f"Tracking model loaded and cached: {model_path}")
     return _tracking_model
 
 def get_ball_model():

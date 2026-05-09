@@ -181,6 +181,23 @@ class TrackerCore:
         self.yolo = YOLO(yolo_path)
         self.yolo.to(yolo_device)
 
+        # Derive class-id sets from model.names so we work with either:
+        #   roboflow_players.pt  → {0:'ball', 1:'goalkeeper', 2:'player', 3:'referee'}
+        #   yolov8m.pt (COCO)    → {0:'person', 32:'sports ball', ...}
+        names_lower = {int(k): str(v).lower() for k, v in self.yolo.names.items()}
+        ball_keys = {k for k, v in names_lower.items() if v in ("ball", "sports ball")}
+        player_keys = {k for k, v in names_lower.items()
+                       if v in ("player", "goalkeeper", "referee", "person")}
+        if not ball_keys:
+            ball_keys = {0}        # roboflow default
+        if not player_keys:
+            player_keys = {1, 2, 3}  # roboflow default
+        self.ball_class_ids = ball_keys
+        self.player_class_ids = player_keys
+        self._is_coco_model = "person" in names_lower.values()
+        print(f"[TrackerCore] class ids — ball={sorted(ball_keys)} "
+              f"player={sorted(player_keys)} coco={self._is_coco_model}")
+
         # Deep-EIoU tracker (no external ReID model needed — uses YOLO crops via identity)
         self.tracker = DeepEIoUTracker(
             track_high_thresh=0.50,
@@ -231,10 +248,12 @@ class TrackerCore:
     def detect(self, frame):
         """YOLO – returns np.array (N,6) [x1,y1,x2,y2,conf,cls].
 
-        Side effect: stashes the highest-confidence ball (class 0) detection of
+        Side effect: stashes the highest-confidence ball detection of
         the current frame on `self._last_ball_det` so the per-frame writer can
-        persist it. Roboflow sports model classes: 0=ball, 1=goalkeeper,
-        2=player, 3=referee."""
+        persist it. Class ids derived from model.names at __init__ time:
+        roboflow → {0:ball, 1:goalkeeper, 2:player, 3:referee};
+        coco yolov8 → {0:person, 32:sports ball}. Output cls is normalised
+        to roboflow numbering so downstream consumers stay unchanged."""
         self._last_ball_det = None
         results = self.yolo.predict(frame, conf=0.05, verbose=False)
         boxes = results[0].boxes
@@ -248,11 +267,14 @@ class TrackerCore:
             x1, y1 = float(box.xyxy[0][0]), float(box.xyxy[0][1])
             x2, y2 = float(box.xyxy[0][2]), float(box.xyxy[0][3])
             conf = float(box.conf.item())
-            if cls == 0:
+            if cls in self.ball_class_ids:
                 if best_ball is None or conf > best_ball[4]:
                     best_ball = [x1, y1, x2, y2, conf, 0.0]
-            elif cls in (1, 2, 3):
-                dets.append([x1, y1, x2, y2, conf, float(cls)])
+            elif cls in self.player_class_ids:
+                # Normalise to class 2 (player) when running the COCO fallback,
+                # since downstream code (e.g. trajectory filters) keys on cls==2.
+                out_cls = 2.0 if self._is_coco_model else float(cls)
+                dets.append([x1, y1, x2, y2, conf, out_cls])
         if best_ball is not None:
             self._last_ball_det = {
                 "bbox": [best_ball[0], best_ball[1], best_ball[2], best_ball[3]],
@@ -848,20 +870,62 @@ class TrackerCore:
         return path
 
 
+def _resolve_model_path(primary: str, fallback: str) -> str:
+    """Pick the first existing path, env-overridable.
+
+    YOLO_MODEL_PATH overrides the primary; YOLO_FALLBACK_PATH overrides
+    the fallback. Used by run_tracking for the fallback probe."""
+    primary = os.environ.get("YOLO_MODEL_PATH", primary)
+    fallback = os.environ.get("YOLO_FALLBACK_PATH", fallback)
+    return primary if os.path.exists(primary) else fallback
+
+
+def _probe_first_frames_for_players(tracker: "TrackerCore", cap, n_frames: int = 3) -> int:
+    """Sample n_frames across the video and count player-class detections.
+
+    Used to decide whether to fall back from roboflow_players.pt (which can
+    return only ball boxes on out-of-distribution clips) to a COCO yolov8m.
+    Restores cap position when done."""
+    saved_pos = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
+    sample_idxs = [0, max(1, total // 4), max(2, total // 2)][:n_frames] if total > 0 else list(range(n_frames))
+    n_players = 0
+    for fi in sample_idxs:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, fi)
+        ret, frame = cap.read()
+        if not ret:
+            continue
+        dets = tracker.detect(frame)
+        n_players += len(dets)
+    cap.set(cv2.CAP_PROP_POS_FRAMES, saved_pos)
+    return n_players
+
+
 def run_tracking(video_path, job_id, frame_stride=1, max_frames=None, device="cpu"):
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
         raise FileNotFoundError(f"Video not found: {video_path}")
 
-    if os.path.exists("/content/roboflow_players.pt"):
-        yolo_path = "/content/roboflow_players.pt"
-    else:
-        yolo_path = "models/roboflow_players.pt"
+    primary = "/content/roboflow_players.pt" if os.path.exists("/content/roboflow_players.pt") \
+              else "models/roboflow_players.pt"
+    fallback = "yolov8m.pt" if os.path.exists("yolov8m.pt") else "models/yolov8m.pt"
+    yolo_path = _resolve_model_path(primary, fallback)
 
     tracker = TrackerCore(yolo_path=yolo_path, device=device)
 
+    # Fallback probe: if the primary model returns zero player detections on
+    # the first 3 sampled frames, swap to yolov8m (COCO 'person' class) and
+    # rebuild the tracker. Only meaningful when primary is a roboflow model.
+    if not tracker._is_coco_model and os.path.exists(fallback):
+        n_players = _probe_first_frames_for_players(tracker, cap, n_frames=3)
+        print(f"[run_tracking] primary-model probe: {n_players} player dets across 3 frames")
+        if n_players == 0:
+            print(f"[run_tracking] FALLBACK → {fallback} (primary returned 0 player dets)")
+            tracker = TrackerCore(yolo_path=fallback, device=device)
+
     video_frame = 0
     processed = 0
+    diagnostics = []  # per-sampled-frame tracker health for Phase A acceptance
 
     while True:
         ret, frame = cap.read()
@@ -869,8 +933,32 @@ def run_tracking(video_path, job_id, frame_stride=1, max_frames=None, device="cp
             break
 
         if video_frame % frame_stride == 0:
+            # Raw YOLO inference for diagnostics — share with tracker.detect via
+            # a single-pass that records the histogram, then filters.
+            yolo_results = tracker.yolo.predict(frame, conf=0.05, verbose=False)
+            yolo_boxes = yolo_results[0].boxes
+            if yolo_boxes is None or len(yolo_boxes) == 0:
+                raw_classes = []
+            else:
+                raw_classes = yolo_boxes.cls.cpu().numpy().astype(int).tolist()
+            class_histogram = {}
+            for c in raw_classes:
+                class_histogram[c] = class_histogram.get(c, 0) + 1
+            # Now run the standard detect path (re-runs YOLO; cheap on GPU and
+            # keeps the existing _last_ball_det side-effect clean).
             dets = tracker.detect(frame)
             save_this = True
+            tracker_input_count = len(dets)
+            player_candidate_count = sum(class_histogram.get(c, 0)
+                                         for c in tracker.player_class_ids)
+            diagnostics.append({
+                "frameIndex": video_frame,
+                "raw_box_count": len(raw_classes),
+                "class_histogram": class_histogram,
+                "player_candidate_count": player_candidate_count,
+                "tracker_input_count": tracker_input_count,
+                "active_tracks": -1,  # filled in after process_frame below
+            })
         else:
             dets = np.empty((0, 6))
             save_this = False
@@ -878,6 +966,7 @@ def run_tracking(video_path, job_id, frame_stride=1, max_frames=None, device="cp
         n_tracks = tracker.process_frame(frame, video_frame, dets, save=save_this)
 
         if save_this:
+            diagnostics[-1]["active_tracks"] = int(n_tracks)
             processed += 1
             if processed % 10 == 0:
                 print(f"Video frame {video_frame:4d} | processed {processed:4d} | "
@@ -890,6 +979,22 @@ def run_tracking(video_path, job_id, frame_stride=1, max_frames=None, device="cp
 
     cap.release()
     tracker.save(job_id)
+
+    # Write per-frame diagnostics for Phase A acceptance gate
+    diag_path = Path(f"temp/{job_id}/tracking/tracker_diagnostics.json")
+    diag_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(diag_path, "w") as f:
+        json.dump({"frames": diagnostics, "count": len(diagnostics)}, f, indent=2)
+    # Console summary
+    if diagnostics:
+        import statistics
+        track_counts = [d["active_tracks"] for d in diagnostics if d["active_tracks"] >= 0]
+        nonzero_input = sum(1 for d in diagnostics if d["tracker_input_count"] > 0)
+        pct_nonzero = nonzero_input / max(len(diagnostics), 1) * 100
+        print(f"[diagnostics] {len(diagnostics)} sampled frames | "
+              f"tracker_input>0 on {pct_nonzero:.1f}% | "
+              f"median active tracks={statistics.median(track_counts) if track_counts else 0:.1f} | "
+              f"p10={(sorted(track_counts)[len(track_counts)//10] if len(track_counts)>=10 else min(track_counts) if track_counts else 0):.1f}")
 
     # Final identity-lock summary (the real success metric)
     id_summary = tracker.identity.end_run_summary()

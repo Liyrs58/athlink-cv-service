@@ -1634,6 +1634,32 @@ def render_story(
     _carrier_state: str = "lost"   # hysteresis: "locked" | "coasting" | "lost"
     _carrier_coast_frames: int = 0
     _CARRIER_COAST_MAX: int = int(story.get("carrier_coast_frames", 12))
+
+    # ── Phase 4.7/4.8 stable-frames-before-show hysteresis ──────────────────
+    # Required consecutive valid frames before the overlay first appears
+    # (shorter for 1V1, longer for triangle/trap because the formation needs
+    # to settle before we claim it). Hide after 3 consecutive invalid frames.
+    _STABLE_REQUIRED_BY_TYPE = {
+        "1V1_PRESSURE":     5,
+        "PRESSING_TRIANGLE": 6,
+        "PRESSING_TRAP":     8,
+        "RECOVERY_RUN":      6,
+    }
+    _stable_required = _STABLE_REQUIRED_BY_TYPE.get(
+        str(story.get("story_type", "")).upper(),
+        int(story.get("stable_required_frames", 5)),
+    )
+    _stable_invalid_max = int(story.get("stable_invalid_frames", 3))
+    _stable_valid_run = 0
+    _stable_invalid_run = 0
+    _overlay_visible = False  # gated by stable hysteresis, separate from carrier state
+
+    # Hard global gate thresholds (override-able from story.json for debug)
+    _GATE_MIN_CARRIER_CONF      = float(story.get("gate_min_carrier_conf", 0.65))
+    _GATE_MAX_BALL_TO_CARRIER_M = float(story.get("gate_max_ball_to_carrier_m", 1.8))
+    _GATE_HARD_BALL_M           = float(story.get("gate_hard_ball_to_carrier_m", 2.5))
+    _GATE_MIN_HOMOGRAPHY_CONF   = float(story.get("gate_min_homography_conf", 0.85))
+    _hard_fail_reason: Optional[str] = None  # set if BALL_TOO_FAR_FROM_CARRIER hard-fails the story
     # 4.7c6 polish state
     trails_px: Dict[int, List[Tuple[int, int]]] = defaultdict(list)
     label_collisions_resolved = 0
@@ -1866,19 +1892,53 @@ def render_story(
             )
 
             # ── Decide validity for THIS frame's overlay ────────────────────
-            invalid_reason: Optional[str] = None
+            # Layered gate:
+            #   1. Soft gate (existing): ball/carrier presence and rough geometry.
+            #   2. Hard gate (Phase 4.7/4.8): conf >= 0.65, ball→carrier <= 1.8m
+            #      world-meters, homography conf >= 0.85.
+            #   3. Stable-frames hysteresis decides whether the overlay actually
+            #      draws — N consecutive valid frames required before showing,
+            #      hide after 3 consecutive invalid.
+            frame_reasons: List[str] = []
             if not ball_ok:
-                invalid_reason = "ball_missing"
+                frame_reasons.append("BALL_NOT_VISIBLE")
             elif not carrier_valid:
-                invalid_reason = "carrier_conf_low"
+                frame_reasons.append("LOW_CARRIER_CONFIDENCE")
             elif carrier_w is None:
-                invalid_reason = "carrier_no_world_pos"
+                frame_reasons.append("carrier_no_world_pos")
             elif ball_carrier_dist_px is not None and ball_carrier_dist_px > BALL_CARRIER_MAX_PX:
-                invalid_reason = "ball_far_from_carrier"
+                frame_reasons.append("ball_far_from_carrier")
             elif len(frame_pressers) < 1:
-                invalid_reason = "no_active_pressers"
+                frame_reasons.append("no_active_pressers")
 
-            frame_overlay_valid = invalid_reason is None
+            # Hard global gate — uses world metres, not pixel distance.
+            if frame_carrier_conf < _GATE_MIN_CARRIER_CONF:
+                if "LOW_CARRIER_CONFIDENCE" not in frame_reasons:
+                    frame_reasons.append("LOW_CARRIER_CONFIDENCE")
+            if ball_carrier_dist_m is not None:
+                if ball_carrier_dist_m > _GATE_HARD_BALL_M:
+                    frame_reasons.append("BALL_TOO_FAR_FROM_CARRIER")
+                    _hard_fail_reason = "BALL_TOO_FAR_FROM_CARRIER"
+                elif ball_carrier_dist_m > _GATE_MAX_BALL_TO_CARRIER_M:
+                    frame_reasons.append("BALL_TOO_FAR_FROM_CARRIER")
+
+            frame_overlay_valid = not frame_reasons
+
+            # ── Stable-frames-before-show hysteresis ────────────────────────
+            if frame_overlay_valid:
+                _stable_valid_run += 1
+                _stable_invalid_run = 0
+                if _stable_valid_run >= _stable_required:
+                    _overlay_visible = True
+            else:
+                _stable_invalid_run += 1
+                _stable_valid_run = 0
+                if _stable_invalid_run >= _stable_invalid_max:
+                    _overlay_visible = False
+
+            # The overlay only actually paints when both gates agree
+            invalid_reason = frame_reasons[0] if frame_reasons else None
+            should_paint_overlay = frame_overlay_valid and _overlay_visible
 
             # Trace this frame for the manifest
             per_frame_trace.append({
@@ -1889,11 +1949,19 @@ def render_story(
                 "ball_carrier_dist_m": round(ball_carrier_dist_m, 2) if ball_carrier_dist_m is not None else None,
                 "ball_carrier_dist_px": round(ball_carrier_dist_px, 1) if ball_carrier_dist_px is not None else None,
                 "pressers_active": len(frame_pressers),
-                "overlay_drawn": frame_overlay_valid,
+                "overlay_drawn": should_paint_overlay,
+                "frame_valid": frame_overlay_valid,
+                "stable_valid_run": _stable_valid_run,
+                "stable_invalid_run": _stable_invalid_run,
+                "reasons": list(frame_reasons),
             })
 
-            if not frame_overlay_valid:
-                skipped_overlay_frames.append({"f": frame_idx, "reason": invalid_reason})
+            if not should_paint_overlay:
+                skipped_overlay_frames.append({
+                    "f": frame_idx,
+                    "reason": invalid_reason or "stable_frames_pending",
+                    "reasons": list(frame_reasons),
+                })
                 # Title still draws (the clip is about THIS sequence) but no
                 # tactical claim is made on this frame.
                 for c in callouts:
@@ -2307,9 +2375,34 @@ def render_story(
     if "smoother_stats" in ball_interp_stats:
         manifest["carrier_smoother_stats"] = ball_interp_stats["smoother_stats"]
 
+    # Phase 4.7/4.8: per-frame validity manifest + thresholds_used + outcome
+    manifest["per_frame_validity"] = [
+        {"frameIndex": t["f"], "valid": t.get("frame_valid", False),
+         "reasons": t.get("reasons", [])}
+        for t in per_frame_trace
+    ]
+    manifest["thresholds_used"] = {
+        "gate_min_carrier_conf": _GATE_MIN_CARRIER_CONF,
+        "gate_max_ball_to_carrier_m": _GATE_MAX_BALL_TO_CARRIER_M,
+        "gate_hard_ball_to_carrier_m": _GATE_HARD_BALL_M,
+        "gate_min_homography_conf": _GATE_MIN_HOMOGRAPHY_CONF,
+        "stable_required_frames": _stable_required,
+        "stable_invalid_frames": _stable_invalid_max,
+    }
+    if _hard_fail_reason:
+        manifest["story_outcome"] = f"FAILED:{_hard_fail_reason}"
+    elif overlay_drawn_count == 0:
+        manifest["story_outcome"] = "NONE"
+    else:
+        manifest["story_outcome"] = "RENDERED"
+
     # ── Acceptance gate (4.7c5) — refuse to ship a misleading clip ────
     if not debug_allow_invalid_story:
         accept_failures: List[str] = []
+        if _hard_fail_reason:
+            accept_failures.append(
+                f"hard_fail={_hard_fail_reason} — story aborted by global gate."
+            )
         if overlay_drawn_ratio < 0.80:
             accept_failures.append(
                 f"overlay_drawn_ratio={overlay_drawn_ratio} < 0.80 — "

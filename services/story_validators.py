@@ -37,6 +37,42 @@ PRESSING_TRAP_MIN_PRESSERS = 2
 PRESSING_TRAP_MIN_ANGLE_SPREAD_DEG = 45.0
 PRESSING_TRAP_MAX_ZONE_AREA_M2 = 80.0
 
+# ── Phase 4.7/4.8 acceptance thresholds (v2 validators) ──────────────────────
+# Global truth gate
+GLOBAL_MIN_CARRIER_CONFIDENCE      = 0.65
+GLOBAL_MAX_BALL_TO_CARRIER_M       = 1.8
+GLOBAL_HARD_FAIL_BALL_TO_CARRIER_M = 2.5
+GLOBAL_MIN_HOMOGRAPHY_CONFIDENCE   = 0.85
+
+# Pressing triangle (v2)
+TRIANGLE_PRESSER_STRONG_M     = 2.5
+TRIANGLE_PRESSER_SOFT_M       = 4.0
+TRIANGLE_PRESSER_FAIL_M       = 4.5
+TRIANGLE_COVER_TO_CARRIER_M   = 6.0
+TRIANGLE_COVER_TO_PRESSER_M   = 7.0
+TRIANGLE_COVER_FAIL_M         = 8.0
+TRIANGLE_MAX_EDGE_M           = 8.0
+TRIANGLE_BORDERLINE_EDGE_M    = 11.0
+TRIANGLE_MIN_ANGULAR_SEP_DEG  = 25.0
+TRIANGLE_IDEAL_ANGULAR_MIN_DEG = 40.0
+TRIANGLE_IDEAL_ANGULAR_MAX_DEG = 110.0
+
+# Pressing trap (v2)
+TRAP_DEFENDER_INFLUENCE_M     = 10.0
+TRAP_DEFENDER_INNER_M         = 6.0
+TRAP_TOUCHLINE_STRONG_M       = 8.0
+TRAP_FREE_ESCAPE_VALID_DEG    = 90.0
+TRAP_FREE_ESCAPE_STRONG_DEG   = 60.0
+TRAP_FREE_ESCAPE_FAIL_DEG     = 120.0
+
+# 1v1 pressure
+ONE_V_ONE_DEFENDER_M          = 3.0
+ONE_V_ONE_SUPPORT_RADIUS_M    = 5.0
+
+# Recovery run
+RECOVERY_MIN_SPEED_MS         = 5.5
+RECOVERY_MIN_DURATION_S       = 0.7
+
 
 def _polygon_area(points: Sequence[Tuple[float, float]]) -> float:
     """Shoelace area of a 2D polygon. Returns 0 for <3 points."""
@@ -367,3 +403,277 @@ def validate_transition_carry(
         and close_defenders <= TRANSITION_CARRY_MAX_PRESSERS
     )
     return (is_carry, "TRANSITION_CARRY" if is_carry else "1V1_PRESSURE", geom)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Phase 4.7/4.8 v2 validators — return {valid, reasons, evidence} dict.
+# ─────────────────────────────────────────────────────────────────────────────
+
+from . import tactical_failure_reasons as R
+
+
+def _dist_m(a: Tuple[float, float], b: Tuple[float, float]) -> float:
+    return float(np.hypot(a[0] - b[0], a[1] - b[1]))
+
+
+def _angle_at_carrier(
+    carrier: Tuple[float, float],
+    p1: Tuple[float, float],
+    p2: Tuple[float, float],
+) -> float:
+    """Angle in degrees between (carrier→p1) and (carrier→p2)."""
+    v1 = np.array([p1[0] - carrier[0], p1[1] - carrier[1]])
+    v2 = np.array([p2[0] - carrier[0], p2[1] - carrier[1]])
+    n1, n2 = np.linalg.norm(v1), np.linalg.norm(v2)
+    if n1 < 1e-6 or n2 < 1e-6:
+        return 0.0
+    cos = float(np.dot(v1, v2) / (n1 * n2))
+    cos = max(-1.0, min(1.0, cos))
+    return float(degrees(np.arccos(cos)))
+
+
+def _point_in_triangle(p, a, b, c) -> bool:
+    """Barycentric inside-test."""
+    def sign(p1, p2, p3):
+        return (p1[0] - p3[0]) * (p2[1] - p3[1]) - (p2[0] - p3[0]) * (p1[1] - p3[1])
+    d1 = sign(p, a, b)
+    d2 = sign(p, b, c)
+    d3 = sign(p, c, a)
+    has_neg = (d1 < 0) or (d2 < 0) or (d3 < 0)
+    has_pos = (d1 > 0) or (d2 > 0) or (d3 > 0)
+    return not (has_neg and has_pos)
+
+
+def validate_global_truth(
+    *,
+    ball_visible: bool,
+    ball_pos_world: Optional[Tuple[float, float]],
+    carrier_pos_world: Optional[Tuple[float, float]],
+    carrier_confidence: float,
+    homography_confidence: float,
+    track_id_stable: bool = True,
+) -> dict:
+    """Per-frame global truth gate. Run before any story-specific validator.
+
+    Hard fails: BALL_NOT_VISIBLE, LOW_HOMOGRAPHY_CONFIDENCE,
+    LOW_CARRIER_CONFIDENCE, BALL_TOO_FAR_FROM_CARRIER (>1.8m soft, >2.5m hard),
+    TRACK_ID_UNSTABLE.
+    """
+    reasons: List[str] = []
+    evidence: dict = {
+        "carrier_confidence": round(float(carrier_confidence), 3),
+        "homography_confidence": round(float(homography_confidence), 3),
+    }
+
+    if not ball_visible or ball_pos_world is None:
+        reasons.append(R.BALL_NOT_VISIBLE)
+    if homography_confidence < GLOBAL_MIN_HOMOGRAPHY_CONFIDENCE:
+        reasons.append(R.LOW_HOMOGRAPHY_CONFIDENCE)
+    if carrier_confidence < GLOBAL_MIN_CARRIER_CONFIDENCE:
+        reasons.append(R.LOW_CARRIER_CONFIDENCE)
+    if not track_id_stable:
+        reasons.append(R.TRACK_ID_UNSTABLE)
+
+    if ball_pos_world is not None and carrier_pos_world is not None:
+        d = _dist_m(ball_pos_world, carrier_pos_world)
+        evidence["ball_to_carrier_m"] = round(d, 2)
+        if d > GLOBAL_HARD_FAIL_BALL_TO_CARRIER_M:
+            reasons.append(R.BALL_TOO_FAR_FROM_CARRIER)
+            evidence["ball_to_carrier_hard_fail"] = True
+        elif d > GLOBAL_MAX_BALL_TO_CARRIER_M:
+            reasons.append(R.BALL_TOO_FAR_FROM_CARRIER)
+
+    return {"valid": not reasons, "reasons": reasons, "evidence": evidence}
+
+
+def validate_pressing_triangle_v2(
+    *,
+    carrier: Tuple[float, float],
+    presser: Tuple[float, float],
+    cover: Tuple[float, float],
+    ball_pos_world: Optional[Tuple[float, float]] = None,
+    carrier_confidence: float = 1.0,
+    homography_confidence: float = 1.0,
+) -> dict:
+    """Strict pressing-triangle geometry check.
+
+    Returns {valid, reasons, evidence}. Always runs the global truth gate
+    first — its reasons are merged into the output."""
+    out = validate_global_truth(
+        ball_visible=ball_pos_world is not None,
+        ball_pos_world=ball_pos_world,
+        carrier_pos_world=carrier,
+        carrier_confidence=carrier_confidence,
+        homography_confidence=homography_confidence,
+    )
+    reasons: List[str] = list(out["reasons"])
+    evidence: dict = dict(out["evidence"])
+
+    presser_d = _dist_m(carrier, presser)
+    cover_to_carrier_d = _dist_m(carrier, cover)
+    cover_to_presser_d = _dist_m(presser, cover)
+    edge_max = max(presser_d, cover_to_carrier_d, cover_to_presser_d)
+    angular = _angle_at_carrier(carrier, presser, cover)
+
+    evidence.update({
+        "presser_to_carrier_m": round(presser_d, 2),
+        "cover_to_carrier_m": round(cover_to_carrier_d, 2),
+        "cover_to_presser_m": round(cover_to_presser_d, 2),
+        "triangle_edge_max_m": round(edge_max, 2),
+        "angular_separation_deg": round(angular, 1),
+    })
+
+    if presser_d > TRIANGLE_PRESSER_FAIL_M:
+        reasons.append(R.PRESSER_TOO_FAR)
+    if cover_to_carrier_d > TRIANGLE_COVER_FAIL_M or cover_to_presser_d > TRIANGLE_COVER_FAIL_M:
+        reasons.append(R.NO_REAL_COVER_DEFENDER)
+    if edge_max > TRIANGLE_BORDERLINE_EDGE_M:
+        reasons.append(R.TRIANGLE_TOO_LARGE)
+    elif edge_max > TRIANGLE_MAX_EDGE_M:
+        evidence["triangle_borderline"] = True
+    if angular < TRIANGLE_MIN_ANGULAR_SEP_DEG:
+        reasons.append(R.DEFENDERS_COLLINEAR)
+
+    # Carrier-inside-or-near-footprint check: tolerate carrier just outside
+    # the triangle (within 1.5m) since the carrier sits on the corner anyway.
+    inside = _point_in_triangle(carrier, carrier, presser, cover)
+    if not inside:
+        # Distance from carrier to the closest triangle edge
+        # (carrier is one of the vertices so this is always 0; kept for clarity)
+        reasons.append(R.CARRIER_OUTSIDE_TRIANGLE)
+
+    return {"valid": not reasons, "reasons": reasons, "evidence": evidence,
+            "story_type": "PRESSING_TRIANGLE"}
+
+
+def validate_pressing_trap_v2(
+    *,
+    carrier: Tuple[float, float],
+    defenders: Sequence[Tuple[float, float]],
+    touchline_dist_m: float,
+    free_escape_angle_deg: float,
+    ball_pos_world: Optional[Tuple[float, float]] = None,
+    carrier_confidence: float = 1.0,
+    homography_confidence: float = 1.0,
+) -> dict:
+    """Trap geometry: ≥3 defenders within 10m, ≥2 within 6m, escape ≤90°."""
+    out = validate_global_truth(
+        ball_visible=ball_pos_world is not None,
+        ball_pos_world=ball_pos_world,
+        carrier_pos_world=carrier,
+        carrier_confidence=carrier_confidence,
+        homography_confidence=homography_confidence,
+    )
+    reasons: List[str] = list(out["reasons"])
+    evidence: dict = dict(out["evidence"])
+
+    influencing = [d for d in defenders if _dist_m(carrier, d) <= TRAP_DEFENDER_INFLUENCE_M]
+    inner = [d for d in defenders if _dist_m(carrier, d) <= TRAP_DEFENDER_INNER_M]
+
+    evidence.update({
+        "n_influencing_defenders": len(influencing),
+        "n_inner_defenders": len(inner),
+        "touchline_dist_m": round(touchline_dist_m, 2),
+        "free_escape_angle_deg": round(free_escape_angle_deg, 1),
+    })
+
+    if len(influencing) < 3 or len(inner) < 2:
+        reasons.append(R.INSUFFICIENT_DEFENDERS_FOR_TRAP)
+    if free_escape_angle_deg > TRAP_FREE_ESCAPE_FAIL_DEG:
+        reasons.append(R.ESCAPE_ANGLE_TOO_LARGE)
+    if free_escape_angle_deg > TRAP_FREE_ESCAPE_VALID_DEG:
+        reasons.append(R.NO_DIRECTIONAL_FORCE)
+    if touchline_dist_m <= TRAP_TOUCHLINE_STRONG_M:
+        evidence["trap_strength"] = "strong"
+
+    return {"valid": not reasons, "reasons": reasons, "evidence": evidence,
+            "story_type": "PRESSING_TRAP"}
+
+
+def validate_1v1_pressure(
+    *,
+    carrier: Tuple[float, float],
+    defender: Tuple[float, float],
+    other_defenders: Sequence[Tuple[float, float]],
+    defender_velocity_world: Optional[Tuple[float, float]] = None,
+    ball_pos_world: Optional[Tuple[float, float]] = None,
+    carrier_confidence: float = 1.0,
+    homography_confidence: float = 1.0,
+) -> dict:
+    out = validate_global_truth(
+        ball_visible=ball_pos_world is not None,
+        ball_pos_world=ball_pos_world,
+        carrier_pos_world=carrier,
+        carrier_confidence=carrier_confidence,
+        homography_confidence=homography_confidence,
+    )
+    reasons: List[str] = list(out["reasons"])
+    evidence: dict = dict(out["evidence"])
+
+    d_def = _dist_m(carrier, defender)
+    n_supporting = sum(1 for d in other_defenders
+                       if _dist_m(carrier, d) <= ONE_V_ONE_SUPPORT_RADIUS_M)
+    evidence.update({
+        "defender_to_carrier_m": round(d_def, 2),
+        "n_supporting_defenders": n_supporting,
+    })
+
+    if d_def > ONE_V_ONE_DEFENDER_M:
+        reasons.append(R.PRESSER_TOO_FAR)
+    if n_supporting > 0:
+        reasons.append(R.SECOND_DEFENDER_PRESENT)
+
+    if defender_velocity_world is not None:
+        # Engaging = velocity points toward carrier (dot product > 0)
+        v = np.array(defender_velocity_world)
+        toward = np.array([carrier[0] - defender[0], carrier[1] - defender[1]])
+        n = np.linalg.norm(v) * np.linalg.norm(toward)
+        cos = float(np.dot(v, toward) / n) if n > 1e-6 else 0.0
+        evidence["defender_engagement_cos"] = round(cos, 3)
+        if cos < 0.0:
+            reasons.append(R.DEFENDER_NOT_ENGAGING)
+
+    return {"valid": not reasons, "reasons": reasons, "evidence": evidence,
+            "story_type": "1V1_PRESSURE"}
+
+
+def validate_recovery_run(
+    *,
+    defender_speed_ms: float,
+    duration_s: float,
+    moving_toward_own_goal: bool,
+    distance_to_threat_decreasing: bool,
+    carrier_confidence: float = 1.0,
+    homography_confidence: float = 1.0,
+) -> dict:
+    out = validate_global_truth(
+        ball_visible=True,             # recovery doesn't require ball visibility
+        ball_pos_world=(0, 0),         # dummy, won't be used
+        carrier_pos_world=(0, 0),
+        carrier_confidence=carrier_confidence,
+        homography_confidence=homography_confidence,
+    )
+    # Drop ball-visibility/distance reasons since this story doesn't require them
+    reasons: List[str] = [
+        r for r in out["reasons"]
+        if r not in (R.BALL_NOT_VISIBLE, R.BALL_TOO_FAR_FROM_CARRIER)
+    ]
+    evidence: dict = dict(out["evidence"])
+    evidence.update({
+        "defender_speed_ms": round(defender_speed_ms, 2),
+        "duration_s": round(duration_s, 2),
+        "moving_toward_own_goal": bool(moving_toward_own_goal),
+        "distance_to_threat_decreasing": bool(distance_to_threat_decreasing),
+    })
+
+    if defender_speed_ms < RECOVERY_MIN_SPEED_MS:
+        reasons.append(R.SPEED_TOO_LOW)
+    if duration_s < RECOVERY_MIN_DURATION_S:
+        reasons.append(R.SPEED_TOO_LOW)  # duration too short = same-bucket failure
+    if not moving_toward_own_goal:
+        reasons.append(R.RUN_NOT_TOWARD_OWN_GOAL)
+    if not distance_to_threat_decreasing:
+        reasons.append(R.NO_TRANSITION_THREAT)
+
+    return {"valid": not reasons, "reasons": reasons, "evidence": evidence,
+            "story_type": "RECOVERY_RUN"}
