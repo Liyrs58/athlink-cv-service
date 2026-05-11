@@ -225,7 +225,8 @@ class TrackerCore:
         # VLM: game state only (scene detection)
         self.vlm = VLMStateMachine(device=device)
         # Identity core: deterministic ID assignment via ReID + position
-        self.identity = IdentityCore() if use_identity else _NoOpIdentity()
+        # Re-enabled Phase D: proactive snapshot now fires before collapse (line 569)
+        self.identity = IdentityCore()
         self.reid = ReIDExtractor(device=device) if use_identity else None
         self._use_identity = use_identity
         self.suppressor = TrackSuppressor()
@@ -248,6 +249,7 @@ class TrackerCore:
         self._streak_recover = 0
         self._transition_frame = -1
         self._frames_in_collapse = 0  # phase 2 telemetry: feeds match_report.quality.softCollapseFraction
+        self._last_snapshot_frame = -100  # proactive snapshot: throttle to every 15 frames min
 
         # Officials tracking for output
         self._officials_this_frame = []
@@ -553,7 +555,7 @@ class TrackerCore:
                 # Floor at 8 (small-side coverage); no upper cap.
                 self._active_baseline = max(8.0, median_count)
 
-            if self._active_baseline > 0:
+
                 # Trigger SoftCollapse if dropped below 65% for 3+ consecutive frames
                 if current_count <= 0.65 * self._active_baseline:
                     self._streak_collapse += 1
@@ -660,6 +662,35 @@ class TrackerCore:
             # Team label from id_remap history or track attribute
             team_labels[tid] = getattr(tr, 'team', None)
             track_objs.append(tr)
+
+        # PROACTIVE SNAPSHOT: Capture healthy track state before collapse
+        # Runs AFTER embeddings are built so embed_map is available
+        if is_play and self._active_baseline > 0:
+            current_count = len(assignable_tracks)
+            is_healthy = (current_count >= 0.35 * max(self._active_baseline, 1.0))
+            should_snapshot = (
+                is_healthy and
+                (not hasattr(self, '_last_snapshot_frame') or video_frame - self._last_snapshot_frame >= 15)
+            )
+            if should_snapshot:
+                # Snapshot from identity slots first (locked/revived tracks)
+                saved = self.identity.snapshot_soft(video_frame)
+                # If no slots yet, snapshot raw tracks directly into soft_snapshot
+                if saved == 0 and len(embed_map) > 0:
+                    self.identity._soft_snapshot = {}
+                    for tid, emb in embed_map.items():
+                        if tid in pitch_positions:
+                            self.identity._soft_snapshot[f"T{tid}"] = {
+                                "embedding": emb.copy() if emb is not None else np.zeros(512),
+                                "position": positions.get(tid, (0, 0)),
+                                "pitch": pitch_positions.get(tid, (0, 0)),
+                                "team_id": team_labels.get(tid),
+                                "last_seen": video_frame,
+                            }
+                    saved = len(self.identity._soft_snapshot)
+                self._last_snapshot_frame = video_frame
+                if saved > 0:
+                    print(f"[ProactiveSnapshot] Frame {video_frame}: {saved} slots captured (baseline={self._active_baseline:.1f})")
 
         # Pass pitch coords and team labels to identity core
         self.identity.pitch_positions = pitch_positions
