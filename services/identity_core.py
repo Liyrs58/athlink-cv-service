@@ -95,6 +95,8 @@ class PlayerSlot:
     pending_tid: Optional[int] = None
     pending_streak: int = 0
     pending_seen_seq: int = 0  # identity_frame_seq when last matched
+    last_assigned_tid: Optional[int] = None  # for continuity bias in cost matrix
+    last_assigned_seq: int = 0
     team_id: Optional[int] = None
 
     def update_embedding(self, emb: np.ndarray) -> None:
@@ -434,9 +436,17 @@ class IdentityCore:
             for i, tr in enumerate(unlocked_tracks):
                 tid = int(tr.track_id)
                 for jj, j in enumerate(unlocked_slot_idx):
-                    cost[i, jj] = self._slot_cost(
+                    base = self._slot_cost(
                         self.slots[j], embeddings.get(tid), positions.get(tid), tid=tid
                     )
+                    # Apply continuity bias: strongly prefer slots that matched this tid recently
+                    slot = self.slots[j]
+                    if slot.pending_tid is not None and int(slot.pending_tid) == int(tid):
+                        base = max(0.0, base - 0.50)  # Very strong bias to maintain tid-pid continuity
+                    elif (hasattr(slot, 'last_assigned_tid') and slot.last_assigned_tid is not None
+                          and int(slot.last_assigned_tid) == int(tid)):
+                        base = max(0.0, base - 0.25)  # Strong bias for recent history
+                    cost[i, jj] = base
 
             r_idx, c_idx = linear_sum_assignment(cost)
 
@@ -458,21 +468,41 @@ class IdentityCore:
 
                 # Track pending_streak using identity frame sequence, not raw frames
                 # This survives frame_stride differences and late seeding
-                tid_match = slot.pending_tid == tid
-                seq_match = slot.pending_seen_seq == self.identity_frame_seq - 1
-                if tid_match and seq_match:
+                # Check if this tid matches the slot's last assignment (from previous processed frame)
+                same_tid = (hasattr(slot, 'last_assigned_tid') and slot.last_assigned_tid is not None
+                           and int(slot.last_assigned_tid) == int(tid))
+                seq_ok = slot.pending_seen_seq == self.identity_frame_seq - 1
+                pending_streak_before = slot.pending_streak
+
+                if same_tid and seq_ok:
                     slot.pending_streak += 1
+                    branch = "increment"
+                    reset_reason = None
                 else:
-                    if self.frame_id % self.debug_every == 0 and slot.pending_tid is not None:
-                        print(f"[SlotReset] frame={self.frame_id} pid={slot.pid} old_tid={slot.pending_tid} new_tid={tid} old_streak={slot.pending_streak} old_seq={slot.pending_seen_seq} cur_seq={self.identity_frame_seq} tid_match={tid_match} seq_match={seq_match}")
-                    slot.pending_tid = tid
+                    branch = "reset"
+                    reset_reason = []
+                    if not same_tid:
+                        reset_reason.append("tid_changed")
+                    if not seq_ok:
+                        reset_reason.append("seq_gap")
+                    slot.pending_tid = int(tid)
                     slot.pending_streak = 1
-                if self.frame_id % self.debug_every == 0 and tid == 1:  # Debug for first track
-                    print(f"[SeqTrace] frame={self.frame_id} tid={tid} pid={slot.pid} streak={slot.pending_streak} pending_seq={slot.pending_seen_seq} cur_seq={self.identity_frame_seq}")
+
+                if self.frame_id % self.debug_every == 0:
+                    print(f"[StreakBranch] frame={self.frame_id} tid={tid} pid={slot.pid} "
+                          f"slot_pending_tid={slot.pending_tid} same_tid={same_tid} "
+                          f"pending_seq={slot.pending_seen_seq} expected_prev_seq={self.identity_frame_seq-1} seq_ok={seq_ok} "
+                          f"streak_before={pending_streak_before} branch={branch} reason={reset_reason}")
+
                 slot.pending_seen_seq = self.identity_frame_seq
 
                 track_to_pid[tid] = slot.pid
+                old_pid = getattr(slot, '_last_assigned_pid', None)
                 self._activate_slot(slot, tid, positions)
+                slot._last_assigned_pid = slot.pid
+                if self.frame_id % self.debug_every == 0 and tid == 1:
+                    changed = "yes" if old_pid is not None and old_pid != slot.pid else "no"
+                    print(f"[TidPidContinuity] frame={self.frame_id} tid={tid} pid={slot.pid} old_pid={old_pid} changed={changed}")
 
                 if cst <= LOW_CONFIDENCE_THRESHOLD:
                     emb = embeddings.get(tid)
@@ -623,17 +653,19 @@ class IdentityCore:
                 slot.last_pitch = pitch_positions.get(tid, (0, 0))
                 slot.team_id = team_labels.get(tid)
                 slot.last_seen_frame = frame_id
-                # Bootstrap: start pending streak for future Hungarian matching
-                slot.pending_tid = tid
-                slot.pending_streak = 1
-                # Set pending_seen_seq to one BEFORE current identity frame so next assign_tracks sees continuity
-                # (seed happens before assign_tracks, so we pretend it was seen in the "previous" processed frame)
-                slot.pending_seen_seq = self.identity_frame_seq - 1
-                slot.active_track_id = tid
+                # DON'T set pending_tid during seed.
+                # Let Hungarian create the first match naturally.
+                # The first match will set pending_tid=matched_tid and pending_streak=1.
+                # Then subsequent frames can check continuity.
+                # For now, just mark that this slot was "seeded" so pending continuity starts fresh
+                slot.pending_tid = None
+                slot.pending_streak = 0
+                slot.pending_seen_seq = self.identity_frame_seq
+                slot.active_track_id = None  # Don't set active_track_id; let assign_tracks do that
                 # Do NOT set seen_this_frame=True; seed is before assign_tracks processes
                 seeded += 1
         if seeded > 0:
-            print(f"[SlotSeed] frame={frame_id} seeded {seeded} empty slots from {len(tids)} tracks")
+            print(f"[SlotSeed] frame={frame_id} seeded {seeded} empty slots from {len(tids)} tracks cur_seq={self.identity_frame_seq}")
         return seeded
 
     # ------------------------------------------------------------------
@@ -1047,6 +1079,8 @@ class IdentityCore:
         positions: Dict[int, Tuple[float, float]],
     ) -> None:
         slot.active_track_id = tid
+        slot.last_assigned_tid = int(tid)
+        slot.last_assigned_seq = self.identity_frame_seq
         slot.seen_this_frame = True
         slot.state = "active"
         slot.last_seen_frame = self.frame_id
