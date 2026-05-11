@@ -14,25 +14,46 @@ import subprocess
 from pathlib import Path
 
 # ============================================================================
-# STEP 0: CLONE REPO (since cell was restarted)
+# STEP 0: FETCH REPO (via ZIP download to avoid auth issues)
 # ============================================================================
 print("=" * 80)
-print("STEP 0: CLONE REPO")
+print("STEP 0: FETCH REPO")
 print("=" * 80)
 
-# Check if already cloned
+# Check if already present
 if not os.path.exists('/content/athlink-cv-service'):
-    print("Cloning athlink-cv-service repo...")
+    print("Downloading athlink-cv-service repo (ZIP)...")
     result = subprocess.run(
-        ['git', 'clone', 'https://github.com/liys58/athlink-cv-service.git'],
-        cwd='/content',
+        ['curl', '-L',
+         'https://github.com/liys58/athlink-cv-service/archive/refs/heads/main.zip',
+         '-o', '/content/repo.zip'],
         capture_output=True,
         text=True
     )
     if result.returncode != 0:
-        print(f"Clone failed: {result.stderr}")
+        print(f"Download failed: {result.stderr}")
         sys.exit(1)
-    print("✓ Repo cloned")
+
+    print("Extracting...")
+    result = subprocess.run(
+        ['unzip', '-q', '/content/repo.zip', '-d', '/content'],
+        capture_output=True,
+        text=True
+    )
+    if result.returncode != 0:
+        print(f"Extraction failed: {result.stderr}")
+        sys.exit(1)
+
+    # Rename extracted folder to standard name
+    result = subprocess.run(
+        ['mv', '/content/athlink-cv-service-main', '/content/athlink-cv-service'],
+        capture_output=True,
+        text=True
+    )
+    if result.returncode != 0:
+        print(f"Rename failed (folder may already exist): {result.stderr}")
+
+    print("✓ Repo extracted")
 else:
     print("✓ Repo already present")
 
