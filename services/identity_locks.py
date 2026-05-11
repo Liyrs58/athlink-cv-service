@@ -105,6 +105,10 @@ class IdentityLockManager:
     def locked_pids(self) -> Set[str]:
         return set(self._pid_to_tid.keys())
 
+    def count_live_locks(self) -> int:
+        """Count non-dormant locks."""
+        return sum(1 for lk in self._tid_to_lock.values() if not lk.dormant)
+
     def lock_ttl(self, tid: int) -> int:
         lk = self._tid_to_lock.get(tid)
         return lk.ttl if lk else 0

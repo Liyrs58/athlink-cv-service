@@ -540,6 +540,13 @@ class TrackerCore:
             current_count = max(0, len(assignable_tracks) - 0)  # assignable already excludes officials
             _ = n_officials  # kept for future expected-count subtraction if assignable changes
 
+            # Track recovery even while collapsed so recovery trigger can fire
+            if self._soft_collapse:
+                if current_count >= 0.60 * self._active_baseline:
+                    self._streak_recover += 1
+                else:
+                    self._streak_recover = 0
+
             # Always feed the rolling window (no gate on >=18 — that's what trapped the baseline high).
             if not self._soft_collapse:
                 self._track_history.append(current_count)
@@ -562,35 +569,48 @@ class TrackerCore:
                 else:
                     self._streak_collapse = 0
 
-                # Trigger SoftRecovery if recovered above 80%
-                if current_count >= 0.80 * self._active_baseline:
+                # Trigger SoftRecovery if recovered above 60%
+                if current_count >= 0.60 * self._active_baseline:
                     self._streak_recover += 1
                 else:
                     self._streak_recover = 0
 
                 if self._streak_collapse >= 3 and not self._soft_collapse:
-                    saved = self.identity.snapshot_soft(video_frame)
-                    self._soft_collapse = True
-                    self.identity.in_soft_collapse = True
-                    self.identity.locks.in_collapse = True   # audit flag
-                    self.identity.in_soft_recovery = False
-                    self._streak_collapse = 0
-                    print(f"[SoftCollapse] Frame {video_frame}: current={current_count} baseline={self._active_baseline:.1f} saved={saved}")
-
-                elif self._streak_recover >= 1 and self._soft_collapse:
-                    self._soft_collapse = False
-                    self.identity.in_soft_collapse = False
-                    self.identity.locks.in_collapse = False
-                    snap_len = len(self.identity._soft_snapshot) if hasattr(self.identity, '_soft_snapshot') and self.identity._soft_snapshot else 0
-                    if snap_len == 0:
-                        self._soft_recovery_frames = 0
+                    # Check if identity bootstrap is complete before allowing soft collapse
+                    bootstrap_complete = (
+                        self.identity.locks.collapse_lock_creations == 0 and  # no collapsed-blocks yet
+                        (self.identity.locks.locks_created >= 5 or self.identity.locks.count_live_locks() >= 5)
+                    )
+                    if bootstrap_complete:
+                        saved = self.identity.snapshot_soft(video_frame)
+                        self._soft_collapse = True
+                        self.identity.in_soft_collapse = True
+                        self.identity.locks.in_collapse = True   # audit flag
                         self.identity.in_soft_recovery = False
-                        print(f"[SoftRecovery] Frame {video_frame}: snapshot empty → skip recovery, normal mode")
+                        self._streak_collapse = 0
+                        print(f"[SoftCollapse] Frame {video_frame}: current={current_count} baseline={self._active_baseline:.1f} saved={saved}")
                     else:
-                        self._soft_recovery_frames = 60
-                        self.identity.in_soft_recovery = True
-                        print(f"[SoftRecovery] Frame {video_frame}: current={current_count} baseline={self._active_baseline:.1f} snapshot_slots={snap_len} revived=candidates → entering recovery mode")
-                    self._streak_recover = 0
+                        # Bootstrap not complete — don't activate soft collapse yet
+                        self._streak_collapse = 0
+                        if video_frame % 30 == 0:
+                            print(f"[Bootstrap] Frame {video_frame}: soft_collapse blocked (not ready) — live_locks={self.identity.locks.count_live_locks()} created={self.identity.locks.locks_created}")
+
+            # Recovery transition — checked OUTSIDE the if-not-collapse gate so it can fire when collapsed
+            if self._streak_recover >= 1 and self._soft_collapse and is_play and not is_overlay:
+                self._soft_collapse = False
+                self.identity.in_soft_collapse = False
+                self.identity.locks.in_collapse = False
+                snap_len = len(self.identity._soft_snapshot) if hasattr(self.identity, '_soft_snapshot') and self.identity._soft_snapshot else 0
+                if snap_len == 0:
+                    self._soft_recovery_frames = 0
+                    self.identity.in_soft_recovery = False
+                    print(f"[SoftRecovery] Frame {video_frame}: snapshot empty → skip recovery, normal mode")
+                else:
+                    self._soft_recovery_frames = 60
+                    self.identity.in_soft_recovery = True
+                    current_count = len(assignable_tracks)  # Re-compute for log
+                    print(f"[SoftRecovery] Frame {video_frame}: current={current_count} baseline={self._active_baseline:.1f} snapshot_slots={snap_len} revived=candidates → entering recovery mode")
+                self._streak_recover = 0
 
         # Track frames-in-collapse for match_report.json telemetry (phase 2)
         if self._soft_collapse:
@@ -675,19 +695,12 @@ class TrackerCore:
             if should_snapshot:
                 # Snapshot from identity slots first (locked/revived tracks)
                 saved = self.identity.snapshot_soft(video_frame)
-                # If no slots yet, snapshot raw tracks directly into soft_snapshot
+                # If no slots yet, seed empty slots with raw track embeddings
                 if saved == 0 and len(embed_map) > 0:
-                    self.identity._soft_snapshot = {}
-                    for tid, emb in embed_map.items():
-                        if tid in pitch_positions:
-                            self.identity._soft_snapshot[f"T{tid}"] = {
-                                "embedding": emb.copy() if emb is not None else np.zeros(512),
-                                "position": positions.get(tid, (0, 0)),
-                                "pitch": pitch_positions.get(tid, (0, 0)),
-                                "team_id": team_labels.get(tid),
-                                "last_seen": video_frame,
-                            }
-                    saved = len(self.identity._soft_snapshot)
+                    seeded = self.identity.seed_provisional_from_tracks(
+                        embed_map, positions, pitch_positions, team_labels, video_frame
+                    )
+                    saved = seeded
                 self._last_snapshot_frame = video_frame
                 if saved > 0:
                     print(f"[ProactiveSnapshot] Frame {video_frame}: {saved} slots captured (baseline={self._active_baseline:.1f})")

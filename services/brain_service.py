@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _call_claude(messages: list, max_tokens: int = 1024, model: str = "claude-sonnet-4-20250514") -> dict:
+def _call_claude(messages: list, max_tokens: int = 1024, model: str = "claude-opus-4-6") -> dict:
     """Call Claude API and return the parsed JSON response body."""
     api_key = os.environ.get("ANTHROPIC_API_KEY", "")
     if not api_key:
@@ -331,7 +331,7 @@ Return ONLY valid JSON. No markdown.""",
         result = _call_claude(
             messages=[{"role": "user", "content": content}],
             max_tokens=1024,
-            model="claude-sonnet-4-20250514",
+            model="claude-opus-4-6",
         )
         text = result["content"][0]["text"]
         audit = _parse_json_response(text)
@@ -621,7 +621,7 @@ Rules you must follow:
         result = _call_claude(
             messages=[{"role": "user", "content": prompt}],
             max_tokens=8192,
-            model="claude-sonnet-4-20250514",
+            model="claude-opus-4-6",
         )
         report = result["content"][0]["text"]
         logger.info("Synthesis complete — %d chars", len(report))

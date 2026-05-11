@@ -1,5 +1,13 @@
 # Project Context
 
+## Browser Automation
+
+`agent-browser` (v0.27.0) is installed at `~/.npm-global/bin/`. Always prefix with:
+```bash
+export PATH="$HOME/.npm-global/bin:$PATH"
+```
+Use it for Colab interaction, scraping render output, screenshots. See `.claude/agent-browser.md` for the skill guide.
+
 This is a Python computer vision pipeline for grassroots football player tracking.
 
 **Stack:** YOLO, BoT-SORT (boxmot), OpenCV, NumPy, FastAPI

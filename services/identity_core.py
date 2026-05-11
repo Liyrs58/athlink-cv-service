@@ -94,6 +94,7 @@ class PlayerSlot:
     stability_counter: int = 0
     pending_tid: Optional[int] = None
     pending_streak: int = 0
+    pending_seen_seq: int = 0  # identity_frame_seq when last matched
     team_id: Optional[int] = None
 
     def update_embedding(self, emb: np.ndarray) -> None:
@@ -120,6 +121,7 @@ class IdentityCore:
         print("[ReID] using HSV fallback only for appearance matching")
 
         self.frame_id: int = -1
+        self.identity_frame_seq: int = 0  # increments on each assign_tracks call
         self.assigned_this_frame: int = 0
         self.unmatched_tracks: int = 0
         self.unmatched_slots: int = 0
@@ -253,11 +255,17 @@ class IdentityCore:
     # ------------------------------------------------------------------
 
     def reset_for_scene(self, frame_id: int = -1) -> None:
+        if frame_id >= 0:
+            self.frame_id = frame_id
+        reset_count = sum(1 for s in self.slots if s.pending_tid is not None)
         for s in self.slots:
             s.active_track_id = None
             s.seen_this_frame = False
             s.pending_tid = None
             s.pending_streak = 0
+            s.pending_seen_seq = 0
+        if reset_count > 0:
+            print(f"[PendingReset] fn=reset_for_scene frame={self.frame_id} reset={reset_count} slots")
             if s.state in ("active", "dormant") and s.embedding is not None:
                 s.state = "dormant"
             else:
@@ -323,6 +331,9 @@ class IdentityCore:
         Caller always passes allow_new_assignments=not _identity_restricted().
         The internal check here is a second safety net.
         """
+        # Increment identity frame sequence for streak continuity across frame_stride
+        self.identity_frame_seq += 1
+
         meta_map: Dict[int, AssignmentMeta] = {}
         track_to_pid: Dict[int, str] = {}
         memory_skips = 0
@@ -378,6 +389,10 @@ class IdentityCore:
 
         if locked_kept and self.frame_id % self.debug_every == 0:
             print(f"[IDLockKeep] frame={self.frame_id} kept={locked_kept}")
+
+        if allow_new_assignments and len(unlocked_tracks) > 0:
+            emb_present = sum(1 for t in unlocked_tracks if embeddings.get(int(t.track_id)) is not None)
+            print(f"[LockDiag] frame={self.frame_id} unlocked={len(unlocked_tracks)} emb_present={emb_present}")
 
         # ── Step 2: gate — restricted or not allowed → all UNKNOWN ───────
         if not allow_new_assignments:
@@ -441,11 +456,20 @@ class IdentityCore:
                 # Normal play: stable-promote streak → lock
                 confidence = max(0.0, 1.0 - cst)
 
-                if slot.pending_tid == tid:
+                # Track pending_streak using identity frame sequence, not raw frames
+                # This survives frame_stride differences and late seeding
+                tid_match = slot.pending_tid == tid
+                seq_match = slot.pending_seen_seq == self.identity_frame_seq - 1
+                if tid_match and seq_match:
                     slot.pending_streak += 1
                 else:
+                    if self.frame_id % self.debug_every == 0 and slot.pending_tid is not None:
+                        print(f"[SlotReset] frame={self.frame_id} pid={slot.pid} old_tid={slot.pending_tid} new_tid={tid} old_streak={slot.pending_streak} old_seq={slot.pending_seen_seq} cur_seq={self.identity_frame_seq} tid_match={tid_match} seq_match={seq_match}")
                     slot.pending_tid = tid
                     slot.pending_streak = 1
+                if self.frame_id % self.debug_every == 0 and tid == 1:  # Debug for first track
+                    print(f"[SeqTrace] frame={self.frame_id} tid={tid} pid={slot.pid} streak={slot.pending_streak} pending_seq={slot.pending_seen_seq} cur_seq={self.identity_frame_seq}")
+                slot.pending_seen_seq = self.identity_frame_seq
 
                 track_to_pid[tid] = slot.pid
                 self._activate_slot(slot, tid, positions)
@@ -458,13 +482,24 @@ class IdentityCore:
                         else:
                             memory_skips += 1
 
-                if slot.pending_streak >= LOCK_PROMOTE_FRAMES and cst <= LOW_CONFIDENCE_THRESHOLD:
+                if self.frame_id % self.debug_every == 0:
+                    print(f"[StreakDiag] frame={self.frame_id} tid={tid} pid={slot.pid} cost={cst:.3f} streak={slot.pending_streak}/{LOCK_PROMOTE_FRAMES} seq={slot.pending_seen_seq}=={self.identity_frame_seq-1}? threshold={LOW_CONFIDENCE_THRESHOLD:.2f}")
+
+                # Try lock promotion if streak is ready and cost is good
+                lock_ready = slot.pending_streak >= LOCK_PROMOTE_FRAMES
+                cost_ok = cst <= LOW_CONFIDENCE_THRESHOLD
+                if self.frame_id % self.debug_every == 0 and (lock_ready or cost_ok):
+                    print(f"[LockAttempt] frame={self.frame_id} tid={tid} pid={slot.pid} cost={cst:.3f} streak={slot.pending_streak} ready={lock_ready} cost_ok={cost_ok}")
+
+                if lock_ready and cost_ok:
                     lk_new, status = self.locks.try_create_lock(
                         tid=tid, pid=slot.pid, source="hungarian",
                         frame_id=self.frame_id, confidence=cst,
                         allow_takeover=True, allow_rebind=True,
                     )
+                    print(f"[LockAttemptResult] frame={self.frame_id} tid={tid} pid={slot.pid} status={status}")
                     if status in ("created", "refreshed"):
+                        print(f"[LockCreate] frame={self.frame_id} tid={tid} pid={slot.pid} cost={cst:.3f} status={status}")
                         slot.pending_tid = None
                         slot.pending_streak = 0
 
@@ -495,6 +530,7 @@ class IdentityCore:
     def end_frame(self, frame_id: Optional[int] = None) -> None:
         if frame_id is not None:
             self.frame_id = frame_id
+        decayed = 0
         for s in self.slots:
             if s.seen_this_frame:
                 continue
@@ -504,8 +540,11 @@ class IdentityCore:
             s.stability_counter = 0
             if s.pending_tid is not None:
                 s.pending_streak = max(0, s.pending_streak - 1)
+                decayed += 1
                 if s.pending_streak == 0:
                     s.pending_tid = None
+        if decayed > 0 and self.frame_id % self.debug_every == 0:
+            print(f"[PendingDecay] fn=end_frame frame={self.frame_id} decayed={decayed} slots")
 
     # ------------------------------------------------------------------
     # Snapshots
@@ -562,6 +601,40 @@ class IdentityCore:
         saved = len(self._soft_snapshot)
         print(f"[Identity] SoftSnapshot: {saved} slots saved at frame {frame_id}")
         return saved
+
+    def seed_provisional_from_tracks(
+        self,
+        embed_map: Dict[int, np.ndarray],
+        positions: Dict[int, tuple],
+        pitch_positions: Dict[int, tuple],
+        team_labels: Dict[int, int],
+        frame_id: int,
+    ) -> int:
+        """Bootstrap: assign raw tracks to empty slots so snapshot_soft() can capture them."""
+        empty_slots = [s for s in self.slots if s.state == "lost" and s.embedding is None]
+        tids = list(embed_map.keys())
+        seeded = 0
+        for i, tid in enumerate(tids[:len(empty_slots)]):
+            slot = empty_slots[i]
+            emb = embed_map.get(tid)
+            if emb is not None:
+                slot.embedding = emb.copy()
+                slot.last_position = positions.get(tid, (0, 0))
+                slot.last_pitch = pitch_positions.get(tid, (0, 0))
+                slot.team_id = team_labels.get(tid)
+                slot.last_seen_frame = frame_id
+                # Bootstrap: start pending streak for future Hungarian matching
+                slot.pending_tid = tid
+                slot.pending_streak = 1
+                # Set pending_seen_seq to one BEFORE current identity frame so next assign_tracks sees continuity
+                # (seed happens before assign_tracks, so we pretend it was seen in the "previous" processed frame)
+                slot.pending_seen_seq = self.identity_frame_seq - 1
+                slot.active_track_id = tid
+                # Do NOT set seen_this_frame=True; seed is before assign_tracks processes
+                seeded += 1
+        if seeded > 0:
+            print(f"[SlotSeed] frame={frame_id} seeded {seeded} empty slots from {len(tids)} tracks")
+        return seeded
 
     # ------------------------------------------------------------------
     # Revival
