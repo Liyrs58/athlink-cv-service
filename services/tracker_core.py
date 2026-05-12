@@ -346,9 +346,8 @@ class TrackerCore:
         coco yolov8 → {0:person, 32:sports ball}. Output cls is normalised
         to roboflow numbering so downstream consumers stay unchanged."""
         self._last_ball_det = None
-        # Use built-in half parameter to handle fusion safely on GPU
-        use_half = "cuda" in str(self.device) or str(self.device) == "0"
-        results = self.yolo.predict(frame, conf=0.05, verbose=False, half=use_half)
+        # Disable FP16 (half=False) for YOLO to prevent dtype mismatch during fusion
+        results = self.yolo.predict(frame, conf=0.05, verbose=False, half=False)
         boxes = results[0].boxes
         if boxes is None or len(boxes) == 0:
             return np.empty((0, 6))
@@ -1173,8 +1172,8 @@ def run_tracking(video_path, job_id, frame_stride=1, max_frames=None, device="cp
 
             # Raw YOLO inference for diagnostics — share with tracker.detect via
             # a single-pass that records the histogram, then filters.
-            use_half = ("cuda" in str(device) or str(device) == "0")
-            yolo_results = tracker.yolo.predict(frame, conf=0.05, verbose=False, half=use_half)
+            # Disable FP16 (half=False) for YOLO to prevent dtype mismatch during fusion
+            yolo_results = tracker.yolo.predict(frame, conf=0.05, verbose=False, half=False)
             yolo_boxes = yolo_results[0].boxes
             if yolo_boxes is None or len(yolo_boxes) == 0:
                 raw_classes = []
