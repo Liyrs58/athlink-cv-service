@@ -118,6 +118,8 @@ class ReIDExtractor:
                 self.model.classifier = torch.nn.Identity()
 
             self.model.to(self.device)
+            if "cuda" in str(self.device):
+                self.model.half()
             self.model.eval()
             self.transform = T.Compose([
                 T.ToPILImage(),
@@ -138,6 +140,8 @@ class ReIDExtractor:
             self.model = resnet50(weights=ResNet50_Weights.DEFAULT)
             self.model.fc = torch.nn.Identity()
             self.model.to(self.device)
+            if "cuda" in str(self.device):
+                self.model.half()
             self.model.eval()
             self.transform = T.Compose([
                 T.ToPILImage(),
@@ -162,7 +166,7 @@ class ReIDExtractor:
         if self.model is None or not crops:
             return []
         features_list = []
-        batch_size = 16
+        batch_size = 32
         for i in range(0, len(crops), batch_size):
             batch_crops = crops[i:i + batch_size]
             tensors = []
@@ -175,6 +179,8 @@ class ReIDExtractor:
                     except Exception:
                         tensors.append(self._zero_tensor())
             batch_tensor = torch.stack(tensors).to(self.device)
+            if "cuda" in str(self.device):
+                batch_tensor = batch_tensor.half()
             with torch.no_grad():
                 feat = self.model(batch_tensor)
                 feat = torch.nn.functional.normalize(feat, p=2, dim=1)
@@ -199,9 +205,11 @@ class TrackerCore:
         yolo_path = os.path.abspath(yolo_path)
         print(f"[TrackerCore] YOLO: {yolo_path} (exists: {os.path.exists(yolo_path)})")
 
-        yolo_device = "cuda" if device in ("0", "cuda") else "cpu"
+        yolo_device = "cuda" if ("cuda" in str(device) or str(device) == "0") else "cpu"
         self.yolo = YOLO(yolo_path)
         self.yolo.to(yolo_device)
+        if yolo_device == "cuda":
+            self.yolo.half()
 
         # Derive class-id sets from model.names so we work with either:
         #   roboflow_players.pt  → {0:'ball', 1:'goalkeeper', 2:'player', 3:'referee'}
