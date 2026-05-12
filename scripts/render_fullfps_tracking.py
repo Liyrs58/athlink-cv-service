@@ -42,6 +42,9 @@ def parse_args() -> argparse.Namespace:
                    help="Show raw track ID in labels")
     p.add_argument("--show-confidence", action="store_true",
                    help="Show identity confidence in labels")
+    p.add_argument("--strict", action="store_true",
+                   help="Fail on missing camera_motion/identity_metrics, "
+                        "dimension mismatch, duplicate PID, or hungarian/provisional render.")
     return p.parse_args()
 
 
