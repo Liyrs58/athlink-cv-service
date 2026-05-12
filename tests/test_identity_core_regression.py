@@ -1,6 +1,7 @@
 import pytest
 import numpy as np
 from services.identity_core import IdentityCore
+from types import SimpleNamespace
 
 def test_seed_provisional_unwraps_dict_embedding():
     """
@@ -63,3 +64,86 @@ def test_seed_provisional_unwraps_dict_embedding():
     # Should calculate successfully without throwing TypeError
     assert isinstance(cost, float), "Cost should compute successfully as a float"
 
+
+def test_player_slot_cap_blocks_new_pid_creation(monkeypatch):
+    """Extra raw tracks must stay UNKNOWN instead of creating PIDs above the match cap."""
+    monkeypatch.setenv("ATHLINK_MAX_PLAYER_SLOTS", "2")
+    identity = IdentityCore()
+    identity.begin_frame(20, present_tids={99})
+
+    # Simulate P1/P2 already occupied in this frame. The next unmatched track
+    # must not be allowed to grab P3 just because that empty slot exists.
+    for slot in identity.slots[:2]:
+        slot.seen_this_frame = True
+        slot.state = "active"
+        slot.embedding = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+
+    track = SimpleNamespace(track_id=99)
+    _, meta = identity.assign_tracks(
+        [track],
+        {99: np.array([1.0, 0.0, 0.0], dtype=np.float32)},
+        {99: (100.0, 200.0)},
+        allow_new_assignments=True,
+    )
+
+    assert meta[99].pid is None
+    assert meta[99].identity_valid is False
+
+
+def test_player_slot_cap_still_allows_registered_slot_recovery(monkeypatch):
+    """The cap should block fresh PIDs, not prevent matching back to known slots."""
+    monkeypatch.setenv("ATHLINK_MAX_PLAYER_SLOTS", "2")
+    identity = IdentityCore()
+    identity.begin_frame(21, present_tids={42})
+
+    emb = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+    slot = identity.slots[0]
+    slot.embedding = emb.copy()
+    slot.state = "dormant"
+    slot.last_position = (100.0, 200.0)
+    slot.last_seen_frame = 20
+
+    track = SimpleNamespace(track_id=42)
+    _, meta = identity.assign_tracks(
+        [track],
+        {42: emb.copy()},
+        {42: (102.0, 201.0)},
+        allow_new_assignments=True,
+    )
+
+    assert meta[42].pid == "P1"
+
+
+def test_absent_stable_lock_can_relink_to_tracker_fragment(monkeypatch):
+    """A stable PID may follow a new raw tid when the old tid is absent."""
+    monkeypatch.setenv("ATHLINK_MAX_PLAYER_SLOTS", "2")
+    identity = IdentityCore(debug_every=9999)
+    emb = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+
+    identity.locks.try_create_lock(
+        tid=1, pid="P1", source="hungarian", frame_id=0, confidence=0.0
+    )
+    identity.locks.get_lock(1).stable_count = 20
+    slot = identity.slots[0]
+    slot.embedding = emb.copy()
+    slot.state = "dormant"
+    slot.last_position = (100.0, 200.0)
+    slot.last_seen_frame = 0
+
+    track = SimpleNamespace(track_id=99)
+    saw_revived = False
+    for frame_id in range(1, 7):
+        identity.begin_frame(frame_id, present_tids={99})
+        _, meta = identity.assign_tracks(
+            [track],
+            {99: emb.copy()},
+            {99: (100.0 + frame_id, 200.0)},
+            allow_new_assignments=True,
+        )
+        saw_revived = saw_revived or meta[99].source == "revived"
+        identity.end_frame(frame_id)
+
+    assert identity.locks.get_tid_for_pid("P1") == 99
+    assert meta[99].pid == "P1"
+    assert saw_revived
+    assert identity.revived_count >= 1

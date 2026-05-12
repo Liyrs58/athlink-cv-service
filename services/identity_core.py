@@ -27,6 +27,7 @@ from enum import Enum
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 import cv2
+import os
 import numpy as np
 from scipy.optimize import linear_sum_assignment
 
@@ -50,6 +51,7 @@ except ModuleNotFoundError:
 
 DORMANT_TTL = 180
 MAX_SLOTS = 22
+DEFAULT_PLAYER_SLOT_CAP = 14
 COST_REJECT_THRESHOLD = 0.72
 REVIVAL_COST_THRESHOLD = 0.60
 SOFT_REVIVE_COST_MAX = 0.38           # was 0.30 — loosened with real OSNet embeddings
@@ -66,6 +68,20 @@ LOW_CONFIDENCE_THRESHOLD = 0.55
 EMB_ALPHA = 0.25
 STABLE_PROTECT_THRESHOLD = 10
 LOCK_PROMOTE_FRAMES = 5
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    val = os.environ.get(name)
+    if val is None:
+        return default
+    return str(val).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return default
 
 
 def _unwrap_emb(emb) -> Optional[np.ndarray]:
@@ -176,7 +192,16 @@ class IdentityCore:
         self.slots: List[PlayerSlot] = [
             PlayerSlot(pid=f"P{i}") for i in range(1, MAX_SLOTS + 1)
         ]
+        self.max_player_slots = max(
+            1,
+            min(MAX_SLOTS, _env_int("ATHLINK_MAX_PLAYER_SLOTS", DEFAULT_PLAYER_SLOT_CAP)),
+        )
+        self.allow_extended_player_slots = _env_bool("ATHLINK_ALLOW_NEW_PLAYER_SLOTS", False)
         print("[ReID] using HSV fallback only for appearance matching")
+        print(
+            f"[IdentityConfig] max_player_slots={self.max_player_slots} "
+            f"allow_extended={self.allow_extended_player_slots}"
+        )
 
         self.frame_id: int = -1
         self.identity_frame_seq: int = 0  # increments on each assign_tracks call
@@ -247,10 +272,12 @@ class IdentityCore:
     def _relink_absent_existing_lock(self, pid: str, old_tid: Optional[int], new_tid: int,
                                      source: str, cost: float) -> bool:
         """Relink a reserved PID when its previous tracker id is absent from this frame."""
-        if old_tid is None or old_tid == new_tid or not self._identity_restricted:
+        if old_tid is None or old_tid == new_tid:
             return False
         existing_lk = self.locks.get_lock(old_tid)
         if existing_lk is None or old_tid in self._present_tids:
+            return False
+        if not self._identity_restricted and existing_lk.stable_count < STABLE_PROTECT_THRESHOLD:
             return False
         lk, status = self.locks.relink_absent_lock(
             old_tid=old_tid,
@@ -521,7 +548,7 @@ class IdentityCore:
         # ── Step 3: Normal play — Hungarian on unlocked tracks × free slots
         unlocked_slot_idx = [
             j for j, s in enumerate(self.slots)
-            if not self.locks.is_pid_locked(s.pid) and not s.seen_this_frame
+            if self._slot_available_for_assignment(s)
         ]
 
         if not unlocked_tracks or not unlocked_slot_idx:
@@ -640,6 +667,7 @@ class IdentityCore:
                     # Pan-safe gate: restrict new locks/rebinds/takeovers during fast_pan/cut
                     pan_restricted = self._camera_motion_restricted()
                     reason = self._camera_motion_reason() if pan_restricted else None
+                    relinked_absent = False
 
                     # Block all lock attempts (new, rebind, takeover) during pan motion
                     if pan_restricted:
@@ -648,27 +676,43 @@ class IdentityCore:
                             print(f"[PanGate] frame={self.frame_id} tid={tid} pid={slot.pid} "
                                   f"action=block_lock_creation reason={reason}")
                     else:
-                        lk_new, status = self.locks.try_create_lock(
-                            tid=tid, pid=slot.pid, source="hungarian",
-                            frame_id=self.frame_id, confidence=cst,
-                            allow_takeover=True,
-                            allow_rebind=True,
-                        )
+                        existing_tid_for_pid = self.locks.get_tid_for_pid(slot.pid)
+                        if (existing_tid_for_pid is not None
+                                and existing_tid_for_pid != tid
+                                and existing_tid_for_pid not in self._present_tids):
+                            relinked_absent = self._relink_absent_existing_lock(
+                                slot.pid, existing_tid_for_pid, tid,
+                                source="hungarian_absent", cost=cst,
+                            )
+                            if relinked_absent:
+                                self.revived_count += 1
+                                lk_new = self.locks.get_lock(tid)
+                                status = "relinked_absent"
+                            else:
+                                lk_new, status = None, "blocked_absent_lock"
+                        else:
+                            lk_new, status = self.locks.try_create_lock(
+                                tid=tid, pid=slot.pid, source="hungarian",
+                                frame_id=self.frame_id, confidence=cst,
+                                allow_takeover=True,
+                                allow_rebind=True,
+                            )
 
                         if self.frame_id % self.debug_every == 0:
                             print(f"[LockAttemptResult] frame={self.frame_id} tid={tid} pid={slot.pid} status={status}")
 
-                        if status in ("created", "refreshed"):
+                        if status in ("created", "refreshed", "relinked_absent"):
                             print(f"[LockCreate] frame={self.frame_id} tid={tid} pid={slot.pid} cost={cst:.3f} status={status}")
                             slot.pending_tid = None
                             slot.pending_streak = 0
 
                 self.assigned_this_frame += 1
                 is_locked = self.locks.is_tid_locked(tid)
+                is_relinked_revival = is_locked and self.locks.get_pid(tid) == slot.pid and status == "relinked_absent" if lock_ready and cost_ok and not pan_restricted else False
                 meta_map[tid] = AssignmentMeta(
                     pid=slot.pid,
-                    source="locked" if is_locked else "provisional",
-                    identity_state=IdentityState.LOCKED if is_locked else IdentityState.PROVISIONAL,
+                    source="revived" if is_relinked_revival else ("locked" if is_locked else "provisional"),
+                    identity_state=IdentityState.REVIVED if is_relinked_revival else (IdentityState.LOCKED if is_locked else IdentityState.PROVISIONAL),
                     confidence=confidence,
                     identity_valid=is_locked,
                 )
@@ -771,7 +815,10 @@ class IdentityCore:
         frame_id: int,
     ) -> int:
         """Bootstrap: assign raw tracks to empty slots so snapshot_soft() can capture them."""
-        empty_slots = [s for s in self.slots if s.state == "lost" and s.embedding is None]
+        empty_slots = [
+            s for s in self.slots
+            if self._slot_within_player_cap(s) and s.state == "lost" and s.embedding is None
+        ]
         tids = list(embed_map.keys())
         seeded = 0
         for i, tid in enumerate(tids[:len(empty_slots)]):
@@ -1284,6 +1331,29 @@ class IdentityCore:
                 return s
         return None
 
+    @staticmethod
+    def _pid_number(pid: Optional[str]) -> Optional[int]:
+        if not pid or not isinstance(pid, str) or not pid.startswith("P"):
+            return None
+        try:
+            return int(pid[1:])
+        except ValueError:
+            return None
+
+    def _slot_within_player_cap(self, slot: PlayerSlot) -> bool:
+        """Return whether a player slot is eligible for normal match identity use."""
+        if self.allow_extended_player_slots:
+            return True
+        n = self._pid_number(slot.pid)
+        return n is not None and n <= self.max_player_slots
+
+    def _slot_available_for_assignment(self, slot: PlayerSlot) -> bool:
+        """Slots can be matched when free, or when their lock belongs to an absent raw track."""
+        if not self._slot_within_player_cap(slot) or slot.seen_this_frame:
+            return False
+        locked_tid = self.locks.get_tid_for_pid(slot.pid)
+        return locked_tid is None or locked_tid not in self._present_tids
+
     def state_counts(self) -> Tuple[int, int, int]:
         active = sum(1 for s in self.slots if s.state == "active")
         dormant = sum(1 for s in self.slots if s.state == "dormant")
@@ -1312,6 +1382,9 @@ class IdentityCore:
         tid: Optional[int] = None,
         camera_motion: Optional[Dict] = None,
     ) -> float:
+        if not self._slot_within_player_cap(slot):
+            return float(COST_REJECT_THRESHOLD + 0.25)
+
         t_emb = t_data.get("emb") if isinstance(t_data, dict) else t_data
         t_hsv = t_data.get("hsv") if isinstance(t_data, dict) else None
 
@@ -1366,8 +1439,15 @@ class IdentityCore:
             log_motion_comp = True
 
         t_pitch = self.pitch_positions.get(tid) if tid is not None else None
-        pos_cost = assignment_position_cost(slot.last_pitch, t_pitch) if t_pitch is not None \
-            else (assignment_position_cost(slot_pos_for_cost, t_pos) if t_pos is not None else 0.5)
+        if t_pitch is not None and slot.last_pitch is not None:
+            pos_cost = assignment_position_cost(slot.last_pitch, t_pitch)
+        elif t_pos is not None and slot_pos_for_cost is not None:
+            dx = float(t_pos[0] - slot_pos_for_cost[0])
+            dy = float(t_pos[1] - slot_pos_for_cost[1])
+            dist = (dx * dx + dy * dy) ** 0.5
+            pos_cost = min(dist / 300.0, 1.0)
+        else:
+            pos_cost = 0.5
 
         # Log position compensation effect if applied
         if log_motion_comp and self.frame_id % 30 == 0:
