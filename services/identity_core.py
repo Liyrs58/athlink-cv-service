@@ -1027,21 +1027,12 @@ class IdentityCore:
             cost_max = SOFT_REVIVE_COST_MAX
             margin_min = SOFT_REVIVE_MARGIN_MIN
             if self._camera_motion_restricted():
-                    row_costs = cost[r, :]
-                    valid_row = row_costs[row_costs < 1e2]
-                    if is_first_recovery_frame and len(debug_costs) > 0:
-                        match_costs = [dc for dc in debug_costs if dc["tid"] == tid and dc["pid"] == pid]
-                        if match_costs:
-                            mc = match_costs[0]
-                            if mc["emb"] > 0.18:
-                                if self.frame_id % self.debug_every == 0:
-                                    print(f"[PanGate] frame={self.frame_id} tid={tid} pid={pid} "
-                                          f"action=block_soft_revive reason=appearance_cost_too_high appearance={mc['emb']:.3f}")
-                                continue
-            else:
-                ok, reason = self._revive_margin_ok(
-                    cst, margin, SOFT_REVIVE_COST_MAX, SOFT_REVIVE_MARGIN_MIN
-                )
+                cost_max = cost_max * 0.7  # Stricter maximum cost
+                margin_min = margin_min * 1.5  # Need stronger confidence margin
+            
+            ok, reason = self._revive_margin_ok(
+                cst, margin, cost_max, margin_min
+            )
 
             if not ok:
                 if reason == "ambiguous":
@@ -1098,7 +1089,7 @@ class IdentityCore:
             for d in debug_costs[:8]:
                 cost_ok = d["cost"] <= SOFT_REVIVE_COST_MAX
                 print(f"[SoftReviveCost] tid={d['tid']} pid={d['pid']} "
-                      f"cost={d['cost']:.3f} emb={d['emb']:.3f} pos={d['pos']:.3f} "
+                      f"cost={d['cost']:.3f} "
                       f"cost_ok={cost_ok}")
         return revived, meta
 
