@@ -209,3 +209,57 @@ class TestOfficialGateRegression:
 
         assert track_to_pid.get(10) is None, "P5 must not emit when tid=10 is official"
         assert meta[10].source == "official_blocked"
+
+
+class TestCongestionDetector:
+    """CongestionDetector tags TIDs that are inside dense clusters."""
+
+    def _make_bbox(self, cx, cy, w=50, h=120):
+        return [cx - w//2, cy - h//2, cx + w//2, cy + h//2]
+
+    def test_overlapping_group_tagged(self):
+        """Three boxes heavily overlapping → all 3 tagged as in-cluster."""
+        from services.identity_core import CongestionDetector
+        det = CongestionDetector(iou_threshold=0.10, radius_px=80, min_neighbors=2)
+
+        tid_bboxes = [
+            (1, self._make_bbox(300, 400)),
+            (2, self._make_bbox(310, 405)),
+            (3, self._make_bbox(305, 402)),
+        ]
+        in_cluster = det.detect(tid_bboxes)
+        assert 1 in in_cluster
+        assert 2 in in_cluster
+        assert 3 in in_cluster
+
+    def test_isolated_player_not_tagged(self):
+        """A player far from all others is not tagged."""
+        from services.identity_core import CongestionDetector
+        det = CongestionDetector(iou_threshold=0.10, radius_px=80, min_neighbors=2)
+
+        tid_bboxes = [
+            (1, self._make_bbox(300, 400)),
+            (2, self._make_bbox(310, 405)),
+            (3, self._make_bbox(305, 402)),
+            (7, self._make_bbox(900, 200)),
+        ]
+        in_cluster = det.detect(tid_bboxes)
+        assert 7 not in in_cluster, "isolated tid=7 must not be tagged"
+
+    def test_pair_below_threshold_not_tagged(self):
+        """Only 2 players with min_neighbors=3 → not in cluster."""
+        from services.identity_core import CongestionDetector
+        det = CongestionDetector(iou_threshold=0.10, radius_px=80, min_neighbors=3)
+
+        tid_bboxes = [
+            (1, self._make_bbox(300, 400)),
+            (2, self._make_bbox(305, 402)),
+        ]
+        in_cluster = det.detect(tid_bboxes)
+        assert len(in_cluster) == 0, "pair with min_neighbors=3 should not trigger"
+
+    def test_empty_input(self):
+        """Empty input returns empty set."""
+        from services.identity_core import CongestionDetector
+        det = CongestionDetector()
+        assert det.detect([]) == set()

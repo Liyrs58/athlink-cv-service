@@ -196,6 +196,81 @@ def _unwrap_emb(emb) -> Optional[np.ndarray]:
     return emb
 
 
+# ── Congestion detector configuration ────────────────────────────────
+_CLUSTER_IOU_THRESHOLD = float(os.environ.get("ATHLINK_CLUSTER_IOU_THRESHOLD", "0.10"))
+_CLUSTER_RADIUS_PX     = float(os.environ.get("ATHLINK_CLUSTER_RADIUS_PX", "80"))
+_CLUSTER_MIN_NEIGHBORS = int(os.environ.get("ATHLINK_CLUSTER_MIN_NEIGHBORS", "2"))
+
+
+def _bbox_iou(a: list, b: list) -> float:
+    """Compute IoU between two [x1,y1,x2,y2] boxes."""
+    ix1 = max(a[0], b[0])
+    iy1 = max(a[1], b[1])
+    ix2 = min(a[2], b[2])
+    iy2 = min(a[3], b[3])
+    inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
+    if inter == 0:
+        return 0.0
+    area_a = max(0.0, a[2] - a[0]) * max(0.0, a[3] - a[1])
+    area_b = max(0.0, b[2] - b[0]) * max(0.0, b[3] - b[1])
+    union = area_a + area_b - inter
+    return inter / union if union > 0 else 0.0
+
+
+class CongestionDetector:
+    """
+    Per-frame cluster detection using bbox IoU and center-distance.
+    A TID is tagged "in cluster" when it has >= min_neighbors other players
+    within radius_px OR overlapping with IoU >= iou_threshold.
+    """
+
+    def __init__(
+        self,
+        iou_threshold: float = _CLUSTER_IOU_THRESHOLD,
+        radius_px: float = _CLUSTER_RADIUS_PX,
+        min_neighbors: int = _CLUSTER_MIN_NEIGHBORS,
+    ):
+        self._iou_thresh = iou_threshold
+        self._radius = radius_px
+        self._min_nb = min_neighbors
+
+    def detect(self, tid_bboxes: List[Tuple[int, list]]) -> Set[int]:
+        """
+        Args:
+            tid_bboxes: list of (tid, [x1,y1,x2,y2])
+        Returns:
+            set of TIDs inside a dense cluster
+        """
+        if len(tid_bboxes) < 2:
+            return set()
+
+        tids = [t for t, _ in tid_bboxes]
+        boxes = [b for _, b in tid_bboxes]
+        centers = [
+            ((b[0] + b[2]) / 2.0, (b[1] + b[3]) / 2.0)
+            for b in boxes
+        ]
+
+        neighbor_counts = [0] * len(tids)
+        n = len(tids)
+        for i in range(n):
+            for j in range(n):
+                if i == j:
+                    continue
+                cx_diff = centers[i][0] - centers[j][0]
+                cy_diff = centers[i][1] - centers[j][1]
+                dist = (cx_diff ** 2 + cy_diff ** 2) ** 0.5
+                iou = _bbox_iou(boxes[i], boxes[j])
+                if dist < self._radius or iou >= self._iou_thresh:
+                    neighbor_counts[i] += 1
+
+        return {
+            tids[i]
+            for i in range(n)
+            if neighbor_counts[i] >= self._min_nb
+        }
+
+
 def _edge_for_center(cx: float, cy: float, fw: int, fh: int, margin: int) -> str:
     """Return the nearest frame edge name, or 'interior' if not near any edge."""
     if cx < margin:
@@ -379,6 +454,10 @@ class IdentityCore:
         self.shadow_relink_attempts: int = 0
         self.shadow_relink_accepted: int = 0
         self.shadow_relink_rejected: int = 0
+
+        # Congestion detector
+        self.congestion_detector = CongestionDetector()
+        self.cluster_freeze_blocks: int = 0
 
     # ------------------------------------------------------------------
     # Single source of truth for restricted identity mode
