@@ -563,7 +563,7 @@ class IdentityCore:
             self._present_tids = set()
         # ── Shadow capture: slots whose lock just expired enter SHADOW state ──
         self.shadow_buffer.evict_expired(frame_id)
-        live_lock_pids = {lk.pid for lk in self.locks._tid_to_lock.values()}
+        live_lock_pids = {lk.pid for lk in self.locks._tid_to_lock.values() if not lk.dormant}
         for slot in self.slots:
             pid = slot.pid
             if slot.state not in ("active", "dormant"):
@@ -573,7 +573,7 @@ class IdentityCore:
             if pid in live_lock_pids:
                 continue  # still has a live lock
             stable = slot.last_lock_stable_count
-            if stable >= 1 and slot.last_position is not None:
+            if stable >= STABLE_PROTECT_THRESHOLD and slot.last_position is not None:
                 cx, cy = slot.last_position
                 fw = getattr(self, '_frame_width', 1920)
                 fh = getattr(self, '_frame_height', 1080)

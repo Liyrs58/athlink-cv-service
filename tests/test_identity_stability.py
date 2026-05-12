@@ -637,19 +637,23 @@ class TestShadowBuffer:
     def test_shadow_entry_captured_on_lock_expiry(self):
         """When a locked slot's lock expires, a ShadowEntry must be created."""
         import numpy as np
-        from services.identity_core import IdentityCore, ShadowBuffer
+        from services.identity_core import IdentityCore, ShadowBuffer, STABLE_PROTECT_THRESHOLD
 
         identity = IdentityCore()
         lk, _ = identity.locks.try_create_lock(7, "P7", "hungarian", frame_id=0, ttl=2)
+        # Manually bump stable_count to meet STABLE_PROTECT_THRESHOLD
+        lk.stable_count = STABLE_PROTECT_THRESHOLD
         slot = identity._slot_by_pid("P7")
         slot.state = "active"
         slot.last_position = (100.0, 200.0)
 
+        # Call begin_frame with present_tids=set() so tid 7 is absent,
+        # triggering tick which will expire the lock (frame 5 is > frame 0 + ttl 2)
         identity.begin_frame(5, present_tids=set())
         identity.end_frame()
 
         assert identity.shadow_buffer.has_shadow("P7"), \
-            "P7 must have a shadow entry after lock expiry"
+            f"P7 must have a shadow entry after lock expiry (stable={STABLE_PROTECT_THRESHOLD})"
 
     def test_shadow_evicts_after_ttl(self):
         """ShadowEntry must be evicted after SHADOW_TTL_FRAMES."""
