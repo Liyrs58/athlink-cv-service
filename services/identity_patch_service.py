@@ -17,6 +17,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+try:
+    from services.identity_core import check_physicality
+except ImportError:
+    from identity_core import check_physicality  # type: ignore
+
 
 # ---------------------------------------------------------------------------
 # Validation
@@ -95,7 +100,20 @@ class PatchValidator:
             # We allow patches that specify their own range explicitly
             # but warn about patches that go outside documented conflicts
 
-        return None
+        # Official PID gate: reject patch that assigns player PID to an official
+        if patch.get("is_official_target"):
+            ok, code, detail = check_physicality(
+                pid=patch.get("pid", ""),
+                candidate_center=(0.0, 0.0),
+                candidate_team=None,
+                current_frame=0,
+                last_center=None,
+                last_frame=None,
+                last_team=None,
+                is_official=True,
+            )
+            if not ok:
+                return PatchRejection(patch, "OFFICIAL_PID_ASSIGNMENT", detail)
 
         return None
 

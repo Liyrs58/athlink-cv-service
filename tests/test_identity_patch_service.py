@@ -293,5 +293,25 @@ class TestPatchService:
         assert data["frames"][0]["players"][0]["playerId"] == "P1"
 
 
+class TestPatchValidatorPhysicality:
+    """PatchValidator rejects patches that assign player PID to official."""
+
+    def test_official_pid_patch_rejected(self):
+        """Patch with is_official_target=True must be rejected."""
+        from services.identity_patch_service import PatchValidator
+        validator = PatchValidator()
+        patch = {
+            "action": "assign_pid_to_tracklet",
+            "window_id": "w1",
+            "pid": "P13",
+            "is_official_target": True,
+            "confidence": 0.90,
+            "reason_codes": [],
+        }
+        result = validator.validate(patch, {"jobId": "t", "frames": [], "total_frames": 0})
+        assert result is not None, "Official PID patch must be rejected"
+        assert "official" in result.reason.lower() or "OFFICIAL" in result.reason.upper()
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
