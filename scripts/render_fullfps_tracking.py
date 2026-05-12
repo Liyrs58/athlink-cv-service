@@ -34,9 +34,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--write-contact-sheet", action="store_true")
     p.add_argument("--no-qa-json", action="store_true",
                    help="Disable per-frame QA JSON output (default is on)")
-    p.add_argument("--strict", action="store_true",
-                   help="Fail on missing camera_motion/identity_metrics, "
-                        "dimension mismatch, duplicate PID, or hungarian/provisional render.")
+    p.add_argument("--render-mode", choices=["production", "audit", "casefile"], default="production",
+                   help="Render mode: production (clean), audit (show all boxes/IDs), casefile (VLM debug)")
+    p.add_argument("--show-officials", action="store_true",
+                   help="Show officials even if normally suppressed (default: false)")
+    p.add_argument("--show-raw-id", action="store_true",
+                   help="Show raw track ID in labels")
+    p.add_argument("--show-confidence", action="store_true",
+                   help="Show identity confidence in labels")
     return p.parse_args()
 
 
@@ -67,6 +72,10 @@ def main() -> int:
         write_contact_sheet=args.write_contact_sheet,
         write_qa_json=(not args.no_qa_json),
         strict=args.strict,
+        render_mode=args.render_mode,
+        show_officials=args.show_officials,
+        show_raw_id=args.show_raw_id,
+        show_confidence=args.show_confidence,
     )
 
     print("=" * 60)

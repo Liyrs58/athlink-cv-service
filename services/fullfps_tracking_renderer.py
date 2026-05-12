@@ -830,14 +830,34 @@ def build_manifest(
 # ---- Drawing -------------------------------------------------------------------
 
 
-def _color_for(decision: RenderDecision) -> tuple[int, int, int]:
+def _color_for(decision: RenderDecision, render_mode: str) -> tuple[int, int, int]:
+    if render_mode == "audit":
+        if decision.assignment_source == "locked":
+            return (0, 255, 0) # green
+        elif decision.assignment_source == "revived":
+            return (0, 165, 255) # orange
+        elif not decision.pid:
+            return (128, 128, 128) # gray
     tc = TEAM_COLORS.get(decision.team_id, TEAM_COLORS[-1])
     return tc
 
 
-def _draw_decision(frame: np.ndarray, d: RenderDecision, debug: bool) -> None:
+def _draw_decision(
+    frame: np.ndarray,
+    d: RenderDecision,
+    debug: bool,
+    render_mode: str = "production",
+    show_officials: bool = False,
+    show_raw_id: bool = False,
+    show_confidence: bool = False
+) -> None:
     if d.bbox is None:
         return
+    
+    is_official_track = getattr(d, 'is_official', False) or d.key.startswith("OFFICIAL:")
+    if is_official_track and not show_officials:
+        return
+
     h, w = frame.shape[:2]
     x1 = max(0, min(int(d.bbox[0]), w - 1))
     y1 = max(0, min(int(d.bbox[1]), h - 1))
@@ -845,24 +865,49 @@ def _draw_decision(frame: np.ndarray, d: RenderDecision, debug: bool) -> None:
     y2 = max(0, min(int(d.bbox[3]), h - 1))
     if x2 <= x1 or y2 <= y1:
         return
-    color = _color_for(d)
+    color = _color_for(d, render_mode)
     thickness = 2 if d.state == RenderState.VISIBLE else 1
     cv2.rectangle(frame, (x1, y1), (x2, y2), color, thickness)
 
     label = ""
-    if getattr(d, 'is_official', False) or d.key.startswith("OFFICIAL:"):
-        return  # hide officials completely
-
-    if d.pid:
-        if d.assignment_source == "locked":
-            label = f"{d.pid} LOCK"
-            if debug and d.latest_tid is not None:
-                label = f"{d.pid} T{d.latest_tid} LOCK"
-        elif d.assignment_source == "revived":
-            # HIDE_LABEL for REVIVED, but keep the team color box.
-            label = ""
+    if is_official_track:
+        label = "REF"
+    elif render_mode == "audit":
+        parts = []
+        if d.pid:
+            parts.append(d.pid)
+            tag = "LOCK" if d.assignment_source == "locked" else "REV"
+            parts.append(tag)
         else:
-            # hide UNKNOWN completely
+            parts.append("UNK")
+            if d.latest_tid is not None:
+                parts.append(f"raw={d.latest_tid}")
+            
+        if show_raw_id and d.latest_tid is not None and d.pid:
+            parts.append(f"raw={d.latest_tid}")
+            
+        if show_confidence and hasattr(d, 'confidence'):
+            parts.append(f"c={d.confidence:.2f}")
+            
+        label = " | ".join(parts)
+    elif render_mode == "casefile":
+        if d.pid:
+            tag = "LOCK" if d.assignment_source == "locked" else "REV"
+            label = f"{d.pid} {tag}"
+            if show_raw_id and d.latest_tid is not None:
+                label += f" T{d.latest_tid}"
+    else: # production
+        if d.pid:
+            if d.assignment_source == "locked":
+                label = f"{d.pid} LOCK"
+            elif d.assignment_source == "revived":
+                # HIDE_LABEL for REVIVED, but keep the team color box.
+                label = ""
+            else:
+                # hide UNKNOWN completely
+                if not debug:
+                    return
+        else:
             if not debug:
                 return
 
@@ -919,6 +964,10 @@ def render_video(
     write_contact_sheet: bool = False,
     write_qa_json: bool = True,
     strict: bool = False,
+    render_mode: str = "production",
+    show_officials: bool = False,
+    show_raw_id: bool = False,
+    show_confidence: bool = False,
 ) -> dict:
     """Run the full renderer. Returns the manifest dict."""
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
@@ -958,16 +1007,16 @@ def render_video(
     obs_by_key, counters, _ = build_observations(
         tracking_results,
         frame_dims=(width, height),
-        debug_unknown=debug_unknown,
-        debug_officials=debug_officials,
+        debug_unknown=debug_unknown or (render_mode == "audit"),
+        debug_officials=debug_officials or show_officials,
     )
     decisions = render_frames(
         tracking_results,
         motions=motions,
         total_raw_frames=total_raw_frames,
         frame_dims=(width, height),
-        debug_unknown=debug_unknown,
-        debug_officials=debug_officials,
+        debug_unknown=debug_unknown or (render_mode == "audit"),
+        debug_officials=debug_officials or show_officials,
     )
 
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
@@ -993,10 +1042,14 @@ def render_video(
 
         frame_decisions = decisions[f] if f < len(decisions) else []
         for d in frame_decisions:
-            if d.state == RenderState.HIDDEN:
-                continue
-            _draw_decision(frame, d, debug=debug)
-
+            if d.state != RenderState.HIDDEN and not d.hidden:
+                _draw_decision(
+                    frame, d, debug,
+                    render_mode=render_mode,
+                    show_officials=show_officials,
+                    show_raw_id=show_raw_id,
+                    show_confidence=show_confidence
+                )
         writer.write(frame)
         if write_contact_sheet and f in contact_sample_indices:
             contact_sample_frames.append(frame.copy())

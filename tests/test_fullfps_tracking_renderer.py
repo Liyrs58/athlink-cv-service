@@ -420,7 +420,7 @@ def test_observation_build_drops_officials_and_invalid():
             _player(playerId="P4", rawTrackId=4, identity_valid=True, assignment_source="hungarian"),
         ]),
     ]
-    obs, counters = build_observations(_basic_tracking(frames),
+    obs, counters, _ = build_observations(_basic_tracking(frames),
                                        debug_unknown=False, debug_officials=False)
     # Only PID:P1 should be present.
     assert set(obs.keys()) == {"PID:P1"}

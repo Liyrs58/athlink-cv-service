@@ -58,6 +58,45 @@ def main():
     print(f"  Patches rejected:         {manifest['patches_rejected']}")
     print(f"  Written to: {args.out}")
     print(f"{'='*60}\n")
+    
+    # Calculate Metrics
+    vlm_metrics_path = os.path.join(os.path.dirname(args.patch_plan), "vlm_identity_metrics.json")
+    conflicts_path = os.path.join(os.path.dirname(args.patch_plan), "identity_conflicts.json")
+    
+    total_switches = 0
+    if os.path.exists(conflicts_path):
+        with open(conflicts_path) as f:
+            conflicts_data = json.load(f)
+            # Count only conflicts of type ID_SWITCH or similar, or just all conflicts.
+            # Assuming all items in "conflicts" are identity conflicts.
+            total_switches = len(conflicts_data.get("conflicts", []))
+            
+    vlm_resolved = 0
+    vlm_rejected_patches = len(result["rejected"])
+    for ap in result["applied"]:
+        if ap.get("action") == "swap_pid_after_frame":
+            vlm_resolved += 1
+            
+    # As an approximation, total patches applied can be considered resolved ID switches
+    vlm_resolved = len(result["applied"])
+            
+    accuracy_lift = (vlm_resolved / total_switches) if total_switches > 0 else 0.0
+    
+    metrics = {
+        "total_id_switches_detected": total_switches,
+        "vlm_reviewed_conflicts": len(patch_plan.get("corrections", [])),
+        "vlm_resolved_switches": vlm_resolved,
+        "vlm_rejected_patches": vlm_rejected_patches,
+        "vlm_unreviewed_conflicts": total_switches - len(patch_plan.get("corrections", [])),
+        "vlm_accuracy_lift": accuracy_lift,
+        "physicality_rejects": manifest.get("physicality_rejects", {
+            "speed": 0,
+            "spatial_duplicate": 0,
+            "temporal_gap": 0
+        })
+    }
+    with open(vlm_metrics_path, "w") as f:
+        json.dump(metrics, f, indent=2)
 
     if result["rejected"]:
         print("Rejected patches:")

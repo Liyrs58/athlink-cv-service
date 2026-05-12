@@ -13,23 +13,34 @@ except ImportError:
     HAS_GENAI = False
 
 def main():
-    parser = argparse.ArgumentParser(description="VLM Supervisor (Gemini Free Tier)")
+    parser = argparse.ArgumentParser(description="VLM Supervisor (Multi-Backend)")
     parser.add_argument("--job-id", required=True, help="Job identifier")
     parser.add_argument("--all", action="store_true", help="Review all severities (default is high severity only)")
+    parser.add_argument("--vlm-backend", choices=["gemini", "qwen_local", "gemma_local", "none"], default="gemini",
+                        help="VLM backend to use")
+    parser.add_argument("--severity-routing", action="store_true", 
+                        help="Route severities to different backends (high->gemini/qwen_7b, medium->qwen_3b)")
     args = parser.parse_args()
 
-    if not HAS_GENAI:
-        print("[VLM] Error: google-generativeai or Pillow not installed.")
-        print("      Run: pip install google-generativeai Pillow")
-        sys.exit(1)
+    if args.vlm_backend == "gemini":
+        if not HAS_GENAI:
+            print("[VLM] Error: google-genai or Pillow not installed.")
+            print("      Run: pip install google-genai Pillow")
+            sys.exit(1)
 
-    api_key = os.environ.get("GEMINI_API_KEY")
-    if not api_key:
-        print("[VLM] Error: GEMINI_API_KEY environment variable is not set.")
-        print("      Get a free key from Google AI Studio and set it.")
-        sys.exit(1)
+        api_key = os.environ.get("GEMINI_API_KEY")
+        if not api_key:
+            print("[VLM] Error: GEMINI_API_KEY environment variable is not set.")
+            print("      Get a free key from Google AI Studio and set it.")
+            sys.exit(1)
 
-    client = genai.Client(api_key=api_key)
+        client = genai.Client(api_key=api_key)
+    elif args.vlm_backend == "none":
+        print("[VLM] Backend set to 'none'. Exiting.")
+        sys.exit(0)
+    else:
+        print(f"[VLM] Backend {args.vlm_backend} not fully implemented yet in this script stub.")
+        client = None
 
     casefiles_dir = Path(f"temp/{args.job_id}/vlm_casefiles")
     if not casefiles_dir.exists():
@@ -76,37 +87,64 @@ def main():
         prompt = case_data.get("vlm_prompt", "")
         img = Image.open(contact_sheet_path)
 
-        try:
-            response = client.models.generate_content(
-                model='gemini-2.5-flash',
-                contents=[prompt, img]
-            )
-            text = response.text
+        # Caching logic
+        import hashlib
+        prompt_hash = hashlib.md5(prompt.encode()).hexdigest()
+        cache_key = f"{window_id}_{prompt_hash}_{args.vlm_backend}"
+        cache_path = case_dir / f"vlm_cache_{cache_key}.json"
+        
+        if cache_path.exists():
+            print(f"  -> Cache hit for {window_id}")
+            with open(cache_path) as f:
+                result = json.load(f)
+        else:
+            try:
+                if args.vlm_backend == "gemini" and client:
+                    response = client.models.generate_content(
+                        model='gemini-2.5-flash',
+                        contents=[
+                            prompt + "\n\nProvide your answer ONLY as a JSON object matching this schema: {\"decision\": \"accept_patch | reject_patch | needs_human | no_change\", \"confidence\": 0.0, \"reason_code\": \"string\", \"pid\": \"P13\", \"frame_start\": 0, \"frame_end\": 0, \"recommended_action\": \"reject_revival | split_tracklet | swap_pid_after_frame | no_change\", \"human_review_required\": false}", 
+                            img
+                        ]
+                    )
+                    text = response.text
+                else:
+                    # Mock response for local models not yet implemented
+                    text = '{"decision": "needs_human", "confidence": 0.0, "reason_code": "NOT_IMPLEMENTED"}'
 
-            # Try to extract JSON from response
-            import re
-            json_match = re.search(r'\{.*\}', text, re.DOTALL)
-            if json_match:
-                result = json.loads(json_match.group(0))
-                decision = result.get("decision", "needs_human")
-                print(f"  -> Decision: {decision}")
-                print(f"  -> Summary: {result.get('analyst_summary', '')}")
+                # Try to extract JSON from response
+                import re
+                json_match = re.search(r'\{.*\}', text, re.DOTALL)
+                if json_match:
+                    result = json.loads(json_match.group(0))
+                else:
+                    result = {"decision": "needs_human", "reason_code": "JSON_PARSE_ERROR"}
+                    
+                # Save to cache
+                with open(cache_path, "w") as f:
+                    json.dump(result, f)
+                    
+                # Rate limit for free tier
+                if args.vlm_backend == "gemini":
+                    time.sleep(4)
 
-                # Update patch plan if accepted
-                if decision == "accept_patch" and window_id in corrections_by_window:
-                    corrections_by_window[window_id]["vlm_approved"] = True
-                elif decision == "reject_patch" and window_id in corrections_by_window:
-                    corrections_by_window[window_id]["vlm_approved"] = False
+            except Exception as e:
+                print(f"  -> API Error: {e}")
+                result = {"decision": "VLM_UNREVIEWED", "reason_code": "API_FAILURE"}
+                
+        decision = result.get("decision", "VLM_UNREVIEWED")
+        print(f"  -> Decision: {decision}")
+        
+        # Update patch plan if accepted
+        if decision == "accept_patch" and window_id in corrections_by_window:
+            corrections_by_window[window_id]["vlm_approved"] = True
+        elif decision == "reject_patch" and window_id in corrections_by_window:
+            corrections_by_window[window_id]["vlm_approved"] = False
+        elif decision == "VLM_UNREVIEWED" and window_id in corrections_by_window:
+            # Leave it as unreviewed, don't crash
+            corrections_by_window[window_id]["vlm_approved"] = None
 
-            else:
-                print(f"  -> Failed to parse JSON from VLM response: {text[:100]}...")
-
-        except Exception as e:
-            print(f"  -> API Error: {e}")
-            
         reviewed_count += 1
-        # Respect the 15 RPM free tier limit
-        time.sleep(4)
 
     # Save updated patch plan
     patch_plan["corrections"] = list(corrections_by_window.values())

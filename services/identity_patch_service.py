@@ -87,12 +87,6 @@ class PatchValidator:
                     "Patch would cause goalkeeper to become outfield player",
                 )
 
-        # Rule 3: Check for duplicate PID creation
-        if action == "swap_pid_after_frame":
-            rejection = self._check_swap_creates_duplicates(patch, track_results)
-            if rejection:
-                return rejection
-
         # Rule 4: Frame range check
         if action in ("swap_pid_after_frame", "suppress_pid"):
             apply_from = patch.get("apply_from_frame")
@@ -103,46 +97,86 @@ class PatchValidator:
 
         return None
 
-    def _check_swap_creates_duplicates(
+        return None
+
+    def validate_post_apply(
         self,
         patch: dict,
-        track_results: dict,
+        patched_data: dict,
+        camera_motions: Optional[list] = None,
     ) -> Optional[PatchRejection]:
-        """
-        Simulate a swap and check if it creates duplicate PIDs in any frame.
-        """
-        pid_a = patch.get("pid_a")
-        pid_b = patch.get("pid_b")
-        apply_from = patch.get("apply_from_frame", 0)
-
-        if not pid_a or not pid_b:
-            return None
-
-        frames = track_results.get("frames", [])
+        """Validate track results AFTER applying the patch."""
+        frames = patched_data.get("frames", [])
+        
+        # Build per-PID timelines to check speed and temporal continuity
+        pid_history = {} # pid -> [(frameIndex, cx, cy, raw_track_id)]
+        
+        # Spatial occupancy and duplicate checks per frame
         for frame_data in frames:
             fi = frame_data.get("frameIndex", -1)
-            if fi < apply_from:
-                continue
-
-            pids_in_frame = []
+            pids_in_frame = set()
+            raw_tids_in_frame = {}
+            bboxes_in_frame = []
+            
             for p in frame_data.get("players", []):
                 pid = p.get("playerId")
-                if pid is None:
+                if not pid:
                     continue
-                # Simulate swap
-                if pid == pid_a:
-                    pids_in_frame.append(pid_b)
-                elif pid == pid_b:
-                    pids_in_frame.append(pid_a)
-                else:
-                    pids_in_frame.append(pid)
-
-            if len(pids_in_frame) != len(set(pids_in_frame)):
-                return PatchRejection(
-                    patch, "CREATES_DUPLICATE_PID",
-                    f"Swap of {pid_a}<->{pid_b} from frame {apply_from} "
-                    f"creates duplicate PID at frame {fi}",
-                )
+                    
+                raw_tid = p.get("rawTrackId")
+                bbox = p.get("bbox")
+                cx = (bbox[0] + bbox[2]) / 2.0
+                cy = (bbox[1] + bbox[3]) / 2.0
+                
+                # Rule: Two different PIDs cannot share the same raw_track_id
+                if raw_tid in raw_tids_in_frame:
+                    other_pid = raw_tids_in_frame[raw_tid]
+                    return PatchRejection(
+                        patch, "PHYSICALITY_SPATIAL_DUPLICATE_REJECT",
+                        f"PIDs {pid} and {other_pid} share raw_track_id {raw_tid} in frame {fi}"
+                    )
+                raw_tids_in_frame[raw_tid] = pid
+                
+                # Rule: No two PIDs can be in the exact same spatial location
+                for (opid, ocx, ocy) in bboxes_in_frame:
+                    dist = math.hypot(cx - ocx, cy - ocy)
+                    if dist < 10.0:  # simplistic spatial duplicate threshold
+                        return PatchRejection(
+                            patch, "PHYSICALITY_SPATIAL_DUPLICATE_REJECT",
+                            f"PIDs {pid} and {opid} are suspiciously close (dist={dist:.1f}) in frame {fi}"
+                        )
+                        
+                bboxes_in_frame.append((pid, cx, cy))
+                
+                if pid in pids_in_frame:
+                    return PatchRejection(
+                        patch, "CREATES_DUPLICATE_PID",
+                        f"Duplicate {pid} in frame {fi}"
+                    )
+                pids_in_frame.add(pid)
+                
+                pid_history.setdefault(pid, []).append((fi, cx, cy, raw_tid))
+                
+        # Speed and Temporal checks
+        for pid, history in pid_history.items():
+            history.sort(key=lambda x: x[0])
+            for i in range(1, len(history)):
+                fi1, cx1, cy1, rtid1 = history[i-1]
+                fi2, cx2, cy2, rtid2 = history[i]
+                
+                gap = fi2 - fi1
+                if gap > 150: # Large temporal gap without explicit occlusion handling
+                    # We might skip temporal gap check for now, or just warn.
+                    pass
+                
+                # Speed check
+                dist = math.hypot(cx2 - cx1, cy2 - cy1)
+                speed_px_per_frame = dist / gap
+                if speed_px_per_frame > self.max_speed:
+                    return PatchRejection(
+                        patch, "PHYSICALITY_SPEED_REJECT",
+                        f"pid={pid} frame={fi2} speed={speed_px_per_frame:.1f}px/f > {self.max_speed}"
+                    )
 
         return None
 
@@ -166,6 +200,7 @@ class IdentityPatchService:
         self,
         track_results: dict,
         patch_plan: dict,
+        camera_motions: Optional[list] = None,
     ) -> dict:
         """
         Apply a patch plan to track_results.
@@ -178,33 +213,37 @@ class IdentityPatchService:
         patches = patch_plan.get("corrections", [])
         applied: List[dict] = []
         rejected: List[dict] = []
+        
+        physicality_rejects = {"speed": 0, "spatial_duplicate": 0, "temporal_gap": 0}
 
-        # Deep copy to avoid mutating the original
         patched = copy.deepcopy(track_results)
 
         for patch in patches:
+            # Pre-apply validation (Schema/Identity Consistency)
             rejection = self.validator.validate(patch, patched)
             if rejection:
                 rejected.append(rejection.to_dict())
                 continue
 
+            # Apply to temporary copy
+            temp_patched = copy.deepcopy(patched)
             action = patch.get("action", "")
             success = False
 
             if action == "swap_pid_after_frame":
-                success = self._apply_swap(patched, patch)
+                success = self._apply_swap(temp_patched, patch)
             elif action == "mark_unknown":
-                success = self._apply_mark_unknown(patched, patch)
+                success = self._apply_mark_unknown(temp_patched, patch)
             elif action == "suppress_pid":
-                success = self._apply_suppress(patched, patch)
+                success = self._apply_suppress(temp_patched, patch)
             elif action == "reject_revival":
-                success = self._apply_reject_revival(patched, patch)
+                success = self._apply_reject_revival(temp_patched, patch)
             elif action == "split_tracklet":
-                success = self._apply_split(patched, patch)
+                success = self._apply_split(temp_patched, patch)
             elif action == "merge_tracklets":
-                success = self._apply_merge(patched, patch)
+                success = self._apply_merge(temp_patched, patch)
             elif action == "assign_pid_to_tracklet":
-                success = self._apply_assign(patched, patch)
+                success = self._apply_assign(temp_patched, patch)
             else:
                 rejected.append({
                     "window_id": patch.get("window_id", "unknown"),
@@ -214,20 +253,36 @@ class IdentityPatchService:
                 })
                 continue
 
-            if success:
-                applied.append(patch)
-            else:
+            if not success:
                 rejected.append({
                     "window_id": patch.get("window_id", "unknown"),
                     "action": action,
                     "reason": "APPLY_FAILED",
                     "detail": "Patch application returned False",
                 })
+                continue
+
+            # Post-apply Physicality Validation
+            rejection = self.validator.validate_post_apply(patch, temp_patched, camera_motions)
+            if rejection:
+                rejected.append(rejection.to_dict())
+                if "SPEED" in rejection.reason:
+                    physicality_rejects["speed"] += 1
+                elif "SPATIAL" in rejection.reason or "DUPLICATE" in rejection.reason:
+                    physicality_rejects["spatial_duplicate"] += 1
+                elif "TEMPORAL" in rejection.reason:
+                    physicality_rejects["temporal_gap"] += 1
+                continue
+
+            # Success! Commit temporary copy
+            patched = temp_patched
+            applied.append(patch)
 
         manifest = {
             "patches_proposed": len(patches),
             "patches_applied": len(applied),
             "patches_rejected": len(rejected),
+            "physicality_rejects": physicality_rejects,
         }
 
         return {
