@@ -2,6 +2,7 @@ import argparse
 import json
 import os
 import sys
+import time
 from pathlib import Path
 
 try:
@@ -99,6 +100,8 @@ def main():
             print(f"  -> API Error: {e}")
             
         reviewed_count += 1
+        # Respect the 15 RPM free tier limit
+        time.sleep(4)
 
     # Save updated patch plan
     patch_plan["corrections"] = list(corrections_by_window.values())
