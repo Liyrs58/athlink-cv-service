@@ -1042,7 +1042,7 @@ def render_video(
 
         frame_decisions = decisions[f] if f < len(decisions) else []
         for d in frame_decisions:
-            if d.state != RenderState.HIDDEN and not d.hidden:
+            if d.state != RenderState.HIDDEN:
                 _draw_decision(
                     frame, d, debug,
                     render_mode=render_mode,
