@@ -1272,6 +1272,12 @@ class IdentityCore:
             if t_team is not None:
                 slot.team_id = t_team
 
+    def get_slot(self, pid: str) -> Optional[PlayerSlot]:
+        """Public PID slot lookup used by tracker/export code."""
+        if pid is None:
+            return None
+        return self._slot_by_pid(pid)
+
     def _slot_by_pid(self, pid: str) -> Optional[PlayerSlot]:
         for s in self.slots:
             if s.pid == pid:
