@@ -621,10 +621,20 @@ class IdentityCore:
                     print(f"[StreakDiag] frame={self.frame_id} tid={tid} pid={slot.pid} cost={cst:.3f} streak={slot.pending_streak}/{LOCK_PROMOTE_FRAMES} seq={slot.pending_seen_seq}=={self.identity_frame_seq-1}? threshold={LOW_CONFIDENCE_THRESHOLD:.2f}")
 
                 # Try lock promotion if streak is ready and cost is good
-                lock_ready = slot.pending_streak >= LOCK_PROMOTE_FRAMES
-                cost_ok = cst <= LOW_CONFIDENCE_THRESHOLD
+                # Congestion guard: in dense scenes (>15 active tracks), require
+                # stronger evidence before promoting to a lock
+                n_active_locks = len(self.locks.locked_tids())
+                is_congested = n_active_locks >= 15 or len(tracks) >= 18
+                
+                effective_lock_frames = LOCK_PROMOTE_FRAMES + (3 if is_congested else 0)
+                effective_cost_threshold = LOW_CONFIDENCE_THRESHOLD - (0.10 if is_congested else 0)
+                
+                lock_ready = slot.pending_streak >= effective_lock_frames
+                cost_ok = cst <= effective_cost_threshold
                 if self.frame_id % self.debug_every == 0 and (lock_ready or cost_ok):
-                    print(f"[LockAttempt] frame={self.frame_id} tid={tid} pid={slot.pid} cost={cst:.3f} streak={slot.pending_streak} ready={lock_ready} cost_ok={cost_ok}")
+                    print(f"[LockAttempt] frame={self.frame_id} tid={tid} pid={slot.pid} cost={cst:.3f} "
+                          f"streak={slot.pending_streak}/{effective_lock_frames} ready={lock_ready} "
+                          f"cost_ok={cost_ok} congested={is_congested} active_locks={n_active_locks}")
 
                 if lock_ready and cost_ok:
                     # Pan-safe gate: restrict new locks/rebinds/takeovers during fast_pan/cut

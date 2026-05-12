@@ -61,10 +61,12 @@ class HideReason(str, Enum):
     GAP_TOO_LARGE = "GAP_TOO_LARGE"
     DUPLICATE_PID_SUPPRESSED = "DUPLICATE_PID_SUPPRESSED"
     REFEREE_SUPPRESSED = "REFEREE_SUPPRESSED"
+    OFFICIAL_SUPPRESSION = "OFFICIAL_SUPPRESSION"
     UNKNOWN_SUPPRESSED = "UNKNOWN_SUPPRESSED"
     PAN_LABEL_FREEZE = "PAN_LABEL_FREEZE"
     IMPLAUSIBLE_MOTION = "IMPLAUSIBLE_MOTION"
     EMPTY_BBOX = "EMPTY_BBOX"
+    PREDICTED_SUPPRESSED = "PREDICTED_SUPPRESSED"
 
 
 # ---- Dataclasses ---------------------------------------------------------------
@@ -864,6 +866,7 @@ def _draw_decision(
     show_confidence: bool = False,
     audit_verbose: bool = False,
     audit_focus: Optional[list[str]] = None,
+    show_predicted: bool = False,
 ) -> None:
     if d.bbox is None:
         return
@@ -894,6 +897,10 @@ def _draw_decision(
     
     else: # audit or casefile
         if d.is_official and not show_officials:
+            return
+
+        # In audit mode, hide interpolated/held (predicted) boxes unless requested
+        if not show_predicted and d.state in (RenderState.INTERPOLATED, RenderState.HELD):
             return
             
         dimmed = False
@@ -1020,6 +1027,7 @@ def render_video(
     show_confidence: bool = False,
     audit_verbose: bool = False,
     audit_focus: Optional[list[str]] = None,
+    show_predicted: bool = False,
 ) -> dict:
     """Run the full renderer. Returns the manifest dict."""
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
@@ -1103,6 +1111,7 @@ def render_video(
                     show_confidence=show_confidence,
                     audit_verbose=audit_verbose,
                     audit_focus=audit_focus,
+                    show_predicted=show_predicted,
                 )
         writer.write(frame)
         if write_contact_sheet and f in contact_sample_indices:
@@ -1117,6 +1126,15 @@ def render_video(
     writer.release()
     cap.release()
     print(f"[Renderer] wrote {rendered_count} frames in {time.time() - t0:.1f}s -> {output_path}")
+
+    # Hard render guard: fail if rendered frames < 90% of source
+    if total_raw_frames > 0 and rendered_count < total_raw_frames * 0.90:
+        msg = (f"[Renderer] RENDER TRUNCATION: rendered {rendered_count}/{total_raw_frames} frames "
+               f"({rendered_count/total_raw_frames:.1%}). This is below the 90% threshold. "
+               f"The output video is incomplete.")
+        print(msg)
+        if strict:
+            raise RuntimeError(msg)
 
     manifest = build_manifest(
         decisions=decisions,

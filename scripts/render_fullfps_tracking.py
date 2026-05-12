@@ -49,6 +49,8 @@ def parse_args() -> argparse.Namespace:
                    help="Use verbose labels instead of compact labels in audit mode")
     p.add_argument("--audit-focus", type=str,
                    help="Comma-separated list of PIDs to focus on (e.g. P1,P2). Others will be dimmed.")
+    p.add_argument("--show-predicted", action="store_true",
+                   help="In audit mode, show interpolated/held (predicted) boxes. Default: only real detections.")
     return p.parse_args()
 
 
@@ -85,6 +87,7 @@ def main() -> int:
         show_confidence=args.show_confidence,
         audit_verbose=args.audit_verbose,
         audit_focus=args.audit_focus.split(",") if args.audit_focus else None,
+        show_predicted=args.show_predicted,
     )
 
     print("=" * 60)

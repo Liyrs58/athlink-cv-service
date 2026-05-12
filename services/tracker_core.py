@@ -75,14 +75,23 @@ class ReIDExtractor:
             print(f"[ReID] OSNet weights not found at {self.OSNET_PATH} — attempting to download...")
             import urllib.request
             os.makedirs(os.path.dirname(self.OSNET_PATH), exist_ok=True)
-            try:
-                urllib.request.urlretrieve(
-                    "https://huggingface.co/kaiyangzhou/osnet/resolve/main/osnet_x1_0_msmt17.pt", 
-                    self.OSNET_PATH
-                )
-                print(f"[ReID] Successfully downloaded OSNet weights to {self.OSNET_PATH}")
-            except Exception as e:
-                print(f"[ReID] Failed to download OSNet weights: {e}")
+            # Multiple fallback URLs for the MSMT17-trained OSNet x1.0 weights
+            osnet_urls = [
+                "https://huggingface.co/kaiyangzhou/osnet/resolve/main/osnet_x1_0_msmt17_combineall_256x128_amsgrad_ep150_stp60_lr0.0015_b64_fb10_softmax_labelsmooth_flip_jitter.pth",
+                "https://huggingface.co/kaiyangzhou/osnet/resolve/main/osnet_x1_0_imagenet.pth",
+            ]
+            downloaded = False
+            for url in osnet_urls:
+                try:
+                    print(f"[ReID] Trying: {url.split('/')[-1]}")
+                    urllib.request.urlretrieve(url, self.OSNET_PATH)
+                    print(f"[ReID] Successfully downloaded OSNet weights to {self.OSNET_PATH}")
+                    downloaded = True
+                    break
+                except Exception as e:
+                    print(f"[ReID] Download failed from {url}: {e}")
+            if not downloaded:
+                print("[ReID] All OSNet download URLs failed.")
                 return
         try:
             import torchreid
@@ -954,7 +963,7 @@ class TrackerCore:
                     "analysis_valid": True,
                     "crop_quality": 1.0,
                     "identity_valid": False,
-                    "assignment_source": "locked",
+                    "assignment_source": "official",
                     "identity_confidence": 0.0,
                     "team_id": None,
                     "team_confidence": 0.0,
@@ -963,7 +972,7 @@ class TrackerCore:
                     "consensus": "CONFIRMED",
                 }
                 officials_list.append(ofc_obj)
-                players.append(ofc_obj)
+                # Officials are NEVER added to players list to prevent identity leakage
 
             ball_list = []
             last_ball = getattr(self, "_last_ball_det", None)
