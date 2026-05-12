@@ -147,3 +147,65 @@ def test_absent_stable_lock_can_relink_to_tracker_fragment(monkeypatch):
     assert meta[99].pid == "P1"
     assert saw_revived
     assert identity.revived_count >= 1
+
+
+class TestOfficialGateRegression:
+    """Regression: referee/official must never receive a player P-ID."""
+
+    def _make_track(self, tid: int):
+        class T:
+            track_id = tid
+            time_since_update = 0
+        return T()
+
+    def test_suspected_official_cannot_receive_P13(self):
+        """Exact regression for the observed P13 referee bug."""
+        import numpy as np
+        from services.identity_core import IdentityCore
+
+        identity = IdentityCore()
+        emb = np.random.randn(512).astype(np.float32)
+        emb /= np.linalg.norm(emb)
+
+        for frame in range(10):
+            identity.begin_frame(frame, present_tids={45})
+            track_to_pid, meta = identity.assign_tracks(
+                tracks=[self._make_track(45)],
+                embeddings={45: emb},
+                positions={45: (800.0, 400.0)},
+                allow_new_assignments=True,
+                official_tids={45},
+            )
+            identity.end_frame()
+
+            assert track_to_pid.get(45) is None, \
+                f"Frame {frame}: official tid=45 must not receive P-ID, got {track_to_pid.get(45)}"
+            assert meta[45].source == "official_blocked", \
+                f"Frame {frame}: source must be 'official_blocked', got {meta[45].source}"
+
+        assert identity.official_pid_blocks == 10, \
+            f"Expected 10 blocks over 10 frames, got {identity.official_pid_blocks}"
+
+    def test_official_cannot_steal_pid_from_player(self):
+        """If P5 was locked to tid=10 and tid=10 is re-classified as official, P5 must not emit."""
+        import numpy as np
+        from services.identity_core import IdentityCore
+
+        identity = IdentityCore()
+        identity.locks.try_create_lock(10, "P5", "hungarian", frame_id=0)
+
+        emb = np.random.randn(512).astype(np.float32)
+        emb /= np.linalg.norm(emb)
+
+        identity.begin_frame(1, present_tids={10})
+        track_to_pid, meta = identity.assign_tracks(
+            tracks=[self._make_track(10)],
+            embeddings={10: emb},
+            positions={10: (200.0, 300.0)},
+            allow_new_assignments=True,
+            official_tids={10},
+        )
+        identity.end_frame()
+
+        assert track_to_pid.get(10) is None, "P5 must not emit when tid=10 is official"
+        assert meta[10].source == "official_blocked"
