@@ -189,12 +189,14 @@ class IdentityCore:
     def __init__(self, logger=None, debug_every: int = 30):
         self.logger = logger
         self.debug_every = debug_every
+        self.MAX_SLOTS = int(os.environ.get("ATHLINK_MAX_PLAYER_SLOTS", "22"))
+        self.ALLOW_NEW_SLOTS = os.environ.get("ATHLINK_ALLOW_NEW_PLAYER_SLOTS", "1") == "1"
         self.slots: List[PlayerSlot] = [
-            PlayerSlot(pid=f"P{i}") for i in range(1, MAX_SLOTS + 1)
+            PlayerSlot(pid=f"P{i}") for i in range(1, self.MAX_SLOTS + 1)
         ]
         self.max_player_slots = max(
             1,
-            min(MAX_SLOTS, _env_int("ATHLINK_MAX_PLAYER_SLOTS", DEFAULT_PLAYER_SLOT_CAP)),
+            min(self.MAX_SLOTS, _env_int("ATHLINK_MAX_PLAYER_SLOTS", DEFAULT_PLAYER_SLOT_CAP)),
         )
         self.allow_extended_player_slots = _env_bool("ATHLINK_ALLOW_NEW_PLAYER_SLOTS", False)
         print("[ReID] using HSV fallback only for appearance matching")
@@ -478,7 +480,7 @@ class IdentityCore:
             allow_new_assignments = False
 
         if len(tracks) == 0:
-            self.unmatched_slots = MAX_SLOTS
+            self.unmatched_slots = self.MAX_SLOTS
             return {}, {}
 
         # ── Step 1: locked pairs always pass through ─────────────────────
@@ -1272,6 +1274,19 @@ class IdentityCore:
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+
+    def _create_slot(self, team_id=None, role="player") -> Optional[PlayerSlot]:
+        """Create a new PID slot if capacity allows."""
+        if not self.ALLOW_NEW_SLOTS:
+            return None
+        if len(self.slots) >= self.MAX_SLOTS:
+            return None
+        
+        pid = f"P{len(self.slots) + 1}"
+        slot = PlayerSlot(pid=pid)
+        slot.team_id = team_id
+        self.slots.append(slot)
+        return slot
 
     def _activate_slot(
         self,
