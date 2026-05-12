@@ -26,7 +26,7 @@ import numpy as np
 
 PAN_LABEL_FREEZE_FRAMES = 5
 MAX_INTERP_GAP_RAW_FRAMES = 8
-MAX_HOLD_RAW_FRAMES = 4
+MAX_HOLD_RAW_FRAMES = 15
 MAX_CENTER_JUMP_PX = 140.0
 MIN_BOX_AREA = 80.0
 
@@ -306,6 +306,7 @@ def raw_motion_class_counts(motions: list[dict], total_raw_frames: int) -> dict[
 
 def build_observations(
     tracking_results: dict,
+    frame_dims: tuple[int, int] | None = None,
     debug_unknown: bool = False,
     debug_officials: bool = False,
 ) -> tuple[dict[str, list[TrackObservation]], dict[str, Any]]:
@@ -340,13 +341,21 @@ def build_observations(
             else:
                 counters["identity_sources_rendered"][source or "unknown"] += 1
 
+            raw_bbox = [float(v) for v in player.get("bbox", [0.0, 0.0, 0.0, 0.0])]
+            if frame_dims is not None:
+                w, h = frame_dims
+                raw_bbox[0] = max(0.0, min(float(w), raw_bbox[0]))
+                raw_bbox[1] = max(0.0, min(float(h), raw_bbox[1]))
+                raw_bbox[2] = max(0.0, min(float(w), raw_bbox[2]))
+                raw_bbox[3] = max(0.0, min(float(h), raw_bbox[3]))
+            
             obs_by_key[key].append(
                 TrackObservation(
                     raw_frame_idx=raw_idx,
                     entity_key=key,
                     pid=(player.get("playerId") or player.get("displayId")) if key.startswith("PID:") else None,
                     tid=_player_tid(player),
-                    bbox=[float(v) for v in player.get("bbox", [0.0, 0.0, 0.0, 0.0])],
+                    bbox=raw_bbox,
                     team_id=int(player.get("team_id", -1)),
                     identity_valid=bool(player.get("identity_valid")),
                     assignment_source=source,
@@ -456,7 +465,7 @@ def render_frames(
     RenderDecision objects for that frame (including hidden ones for QA).
     """
     obs_by_key, _counters = build_observations(
-        tracking_results, debug_unknown=debug_unknown, debug_officials=debug_officials
+        tracking_results, frame_dims=frame_dims, debug_unknown=debug_unknown, debug_officials=debug_officials
     )
     offsets = build_cumulative_offset(motions, total_raw_frames)
     cut_frames = build_cut_segments(motions)
@@ -923,6 +932,7 @@ def render_video(
     # so we have a single source of truth.
     obs_by_key, counters = build_observations(
         tracking_results,
+        frame_dims=(width, height),
         debug_unknown=debug_unknown,
         debug_officials=debug_officials,
     )
