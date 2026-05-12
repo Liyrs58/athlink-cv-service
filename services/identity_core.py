@@ -271,6 +271,83 @@ class CongestionDetector:
         }
 
 
+# ── Physicality validator configuration ──────────────────────────────
+_MAX_PIXEL_JUMP_PER_SEC  = float(os.environ.get("ATHLINK_MAX_PIXEL_JUMP_PER_SEC", "650"))
+_MAX_RELINK_PIXEL_JUMP   = float(os.environ.get("ATHLINK_MAX_RELINK_PIXEL_JUMP", "450"))
+_MIN_PATCH_DISTANCE_PX   = float(os.environ.get("ATHLINK_MIN_PATCH_DISTANCE_PX", "24"))
+_REJECT_OFFICIAL_PID     = int(os.environ.get("ATHLINK_REJECT_OFFICIAL_PID", "1")) == 1
+
+
+def check_physicality(
+    pid: str,
+    candidate_center: Tuple[float, float],
+    candidate_team: Optional[int],
+    current_frame: int,
+    last_center: Optional[Tuple[float, float]],
+    last_frame: Optional[int],
+    last_team: Optional[int],
+    is_official: bool = False,
+    all_current_pids: Optional[Dict[str, Tuple[float, float]]] = None,
+    fps: float = 30.0,
+    frame_stride: int = 1,
+    max_speed_px_per_sec: float = _MAX_PIXEL_JUMP_PER_SEC,
+    max_relink_pixel_jump: float = _MAX_RELINK_PIXEL_JUMP,
+    min_patch_distance_px: float = _MIN_PATCH_DISTANCE_PX,
+    reject_official_pid: bool = _REJECT_OFFICIAL_PID,
+) -> Tuple[bool, str, str]:
+    """
+    Validate a proposed PID assignment for physical plausibility.
+    Returns (ok, reject_reason_code, detail_message).
+    Reject codes: OFFICIAL_PID | IMPOSSIBLE_SPEED | IMPOSSIBLE_PIXEL_JUMP
+                  | TEAM_FLIP | DOUBLE_OCCUPANCY
+    """
+    # 1. Official/referee must not receive player PID
+    if reject_official_pid and is_official:
+        return False, "OFFICIAL_PID", f"pid={pid} is_official=True"
+
+    # 2. Team flip check
+    if last_team is not None and candidate_team is not None:
+        if last_team != candidate_team:
+            return False, "TEAM_FLIP", (
+                f"pid={pid} last_team={last_team} candidate_team={candidate_team}"
+            )
+
+    # 3. Speed / pixel jump check
+    if last_center is not None and last_frame is not None:
+        cx, cy = candidate_center
+        lx, ly = last_center
+        dist = ((cx - lx) ** 2 + (cy - ly) ** 2) ** 0.5
+        frame_gap = max(1, current_frame - last_frame)
+        elapsed_sec = (frame_gap * frame_stride) / max(fps, 1.0)
+
+        if elapsed_sec > 0:
+            speed_px_per_sec = dist / elapsed_sec
+            if speed_px_per_sec > max_speed_px_per_sec:
+                return False, "IMPOSSIBLE_SPEED", (
+                    f"pid={pid} dist={dist:.1f}px gap={frame_gap}f "
+                    f"speed={speed_px_per_sec:.1f}px/s > max={max_speed_px_per_sec}"
+                )
+
+        # Relink-specific: large absolute jump even if speed threshold would pass
+        if frame_gap > 1 and dist > max_relink_pixel_jump:
+            return False, "IMPOSSIBLE_PIXEL_JUMP", (
+                f"pid={pid} dist={dist:.1f}px > max_relink={max_relink_pixel_jump} gap={frame_gap}f"
+            )
+
+    # 4. Double occupancy — same PID already assigned this frame
+    if all_current_pids and pid in all_current_pids:
+        existing_center = all_current_pids[pid]
+        ex, ey = existing_center
+        cx, cy = candidate_center
+        dist = ((cx - ex) ** 2 + (cy - ey) ** 2) ** 0.5
+        if dist < min_patch_distance_px:
+            return False, "DOUBLE_OCCUPANCY", (
+                f"pid={pid} already at ({ex:.0f},{ey:.0f}) new=({cx:.0f},{cy:.0f}) dist={dist:.1f}"
+            )
+
+    return True, "", ""
+
+
 def _edge_for_center(cx: float, cy: float, fw: int, fh: int, margin: int) -> str:
     """Return the nearest frame edge name, or 'interior' if not near any edge."""
     if cx < margin:
@@ -458,6 +535,8 @@ class IdentityCore:
         # Congestion detector
         self.congestion_detector = CongestionDetector()
         self.cluster_freeze_blocks: int = 0
+        self.physicality_rejects: int = 0
+        self.physicality_reject_reasons: Dict[str, int] = {}
 
     # ------------------------------------------------------------------
     # Single source of truth for restricted identity mode

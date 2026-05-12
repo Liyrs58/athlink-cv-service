@@ -443,3 +443,74 @@ class TestClusterFreeze:
         assert track_to_pid.get(21) != "P6", \
             "P6 must not revive to cluster-congested winger TID"
         assert identity.cluster_freeze_blocks >= 1
+
+
+class TestPhysicalityValidator:
+    """check_physicality rejects impossible assignments."""
+
+    def test_official_pid_rejected(self):
+        from services.identity_core import check_physicality
+        ok, code, detail = check_physicality(
+            pid="P13", candidate_center=(800.0, 400.0), candidate_team=None,
+            current_frame=10, last_center=None, last_frame=None, last_team=None,
+            is_official=True,
+        )
+        assert not ok
+        assert code == "OFFICIAL_PID"
+
+    def test_impossible_pixel_jump_rejected(self):
+        from services.identity_core import check_physicality
+        ok, code, detail = check_physicality(
+            pid="P6", candidate_center=(1800.0, 400.0), candidate_team=0,
+            current_frame=11, last_center=(100.0, 400.0), last_frame=10,
+            last_team=0, fps=30.0, frame_stride=1, max_speed_px_per_sec=650.0,
+        )
+        assert not ok, f"1700px jump in 1 frame must be rejected; got ok={ok}"
+        assert code in ("IMPOSSIBLE_SPEED", "IMPOSSIBLE_PIXEL_JUMP")
+
+    def test_team_flip_rejected(self):
+        from services.identity_core import check_physicality
+        ok, code, detail = check_physicality(
+            pid="P10", candidate_center=(500.0, 300.0), candidate_team=1,
+            current_frame=50, last_center=(510.0, 305.0), last_frame=49, last_team=0,
+        )
+        assert not ok, "Team flip must be rejected"
+        assert code == "TEAM_FLIP"
+
+    def test_plausible_assignment_accepted(self):
+        from services.identity_core import check_physicality
+        ok, code, detail = check_physicality(
+            pid="P5", candidate_center=(310.0, 405.0), candidate_team=0,
+            current_frame=11, last_center=(300.0, 400.0), last_frame=10,
+            last_team=0, fps=30.0, frame_stride=1,
+        )
+        assert ok, f"Plausible assignment must pass; code={code}"
+
+    def test_double_occupancy_rejected(self):
+        from services.identity_core import check_physicality
+        ok, code, detail = check_physicality(
+            pid="P3", candidate_center=(500.0, 300.0), candidate_team=0,
+            current_frame=20, last_center=None, last_frame=None, last_team=None,
+            all_current_pids={"P3": (500.0, 300.0)},
+        )
+        assert not ok
+        assert code == "DOUBLE_OCCUPANCY"
+
+    def test_p10_team_flip_rejected(self):
+        from services.identity_core import check_physicality
+        ok, code, detail = check_physicality(
+            pid="P10", candidate_center=(600.0, 350.0), candidate_team=1,
+            current_frame=90, last_center=(590.0, 340.0), last_frame=85, last_team=0,
+        )
+        assert not ok
+        assert code == "TEAM_FLIP"
+
+    def test_p11_impossible_winger_jump_rejected(self):
+        from services.identity_core import check_physicality
+        ok, code, detail = check_physicality(
+            pid="P11", candidate_center=(100.0, 300.0), candidate_team=0,
+            current_frame=341, last_center=(960.0, 540.0), last_frame=340,
+            fps=30.0, frame_stride=1, max_speed_px_per_sec=650.0, last_team=0,
+        )
+        assert not ok
+        assert code in ("IMPOSSIBLE_SPEED", "IMPOSSIBLE_PIXEL_JUMP")
