@@ -553,6 +553,39 @@ class IdentityCore:
             return False
         return lock.stable_count < 30
 
+    def _physcheck(
+        self,
+        pid: str,
+        tid: int,
+        candidate_center: Optional[Tuple[float, float]],
+        candidate_team: Optional[int],
+        last_center: Optional[Tuple[float, float]],
+        last_frame: Optional[int],
+        last_team: Optional[int],
+        is_official: bool = False,
+        all_current_pids: Optional[Dict[str, Tuple[float, float]]] = None,
+    ) -> Tuple[bool, str]:
+        """Call check_physicality and update self metrics."""
+        ok, code, detail = check_physicality(
+            pid=pid,
+            candidate_center=candidate_center or (0.0, 0.0),
+            candidate_team=candidate_team,
+            current_frame=self.frame_id,
+            last_center=last_center,
+            last_frame=last_frame,
+            last_team=last_team,
+            is_official=is_official,
+            all_current_pids=all_current_pids,
+        )
+        if not ok:
+            self.physicality_rejects += 1
+            self.physicality_reject_reasons[code] = (
+                self.physicality_reject_reasons.get(code, 0) + 1
+            )
+            print(f"[PhysReject] frame={self.frame_id} tid={tid} pid={pid} "
+                  f"code={code} detail={detail}")
+        return ok, code
+
     def _relink_absent_existing_lock(self, pid: str, old_tid: Optional[int], new_tid: int,
                                      source: str, cost: float) -> bool:
         """Relink a reserved PID when its previous tracker id is absent from this frame."""
@@ -851,6 +884,25 @@ class IdentityCore:
             slot = self._slot_by_pid(pid)
             if slot is None:
                 self.locks.release_lock(tid, reason="bad_pid", frame_id=self.frame_id)
+                unlocked_tracks.append(tr)
+                continue
+
+            # Physicality check on locked pair
+            _pos_now = positions.get(tid)
+            _phys_ok, _phys_code = self._physcheck(
+                pid=pid, tid=tid,
+                candidate_center=_pos_now,
+                candidate_team=getattr(slot, 'team_id', None),
+                last_center=slot.last_position,
+                last_frame=slot.last_seen_frame,
+                last_team=getattr(slot, 'team_id', None),
+            )
+            if not _phys_ok:
+                meta_map[tid] = AssignmentMeta(
+                    pid=None, source="physicality_rejected",
+                    identity_state=IdentityState.UNKNOWN,
+                    confidence=0.0, identity_valid=False,
+                )
                 unlocked_tracks.append(tr)
                 continue
 
@@ -2051,6 +2103,9 @@ class IdentityCore:
         print(f"  pan_ttl_extensions                = {self.pan_ttl_extensions}")
         print(f"  official_pid_blocks               = {self.official_pid_blocks}")
         print(f"  cluster_freeze_blocks             = {self.cluster_freeze_blocks}")
+        print(f"  physicality_rejects          = {self.physicality_rejects}")
+        for code, cnt in sorted(self.physicality_reject_reasons.items()):
+            print(f"    {code}: {cnt}")
         print(f"\n[ShadowGateMetrics]")
         print(f"  shadow_relink_attempts       = {self.shadow_relink_attempts}")
         print(f"  shadow_relink_accepted       = {self.shadow_relink_accepted}")
@@ -2091,4 +2146,6 @@ class IdentityCore:
             "shadow_relink_attempts": self.shadow_relink_attempts,
             "shadow_relink_accepted": self.shadow_relink_accepted,
             "shadow_relink_rejected": self.shadow_relink_rejected,
+            "physicality_rejects": self.physicality_rejects,
+            "physicality_reject_reasons": dict(self.physicality_reject_reasons),
         }

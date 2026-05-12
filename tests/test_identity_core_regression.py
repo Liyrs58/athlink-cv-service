@@ -514,3 +514,45 @@ class TestPhysicalityValidator:
         )
         assert not ok
         assert code in ("IMPOSSIBLE_SPEED", "IMPOSSIBLE_PIXEL_JUMP")
+
+
+class TestPhysicalityWired:
+    """check_physicality is wired into assign_tracks."""
+
+    def _make_track(self, tid):
+        class T:
+            track_id = tid
+            time_since_update = 0
+        return T()
+
+    def test_impossible_jump_on_locked_pair_rejected(self):
+        """Locked pair P7/tid=7: 1720px jump in 1 frame → physicality reject."""
+        import numpy as np
+        from services.identity_core import IdentityCore
+
+        identity = IdentityCore()
+
+        emb = np.random.randn(512).astype(np.float32)
+        emb /= np.linalg.norm(emb)
+
+        identity.locks.try_create_lock(7, "P7", "hungarian", frame_id=0)
+        slot = identity._slot_by_pid("P7")
+        slot.embedding = emb.copy()
+        slot.last_position = (100.0, 400.0)
+        slot.last_seen_frame = 10
+
+        identity.begin_frame(11, present_tids={7})
+        track_to_pid, meta = identity.assign_tracks(
+            tracks=[self._make_track(7)],
+            embeddings={7: emb},
+            positions={7: (1820.0, 400.0)},   # 1720px jump in 1 frame at 30fps
+            allow_new_assignments=True,
+        )
+        identity.end_frame()
+
+        assert identity.physicality_rejects >= 1, \
+            "Physicality reject counter must increment for impossible jump"
+        assert (
+            "IMPOSSIBLE_SPEED" in identity.physicality_reject_reasons or
+            "IMPOSSIBLE_PIXEL_JUMP" in identity.physicality_reject_reasons
+        )
