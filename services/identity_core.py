@@ -255,6 +255,7 @@ class IdentityCore:
         self.camera_motion_recovery_frames: int = 0
         self.fast_pan_frames: int = 0
         self.cut_frames: int = 0
+        self.official_pid_blocks: int = 0
 
     # ------------------------------------------------------------------
     # Single source of truth for restricted identity mode
@@ -437,6 +438,7 @@ class IdentityCore:
         memory_ok_tids: Optional[set] = None,
         allow_new_assignments: bool = True,
         camera_motion: Optional[Dict] = None,
+        official_tids: Optional[Set[int]] = None,
     ) -> Tuple[Dict[int, str], Dict[int, AssignmentMeta]]:
         """
         allow_new_assignments=False OR _identity_restricted=True:
@@ -474,6 +476,23 @@ class IdentityCore:
         memory_skips = 0
         locked_kept = 0
 
+        # ── Official/referee hard gate ─────────────────────────────────────
+        # Runs before locked-pairs loop so officials never emit P-IDs.
+        if official_tids:
+            _blocked: Set[int] = set()
+            for tr in list(tracks):
+                tid = int(tr.track_id)
+                if tid in official_tids:
+                    _blocked.add(tid)
+                    meta_map[tid] = AssignmentMeta(
+                        pid=None, source="official_blocked",
+                        identity_state=IdentityState.UNKNOWN,
+                        confidence=0.0, identity_valid=False,
+                    )
+                    self.official_pid_blocks += 1
+                    print(f"[IdentityGate] frame={self.frame_id} tid={tid} blocked=official_role")
+            tracks = [tr for tr in tracks if int(tr.track_id) not in _blocked]
+
         # Internal gate — overrides caller if they passed wrong value
         restricted = self._identity_restricted
         if restricted:
@@ -481,7 +500,7 @@ class IdentityCore:
 
         if len(tracks) == 0:
             self.unmatched_slots = self.MAX_SLOTS
-            return {}, {}
+            return {}, meta_map
 
         # ── Step 1: locked pairs always pass through ─────────────────────
         unlocked_tracks: List[object] = []
@@ -1548,6 +1567,7 @@ class IdentityCore:
         print(f"  pan_rebinds_blocked               = {self.pan_rebinds_blocked}")
         print(f"  pan_takeovers_blocked             = {self.pan_takeovers_blocked}")
         print(f"  pan_ttl_extensions                = {self.pan_ttl_extensions}")
+        print(f"  official_pid_blocks               = {self.official_pid_blocks}")
 
         violations = []
         if not ok_collapse:
@@ -1579,4 +1599,5 @@ class IdentityCore:
             "pan_rebinds_blocked": self.pan_rebinds_blocked,
             "pan_takeovers_blocked": self.pan_takeovers_blocked,
             "pan_ttl_extensions": self.pan_ttl_extensions,
+            "official_pid_blocks": self.official_pid_blocks,
         }

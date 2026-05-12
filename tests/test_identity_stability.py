@@ -508,5 +508,110 @@ class TestRendererRobustness:
         assert ic == 0.0
 
 
+class TestOfficialHardGate:
+    """Official/referee tracks must never receive a P-ID."""
+
+    def _make_identity(self):
+        from services.identity_core import IdentityCore
+        return IdentityCore()
+
+    def _make_track(self, tid: int):
+        class T:
+            track_id = tid
+            time_since_update = 0
+        return T()
+
+    def test_official_tid_gets_unknown_not_pid(self):
+        """A track classified as official must emit UNKNOWN, not P-ID."""
+        import numpy as np
+        identity = self._make_identity()
+        identity.begin_frame(0, present_tids={7})
+
+        emb = np.random.randn(512).astype(np.float32)
+        emb /= np.linalg.norm(emb)
+
+        track_to_pid, meta = identity.assign_tracks(
+            tracks=[self._make_track(7)],
+            embeddings={7: emb},
+            positions={7: (200.0, 300.0)},
+            allow_new_assignments=True,
+            official_tids={7},
+        )
+        identity.end_frame()
+
+        assert 7 not in track_to_pid or track_to_pid.get(7) is None, \
+            "Official tid=7 must not receive any P-ID"
+        assert meta[7].source == "official_blocked", \
+            f"source must be 'official_blocked', got {meta[7].source}"
+        assert meta[7].identity_valid is False
+
+    def test_official_does_not_steal_existing_lock(self):
+        """Even if a tid already has a lock, official gate must block it."""
+        import numpy as np
+        identity = self._make_identity()
+        identity.locks.try_create_lock(7, "P13", "hungarian", frame_id=0)
+
+        identity.begin_frame(1, present_tids={7})
+        emb = np.random.randn(512).astype(np.float32)
+        emb /= np.linalg.norm(emb)
+
+        track_to_pid, meta = identity.assign_tracks(
+            tracks=[self._make_track(7)],
+            embeddings={7: emb},
+            positions={7: (200.0, 300.0)},
+            allow_new_assignments=True,
+            official_tids={7},
+        )
+        identity.end_frame()
+
+        assert track_to_pid.get(7) is None, \
+            "Official tid=7 must not emit P13 even if lock exists"
+        assert meta[7].source == "official_blocked"
+
+    def test_non_official_tid_unaffected(self):
+        """Normal player tids must pass through the gate unchanged."""
+        import numpy as np
+        identity = self._make_identity()
+        identity.begin_frame(0, present_tids={3})
+
+        emb = np.random.randn(512).astype(np.float32)
+        emb /= np.linalg.norm(emb)
+        slot = identity.slots[0]
+        slot.embedding = emb.copy()
+        slot.state = "active"
+
+        track_to_pid, meta = identity.assign_tracks(
+            tracks=[self._make_track(3)],
+            embeddings={3: emb},
+            positions={3: (200.0, 300.0)},
+            allow_new_assignments=True,
+            official_tids={99},
+        )
+        identity.end_frame()
+
+        assert meta[3].source != "official_blocked", \
+            "Player tid=3 must not be blocked by official gate"
+
+    def test_official_gate_increments_metric(self):
+        """official_pid_blocks counter must increment for each blocked official."""
+        import numpy as np
+        identity = self._make_identity()
+
+        emb = np.random.randn(512).astype(np.float32)
+        emb /= np.linalg.norm(emb)
+        identity.begin_frame(0, present_tids={5, 6})
+        identity.assign_tracks(
+            tracks=[self._make_track(5), self._make_track(6)],
+            embeddings={5: emb, 6: emb},
+            positions={5: (100.0, 200.0), 6: (300.0, 400.0)},
+            allow_new_assignments=True,
+            official_tids={5, 6},
+        )
+        identity.end_frame()
+
+        assert identity.official_pid_blocks >= 2, \
+            f"Expected >=2 official_pid_blocks, got {identity.official_pid_blocks}"
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
