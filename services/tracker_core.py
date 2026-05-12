@@ -28,6 +28,7 @@ try:
     from services.track_suppressor import TrackSuppressor
     from services.role_filter import RoleFilter
     from services.crop_quality import CropQualityGate
+    from services.camera_motion_service import CameraMotionDetector, log_camera_motion
 except (ImportError, ModuleNotFoundError):
     sys.path.insert(0, os.path.dirname(__file__))
     from identity_core import IdentityCore
@@ -35,6 +36,7 @@ except (ImportError, ModuleNotFoundError):
     from track_suppressor import TrackSuppressor
     from role_filter import RoleFilter
     from crop_quality import CropQualityGate
+    from camera_motion_service import CameraMotionDetector, log_camera_motion
 
 
 class ReIDExtractor:
@@ -334,19 +336,19 @@ class TrackerCore:
         if len(dets) == 0:
             # Still call update so Kalman predicts and ages tracks
             return self.tracker.update(
-                np.empty((0, 4)), np.empty((0,)), np.empty((0,)), None
+                np.empty((0, 4)), np.empty((0,)), np.empty((0,)), None, frame=frame
             )
         bboxes  = dets[:, :4]
         scores  = dets[:, 4]
         classes = dets[:, 5]
-        
+
         # Extract embeddings for all detections
         embeds = []
         for bbox in bboxes:
             embeds.append(self._extract_torso_hsv(frame, bbox))
         embeds = np.array(embeds)
-        
-        return self.tracker.update(bboxes, scores, classes, embeds=embeds)
+
+        return self.tracker.update(bboxes, scores, classes, embeds=embeds, frame=frame)
 
     def _extract_embeds(self, frame, tracks):
         """Extract ReID embeddings. OSNet > ResNet50 > HSV fallback."""
@@ -404,7 +406,7 @@ class TrackerCore:
         # If very uniform (solid bar) OR very high edge intensity (text on bar)
         return edge_intensity < 2.0 or edge_intensity > 40.0
 
-    def process_frame(self, frame, video_frame, dets, save=True):
+    def process_frame(self, frame, video_frame, dets, save=True, camera_motion=None):
         """
         Step A: BoTSORT runtime params patched at init + log verified
         Step B: Early snapshot via collapse guard (before hard freeze)
@@ -804,6 +806,7 @@ class TrackerCore:
                 normal_track_objs, embeddings, positions,
                 memory_ok_tids=memory_ok_tids,
                 allow_new_assignments=not restricted,
+                camera_motion=camera_motion,
             )
             meta_by_tid.update(normal_meta)
             self.identity.end_frame(video_frame)
@@ -974,6 +977,10 @@ def run_tracking(video_path, job_id, frame_stride=1, max_frames=None, device="cp
 
     tracker = TrackerCore(yolo_path=yolo_path, device=device, use_identity=use_identity)
 
+    # Phase 2: Initialize camera motion detector
+    camera_motion_detector = CameraMotionDetector()
+    camera_motions = []  # Store for each processed frame
+
     # Fallback probe: if the primary model returns zero player detections on
     # the first 3 sampled frames, swap to yolov8m (COCO 'person' class) and
     # rebuild the tracker. Only meaningful when primary is a roboflow model.
@@ -994,6 +1001,12 @@ def run_tracking(video_path, job_id, frame_stride=1, max_frames=None, device="cp
             break
 
         if video_frame % frame_stride == 0:
+            # Phase 2: Detect camera motion for this processed frame
+            motion = camera_motion_detector.estimate(frame, video_frame)
+            camera_motions.append(motion)
+            if motion["motion_class"] != "stable":
+                print(log_camera_motion(video_frame, motion))
+
             # Raw YOLO inference for diagnostics — share with tracker.detect via
             # a single-pass that records the histogram, then filters.
             yolo_results = tracker.yolo.predict(frame, conf=0.05, verbose=False)
@@ -1019,12 +1032,14 @@ def run_tracking(video_path, job_id, frame_stride=1, max_frames=None, device="cp
                 "player_candidate_count": player_candidate_count,
                 "tracker_input_count": tracker_input_count,
                 "active_tracks": -1,  # filled in after process_frame below
+                "camera_motion": motion["motion_class"],
             })
         else:
             dets = np.empty((0, 6))
             save_this = False
+            motion = None
 
-        n_tracks = tracker.process_frame(frame, video_frame, dets, save=save_this)
+        n_tracks = tracker.process_frame(frame, video_frame, dets, save=save_this, camera_motion=motion)
 
         if save_this:
             diagnostics[-1]["active_tracks"] = int(n_tracks)
@@ -1040,6 +1055,24 @@ def run_tracking(video_path, job_id, frame_stride=1, max_frames=None, device="cp
 
     cap.release()
     tracker.save(job_id)
+
+    # Phase 2: Save camera motion data
+    camera_motion_path = Path(f"temp/{job_id}/tracking/camera_motion.json")
+    camera_motion_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(camera_motion_path, "w") as f:
+        json.dump({
+            "total_frames": video_frame,
+            "processed_frames": processed,
+            "motion_statistics": {
+                "stable": sum(1 for m in camera_motions if m["motion_class"] == "stable"),
+                "pan": sum(1 for m in camera_motions if m["motion_class"] == "pan"),
+                "fast_pan": sum(1 for m in camera_motions if m["motion_class"] == "fast_pan"),
+                "cut": sum(1 for m in camera_motions if m["motion_class"] == "cut"),
+                "unknown": sum(1 for m in camera_motions if m["motion_class"] == "unknown"),
+            },
+            "motions": camera_motions,
+        }, f, indent=2)
+    print(f"\n✓ Camera motion saved to {camera_motion_path}")
 
     # Write per-frame diagnostics for Phase A acceptance gate
     diag_path = Path(f"temp/{job_id}/tracking/tracker_diagnostics.json")

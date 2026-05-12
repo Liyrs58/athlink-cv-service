@@ -1,10 +1,15 @@
 """
-Deep-EIoU tracker with GTA-Link post-processing.
+Deep-EIoU tracker with GTA-Link post-processing and camera motion compensation.
 
 Deep-EIoU: iterative IoU expansion for online association.
   - Expands bounding boxes proportionally before computing IoU cost.
   - Two-round matching: high-conf dets first, low-conf recovery second.
   - Appearance cost blended with expanded-IoU cost.
+
+Camera Motion Compensation: Kalman predictions subtract global scene motion.
+  - Detects global camera motion via optical flow
+  - Compensates predictions to keep tracks stable during pans
+  - Prevents ID loss during fast camera motion
 
 GTA-Link: global tracklet association post-process.
   - Runs after all frames processed.
@@ -14,10 +19,95 @@ GTA-Link: global tracklet association post-process.
 import numpy as np
 from collections import defaultdict
 from typing import Dict, List, Optional, Tuple
+import cv2
 
 
 # ---------------------------------------------------------------------------
-# Kalman filter (simple constant-velocity)
+# Camera motion estimation (optical flow)
+# ---------------------------------------------------------------------------
+
+class CameraMotionEstimator:
+    """Detect global camera motion via sparse optical flow grid."""
+
+    def __init__(self, grid_size=8):
+        self.grid_size = grid_size
+        self.prev_gray = None
+        self.motion_history = []
+        self.max_history = 5
+
+    def estimate(self, frame):
+        """
+        Compute global camera motion (dx, dy) from optical flow.
+        Returns (0, 0) if no frame or weak motion.
+        """
+        if frame is None:
+            return (0.0, 0.0)
+
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        h, w = gray.shape
+
+        if self.prev_gray is None:
+            self.prev_gray = gray.copy()
+            return (0.0, 0.0)
+
+        # Compute optical flow on sparse grid
+        try:
+            flow = cv2.calcOpticalFlowFarneback(
+                self.prev_gray, gray, None,
+                pyr_scale=0.5, levels=3, winsize=15,
+                iterations=3, n8=True, poly_n=5, poly_sigma=1.2, flags=0
+            )
+        except Exception:
+            self.prev_gray = gray.copy()
+            return (0.0, 0.0)
+
+        # Sample flows at grid cell centers
+        cell_h = max(h // self.grid_size, 1)
+        cell_w = max(w // self.grid_size, 1)
+        flows = []
+
+        for i in range(self.grid_size):
+            for j in range(self.grid_size):
+                y = (i + 0.5) * cell_h
+                x = (j + 0.5) * cell_w
+                y_int, x_int = int(y), int(x)
+                y_int = np.clip(y_int, 0, h - 1)
+                x_int = np.clip(x_int, 0, w - 1)
+
+                fx, fy = flow[y_int, x_int]
+                magnitude = np.sqrt(fx*fx + fy*fy)
+                if magnitude > 0.5:
+                    flows.append((fx, fy))
+
+        # Global motion = median of flows (robust to outliers)
+        if not flows:
+            motion = (0.0, 0.0)
+        else:
+            flows = np.array(flows)
+            motion_x = float(np.median(flows[:, 0]))
+            motion_y = float(np.median(flows[:, 1]))
+            mag = np.sqrt(motion_x**2 + motion_y**2)
+            # Reject implausible motion (>50 px/frame typically indicates error)
+            motion = (motion_x, motion_y) if mag <= 50 else (0.0, 0.0)
+
+        # Smooth with history
+        self.motion_history.append(motion)
+        if len(self.motion_history) > self.max_history:
+            self.motion_history.pop(0)
+
+        hist = np.array(self.motion_history)
+        smoothed = (float(np.median(hist[:, 0])), float(np.median(hist[:, 1])))
+
+        self.prev_gray = gray.copy()
+        return smoothed
+
+    def reset(self):
+        self.prev_gray = None
+        self.motion_history = []
+
+
+# ---------------------------------------------------------------------------
+# Kalman filter (constant-velocity with camera motion compensation)
 # ---------------------------------------------------------------------------
 
 class KalmanBox:
@@ -45,9 +135,23 @@ class KalmanBox:
         self.Q = np.diag([1., 1., 1., 1., 1., 1., 0.1, 0.1])
         self.R = np.diag([1., 1., 10., 10.])
 
-    def predict(self):
+    def predict(self, camera_motion=(0.0, 0.0)):
+        """
+        Predict next state with optional camera motion compensation.
+        During pans, subtract global motion from position predictions to keep
+        players stable relative to the field.
+
+        Args:
+            camera_motion: (dx, dy) global scene motion in pixels from optical flow
+        """
         self.x = self.F @ self.x
         self.P = self.F @ self.P @ self.F.T + self.Q
+
+        # Compensate for camera motion: player position -= camera motion
+        # This makes predictions stable relative to the pitch, not the frame
+        self.x[0] -= camera_motion[0]  # cx
+        self.x[1] -= camera_motion[1]  # cy
+
         return self._to_xyxy()
 
     def update(self, bbox_xyxy: np.ndarray):
@@ -98,10 +202,11 @@ class DETrack:
         # Embedding history for GTA-Link
         self._embed_bank: List[np.ndarray] = [] if embed is None else [embed.copy()]
 
-    def predict(self):
+    def predict(self, camera_motion=(0.0, 0.0)):
+        """Predict with optional camera motion compensation."""
         self.age += 1
         self.time_since_update += 1
-        return self.kf.predict()
+        return self.kf.predict(camera_motion=camera_motion)
 
     def update(self, bbox_xyxy: np.ndarray, score: float,
                embed: Optional[np.ndarray], frame: int):
@@ -246,19 +351,30 @@ class DeepEIoUTracker:
         self.lost:     List[DETrack] = []
         self._frame    = 0
 
+        # Camera motion compensation
+        self.camera_motion_estimator = CameraMotionEstimator(grid_size=8)
+        self.last_camera_motion = (0.0, 0.0)
+
     def update(
         self,
         dets_xyxy:  np.ndarray,           # (N,4)
         scores:     np.ndarray,           # (N,)
         classes:    np.ndarray,           # (N,)
         embeds:     Optional[np.ndarray] = None,  # (N, D) or None
+        frame:      Optional[np.ndarray] = None,  # current frame for camera motion estimation
     ) -> List[DETrack]:
         """Returns list of active DETrack objects (state==tracked, hits>=min_hits)."""
         self._frame += 1
 
-        # Predict all existing tracks
+        # Estimate camera motion for this frame (helps during pans)
+        if frame is not None:
+            self.last_camera_motion = self.camera_motion_estimator.estimate(frame)
+        else:
+            self.last_camera_motion = (0.0, 0.0)
+
+        # Predict all existing tracks with camera motion compensation
         for tr in self.tracked + self.lost:
-            tr.predict()
+            tr.predict(camera_motion=self.last_camera_motion)
 
         # Split detections by confidence
         high_mask = scores >= self.track_high_thresh

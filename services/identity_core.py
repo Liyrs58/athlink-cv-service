@@ -26,6 +26,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
+import cv2
 import numpy as np
 from scipy.optimize import linear_sum_assignment
 
@@ -139,6 +140,10 @@ class IdentityCore:
         self.in_scene_recovery: bool = False
         self._scene_reset_frame: int = -1
 
+        # Camera motion state — set via assign_tracks(camera_motion=...)
+        self.camera_motion: Dict = {}
+        self.camera_motion_class: str = "stable"
+
         # Per-frame extras injected by tracker_core
         self.pitch_positions: Dict[int, Tuple[float, float]] = {}
         self.team_labels: Dict[int, Optional[int]] = {}
@@ -159,6 +164,15 @@ class IdentityCore:
         self.restricted_hungarian_assignments: int = 0
         self.ambiguous_rejects: int = 0
         self.revived_count: int = 0
+
+        # Pan-safe gate metrics
+        self.pan_lock_attempts_blocked: int = 0
+        self.pan_rebinds_blocked: int = 0
+        self.pan_takeovers_blocked: int = 0
+        self.pan_ttl_extensions: int = 0
+        self.camera_motion_recovery_frames: int = 0
+        self.fast_pan_frames: int = 0
+        self.cut_frames: int = 0
 
     # ------------------------------------------------------------------
     # Single source of truth for restricted identity mode
@@ -227,6 +241,18 @@ class IdentityCore:
         if self._recovery_frames_left > 0:
             reasons.append(f"recovery_frames_left={self._recovery_frames_left}")
         return ",".join(reasons) if reasons else "none"
+
+    def _camera_motion_restricted(self) -> bool:
+        """True when camera motion requires identity safety (no new locks/rebinds/takeovers)."""
+        return self.camera_motion_class in ("fast_pan", "cut")
+
+    def _camera_motion_reason(self) -> Optional[str]:
+        """Reason why camera motion is restricting identity decisions."""
+        if self.camera_motion_class == "fast_pan":
+            return "CAMERA_FAST_PAN"
+        if self.camera_motion_class == "cut":
+            return "CAMERA_CUT_DETECTED"
+        return None
 
     def get_scene_revive_thresholds(self, max_window: int = SCENE_REVIVE_WINDOW) -> Tuple[float, float]:
         """Progressively relax scene revival as the post-reset window approaches expiry."""
@@ -326,6 +352,7 @@ class IdentityCore:
         positions: Dict[int, Tuple[float, float]],
         memory_ok_tids: Optional[set] = None,
         allow_new_assignments: bool = True,
+        camera_motion: Optional[Dict] = None,
     ) -> Tuple[Dict[int, str], Dict[int, AssignmentMeta]]:
         """
         allow_new_assignments=False OR _identity_restricted=True:
@@ -335,6 +362,28 @@ class IdentityCore:
         """
         # Increment identity frame sequence for streak continuity across frame_stride
         self.identity_frame_seq += 1
+
+        # Update camera motion state for this frame
+        if camera_motion is not None:
+            self.camera_motion = camera_motion
+            self.camera_motion_class = camera_motion.get("motion_class", "stable")
+        else:
+            self.camera_motion = {}
+            self.camera_motion_class = "stable"
+
+        # Track pan recovery frames and extend dormant lock TTL for protection
+        if self.camera_motion_class in ("fast_pan", "cut"):
+            self.camera_motion_recovery_frames += 1
+            if self.camera_motion_class == "fast_pan":
+                self.fast_pan_frames += 1
+                # Extend TTL for dormant locks to protect them during pan
+                ext_count = self.locks.extend_dormant_ttl_for_pan(self.frame_id)
+                self.pan_ttl_extensions += ext_count
+            elif self.camera_motion_class == "cut":
+                self.cut_frames += 1
+                # Also extend for cuts to preserve identity continuity across scene transitions
+                ext_count = self.locks.extend_dormant_ttl_for_pan(self.frame_id)
+                self.pan_ttl_extensions += ext_count
 
         meta_map: Dict[int, AssignmentMeta] = {}
         track_to_pid: Dict[int, str] = {}
@@ -437,7 +486,8 @@ class IdentityCore:
                 tid = int(tr.track_id)
                 for jj, j in enumerate(unlocked_slot_idx):
                     base = self._slot_cost(
-                        self.slots[j], embeddings.get(tid), positions.get(tid), tid=tid
+                        self.slots[j], embeddings.get(tid), positions.get(tid), tid=tid,
+                        camera_motion=camera_motion,
                     )
                     # Apply continuity bias: strongly prefer slots that matched this tid recently
                     slot = self.slots[j]
@@ -522,16 +572,31 @@ class IdentityCore:
                     print(f"[LockAttempt] frame={self.frame_id} tid={tid} pid={slot.pid} cost={cst:.3f} streak={slot.pending_streak} ready={lock_ready} cost_ok={cost_ok}")
 
                 if lock_ready and cost_ok:
-                    lk_new, status = self.locks.try_create_lock(
-                        tid=tid, pid=slot.pid, source="hungarian",
-                        frame_id=self.frame_id, confidence=cst,
-                        allow_takeover=True, allow_rebind=True,
-                    )
-                    print(f"[LockAttemptResult] frame={self.frame_id} tid={tid} pid={slot.pid} status={status}")
-                    if status in ("created", "refreshed"):
-                        print(f"[LockCreate] frame={self.frame_id} tid={tid} pid={slot.pid} cost={cst:.3f} status={status}")
-                        slot.pending_tid = None
-                        slot.pending_streak = 0
+                    # Pan-safe gate: restrict new locks/rebinds/takeovers during fast_pan/cut
+                    pan_restricted = self._camera_motion_restricted()
+                    reason = self._camera_motion_reason() if pan_restricted else None
+
+                    # Block all lock attempts (new, rebind, takeover) during pan motion
+                    if pan_restricted:
+                        self.pan_lock_attempts_blocked += 1
+                        if self.frame_id % self.debug_every == 0:
+                            print(f"[PanGate] frame={self.frame_id} tid={tid} pid={slot.pid} "
+                                  f"action=block_lock_creation reason={reason}")
+                    else:
+                        lk_new, status = self.locks.try_create_lock(
+                            tid=tid, pid=slot.pid, source="hungarian",
+                            frame_id=self.frame_id, confidence=cst,
+                            allow_takeover=True,
+                            allow_rebind=True,
+                        )
+
+                        if self.frame_id % self.debug_every == 0:
+                            print(f"[LockAttemptResult] frame={self.frame_id} tid={tid} pid={slot.pid} status={status}")
+
+                        if status in ("created", "refreshed"):
+                            print(f"[LockCreate] frame={self.frame_id} tid={tid} pid={slot.pid} cost={cst:.3f} status={status}")
+                            slot.pending_tid = None
+                            slot.pending_streak = 0
 
                 self.assigned_this_frame += 1
                 is_locked = self.locks.is_tid_locked(tid)
@@ -928,9 +993,32 @@ class IdentityCore:
             margin = None
             if len(valid_row) >= 2:
                 margin = float(np.sort(valid_row)[1] - np.sort(valid_row)[0])
-            ok, reason = self._revive_margin_ok(
-                cst, margin, SOFT_REVIVE_COST_MAX, SOFT_REVIVE_MARGIN_MIN
-            )
+            # Stricter thresholds during fast pan/cut to prevent wrong revivals
+            if self._camera_motion_restricted():
+                # Pan-safe gate: strict appearance cost and margin requirements
+                cost_max_pan = 0.18  # Very tight appearance cost during pan
+                margin_min_pan = 0.03  # Require clear disambiguation
+                ok, reason = self._revive_margin_ok(
+                    cst, margin, cost_max_pan, margin_min_pan, auto_accept_cost=0.10
+                )
+                if not ok and reason == "cost_too_high":
+                    # Cost driven by appearance alone — check components
+                    row_costs = cost[r, :]
+                    valid_row = row_costs[row_costs < 1e2]
+                    if is_first_recovery_frame and len(debug_costs) > 0:
+                        match_costs = [dc for dc in debug_costs if dc["tid"] == tid and dc["pid"] == pid]
+                        if match_costs:
+                            mc = match_costs[0]
+                            if mc["emb"] > 0.18:
+                                if self.frame_id % self.debug_every == 0:
+                                    print(f"[PanGate] frame={self.frame_id} tid={tid} pid={pid} "
+                                          f"action=block_soft_revive reason=appearance_cost_too_high appearance={mc['emb']:.3f}")
+                                continue
+            else:
+                ok, reason = self._revive_margin_ok(
+                    cst, margin, SOFT_REVIVE_COST_MAX, SOFT_REVIVE_MARGIN_MIN
+                )
+
             if not ok:
                 if reason == "ambiguous":
                     self.ambiguous_rejects += 1
@@ -1126,6 +1214,7 @@ class IdentityCore:
         t_emb: Optional[np.ndarray],
         t_pos: Optional[Tuple[float, float]],
         tid: Optional[int] = None,
+        camera_motion: Optional[Dict] = None,
     ) -> float:
         # Boot: empty lost slots eagerly accept — but NEVER during any restricted mode
         if not self._identity_restricted and slot.state == "lost" and slot.embedding is None:
@@ -1146,9 +1235,41 @@ class IdentityCore:
             cos = float(np.clip(np.dot(e, slot.embedding), -1.0, 1.0))
             emb_cost = 1.0 - (cos + 1.0) * 0.5
 
+        # Apply camera motion compensation to slot position before cost calculation
+        slot_pos_for_cost = slot.last_position
+        log_motion_comp = False
+        if camera_motion is not None and slot.last_position is not None and t_pos is not None:
+            slot_x, slot_y = slot.last_position
+            if camera_motion.get("affine") is not None:
+                # Use affine transform for precise motion compensation
+                M = np.array(camera_motion["affine"], dtype=np.float32)
+                pt = np.array([[slot_x, slot_y]], dtype=np.float32).reshape(-1, 1, 2)
+                pt_comp = cv2.transform(pt, M)
+                slot_pos_for_cost = tuple(pt_comp[0, 0])
+            else:
+                # Fallback: simple translation
+                dx = camera_motion.get("dx", 0.0)
+                dy = camera_motion.get("dy", 0.0)
+                slot_pos_for_cost = (slot_x + dx, slot_y + dy)
+            log_motion_comp = True
+
         t_pitch = self.pitch_positions.get(tid) if tid is not None else None
         pos_cost = assignment_position_cost(slot.last_pitch, t_pitch) if t_pitch is not None \
-            else (assignment_position_cost(slot.last_position, t_pos) if t_pos is not None else 0.5)
+            else (assignment_position_cost(slot_pos_for_cost, t_pos) if t_pos is not None else 0.5)
+
+        # Log position compensation effect if applied
+        if log_motion_comp and self.frame_id % 30 == 0:
+            slot_orig_cost = assignment_position_cost(slot.last_position, t_pos) if t_pos is not None else 0.5
+            dist_before = np.sqrt((slot.last_position[0] - t_pos[0])**2 + (slot.last_position[1] - t_pos[1])**2) if t_pos is not None else 0.0
+            dist_after = np.sqrt((slot_pos_for_cost[0] - t_pos[0])**2 + (slot_pos_for_cost[1] - t_pos[1])**2) if t_pos is not None else 0.0
+            improvement = dist_before - dist_after
+            if improvement > 0.5:  # Only log if improvement is significant
+                print(f"[MotionComp] frame={self.frame_id} pid={slot.pid} tid={tid} "
+                      f"old_pos=({slot.last_position[0]:.0f},{slot.last_position[1]:.0f}) "
+                      f"comp_pos=({slot_pos_for_cost[0]:.0f},{slot_pos_for_cost[1]:.0f}) "
+                      f"det_pos=({t_pos[0]:.0f},{t_pos[1]:.0f}) "
+                      f"dist_before={dist_before:.1f} dist_after={dist_after:.1f} "
+                      f"improvement={improvement:.1f}px motion_class={camera_motion.get('motion_class', 'unknown')}")
 
         recency = min(max(self.frame_id - slot.last_seen_frame, 0), DORMANT_TTL)
         recency_cost = recency / float(DORMANT_TTL)
@@ -1212,6 +1333,14 @@ class IdentityCore:
         print(f"  ambiguous_rejects                 = {self.ambiguous_rejects}")
         print(f"  revived_count                     = {self.revived_count}")
         print(f"  stable_locked_count               = {stable_locked}")
+        print(f"\n[PanSafeGateMetrics]")
+        print(f"  fast_pan_frames                   = {self.fast_pan_frames}")
+        print(f"  cut_frames                        = {self.cut_frames}")
+        print(f"  camera_motion_recovery_frames     = {self.camera_motion_recovery_frames}")
+        print(f"  pan_lock_attempts_blocked         = {self.pan_lock_attempts_blocked}")
+        print(f"  pan_rebinds_blocked               = {self.pan_rebinds_blocked}")
+        print(f"  pan_takeovers_blocked             = {self.pan_takeovers_blocked}")
+        print(f"  pan_ttl_extensions                = {self.pan_ttl_extensions}")
 
         violations = []
         if not ok_collapse:
@@ -1236,4 +1365,11 @@ class IdentityCore:
             "revived_count": self.revived_count,
             "stable_locked_count": stable_locked,
             "lock_retention_rate": retention,
+            "fast_pan_frames": self.fast_pan_frames,
+            "cut_frames": self.cut_frames,
+            "camera_motion_recovery_frames": self.camera_motion_recovery_frames,
+            "pan_lock_attempts_blocked": self.pan_lock_attempts_blocked,
+            "pan_rebinds_blocked": self.pan_rebinds_blocked,
+            "pan_takeovers_blocked": self.pan_takeovers_blocked,
+            "pan_ttl_extensions": self.pan_ttl_extensions,
         }

@@ -19,6 +19,7 @@ STABLE_PROMOTE_FRAMES = 5      # Hungarian must agree this many consecutive fram
 LOCK_DEFAULT_TTL = 150         # frames a lock survives absent track in normal play
 LOCK_REVIVED_TTL = 210         # revivals get a longer grace
 LOCK_DORMANT_TTL = 300         # frames a dormant lock reserves pid before true expiry
+PAN_LOCK_TTL_EXTENSION_FRAMES = 45  # extra frames to protect dormant locks during pan
 MEMORY_UPDATE_MIN_STABLE = 5   # don't write embedding until lock is this stable
 RECENT_DORMANT_REVIVE_FRAMES = 60
 STABLE_AUTO_DORMANT_THRESHOLD = 10  # locks above this stable_count go DORMANT on expiry instead of hard-release
@@ -316,6 +317,20 @@ class IdentityLockManager:
 
     def release_lock(self, tid: int, reason: str = "manual", frame_id: int = -1) -> Optional[str]:
         return self._release_internal(tid, reason=reason, frame_id=frame_id)
+
+    def extend_dormant_ttl_for_pan(self, frame_id: int, extension: int = PAN_LOCK_TTL_EXTENSION_FRAMES) -> int:
+        """Extend TTL for all dormant locks to protect them during camera pan motion."""
+        extended = 0
+        for tid, lk in self._tid_to_lock.items():
+            if lk.dormant:
+                lk.ttl += extension
+                extended += 1
+                if extended <= 3:  # Log first 3 for debugging
+                    print(f"[PanTTLExtend] frame={frame_id} tid={tid} pid={lk.pid} "
+                          f"old_ttl={lk.ttl - extension} new_ttl={lk.ttl}")
+        if extended > 3:
+            print(f"[PanTTLExtend] frame={frame_id} extended {extended} dormant locks (showing first 3)")
+        return extended
 
     def _release_internal(self, tid: int, reason: str, frame_id: int = -1) -> Optional[str]:
         lk = self._tid_to_lock.pop(tid, None)
