@@ -880,6 +880,10 @@ class TrackerCore:
                     identity_confidence = float(meta.confidence)
                     player_id = meta.pid
                     display_id = meta.pid
+                    
+                    slot = self.identity.get_slot(meta.pid)
+                    team_id = slot.team_id if slot else None
+                    team_confidence = 0.91 if team_id is not None else 0.0
                 else:
                     # Uncertain — render as raw track (T<id>), no P-id
                     out_pid = None
@@ -888,6 +892,8 @@ class TrackerCore:
                     identity_confidence = float(meta.confidence) if meta else 0.0
                     player_id = None
                     display_id = "?" if assignment_pending else None
+                    team_id = None
+                    team_confidence = 0.0
 
                 players.append({
                     "trackId": out_pid if out_pid is not None else int(tid),
@@ -904,20 +910,37 @@ class TrackerCore:
                     "identity_valid": identity_valid,
                     "assignment_source": source,
                     "identity_confidence": identity_confidence,
+                    "team_id": team_id,
+                    "team_confidence": team_confidence,
+                    "role": "player" if player_id else "unknown",
                     "is_official": False,
                 })
 
             officials_list = []
             for ofc in self._officials_this_frame:
                 ox1, oy1, ox2, oy2 = ofc.bbox
-                officials_list.append({
+                ofc_obj = {
                     "trackId": int(ofc.track_id),
                     "rawTrackId": int(ofc.track_id),
+                    "playerId": f"OFFICIAL_{int(ofc.track_id)}",
+                    "displayId": "REF",
+                    "assignment_pending": False,
                     "bbox": [float(ox1), float(oy1), float(ox2), float(oy2)],
                     "confidence": float(ofc.score),
                     "class": int(ofc.cls),
+                    "gameState": state.value,
+                    "analysis_valid": True,
+                    "crop_quality": 1.0,
+                    "identity_valid": True,
+                    "assignment_source": "locked",
+                    "identity_confidence": 1.0,
+                    "team_id": None,
+                    "team_confidence": 0.0,
+                    "role": "official",
                     "is_official": True,
-                })
+                }
+                officials_list.append(ofc_obj)
+                players.append(ofc_obj)
 
             ball_list = []
             last_ball = getattr(self, "_last_ball_det", None)

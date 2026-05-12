@@ -15,6 +15,7 @@ except ImportError:
 def main():
     parser = argparse.ArgumentParser(description="VLM Supervisor (Gemini Free Tier)")
     parser.add_argument("--job-id", required=True, help="Job identifier")
+    parser.add_argument("--all", action="store_true", help="Review all severities (default is high severity only)")
     args = parser.parse_args()
 
     if not HAS_GENAI:
@@ -63,10 +64,14 @@ def main():
             case_data = json.load(f)
 
         window_id = case_data.get("window_id")
+        severity = case_data.get("severity", "low").lower()
         if not window_id:
             continue
+            
+        if not args.all and severity != "high":
+            continue
 
-        print(f"\n[VLM] Reviewing {window_id}...")
+        print(f"\n[VLM] Reviewing {window_id} (severity: {severity})...")
 
         prompt = case_data.get("vlm_prompt", "")
         img = Image.open(contact_sheet_path)

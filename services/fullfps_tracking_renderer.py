@@ -97,6 +97,7 @@ class RenderDecision:
     assignment_source: str = ""
     hidden_reason: Optional[HideReason] = None
     raw_frame_idx: int = -1
+    is_official: bool = False
 
 
 class RendererDimensionError(Exception):
@@ -148,7 +149,7 @@ def render_entity_key(
     logic. Only LOCKED/REVIVED sources become PID:* keys; hungarian, provisional,
     or unassigned are never PIDs.
     """
-    if player.get("is_official"):
+    if player.get("is_official") or player.get("role") == "official":
         if not debug_officials:
             return None
         tid = _player_tid(player)
@@ -309,7 +310,7 @@ def build_observations(
     frame_dims: tuple[int, int] | None = None,
     debug_unknown: bool = False,
     debug_officials: bool = False,
-) -> tuple[dict[str, list[TrackObservation]], dict[str, Any]]:
+) -> tuple[dict[str, list[TrackObservation]], dict[str, Any], dict[int, set[int]]]:
     """Build per-key observation lists from track_results.json frames."""
     obs_by_key: dict[str, list[TrackObservation]] = defaultdict(list)
     counters = {
@@ -317,14 +318,18 @@ def build_observations(
         "unknown_suppressed_object_frames": 0,
         "identity_sources_rendered": defaultdict(int),
     }
+    officials_tids_by_frame: dict[int, set[int]] = defaultdict(set)
 
     frames = tracking_results.get("frames", []) or []
     for frame in frames:
         raw_idx = int(frame.get("frameIndex", 0))
         for player in frame.get("players", []) or []:
             # Officials first.
-            if player.get("is_official"):
+            if player.get("is_official") or player.get("role") == "official":
                 counters["official_suppressed_object_frames"] += 1
+                tid = _player_tid(player)
+                if tid is not None:
+                    officials_tids_by_frame[raw_idx].add(tid)
                 if not debug_officials:
                     continue
             key = render_entity_key(player, debug_unknown=debug_unknown,
@@ -369,7 +374,7 @@ def build_observations(
 
     # convert defaultdict for cleaner downstream JSON
     counters["identity_sources_rendered"] = dict(counters["identity_sources_rendered"])
-    return obs_by_key, counters
+    return obs_by_key, counters, dict(officials_tids_by_frame)
 
 
 def validate_bbox_dimensions(
@@ -464,7 +469,7 @@ def render_frames(
     Returns a list of length total_raw_frames; each element is the list of
     RenderDecision objects for that frame (including hidden ones for QA).
     """
-    obs_by_key, _counters = build_observations(
+    obs_by_key, _counters, officials_tids_by_frame = build_observations(
         tracking_results, frame_dims=frame_dims, debug_unknown=debug_unknown, debug_officials=debug_officials
     )
     offsets = build_cumulative_offset(motions, total_raw_frames)
@@ -494,7 +499,7 @@ def render_frames(
 
             if exact:
                 for eo in exact:
-                    per_key_decisions.append(RenderDecision(
+                    decision = RenderDecision(
                         key=key,
                         pid=eo.pid,
                         latest_tid=eo.tid,
@@ -505,7 +510,13 @@ def render_frames(
                         alpha=1.0,
                         assignment_source=eo.assignment_source,
                         raw_frame_idx=f,
-                    ))
+                        is_official=eo.is_official,
+                    )
+                    # Suppress ghost tracks on officials
+                    if decision.latest_tid is not None and decision.latest_tid in officials_tids_by_frame.get(f, set()):
+                        decision.state = RenderState.HIDDEN
+                        decision.hidden_reason = HideReason.OFFICIAL_SUPPRESSION
+                    per_key_decisions.append(decision)
                 candidates.extend(per_key_decisions)
                 continue
 
@@ -521,6 +532,7 @@ def render_frames(
                 confidence=(prev_obs or next_obs).confidence,
                 assignment_source=(prev_obs or next_obs).assignment_source,
                 raw_frame_idx=f,
+                is_official=(prev_obs or next_obs).is_official,
             )
 
             if prev_obs is not None and next_obs is not None:
@@ -595,6 +607,11 @@ def render_frames(
                         if jump > MAX_CENTER_JUMP_PX:
                             decision.state = RenderState.HIDDEN
                             decision.hidden_reason = HideReason.IMPLAUSIBLE_MOTION
+
+            # Suppress interpolated/held ghost tracks on officials
+            if decision.latest_tid is not None and decision.latest_tid in officials_tids_by_frame.get(f, set()):
+                decision.state = RenderState.HIDDEN
+                decision.hidden_reason = HideReason.OFFICIAL_SUPPRESSION
 
             # Pan-safe label freeze: hide first-emit during fast_pan for new PIDs.
             if (
@@ -833,13 +850,21 @@ def _draw_decision(frame: np.ndarray, d: RenderDecision, debug: bool) -> None:
     cv2.rectangle(frame, (x1, y1), (x2, y2), color, thickness)
 
     label = ""
-    if d.key.startswith("OFFICIAL:"):
-        label = "REF"
-    elif d.pid:
-        tag = "LOCK" if d.assignment_source == "locked" else "REV"
-        label = f"{d.pid} {tag}"
-        if debug and d.latest_tid is not None:
-            label = f"{d.pid} T{d.latest_tid} {tag}"
+    if getattr(d, 'is_official', False) or d.key.startswith("OFFICIAL:"):
+        return  # hide officials completely
+
+    if d.pid:
+        if d.assignment_source == "locked":
+            label = f"{d.pid} LOCK"
+            if debug and d.latest_tid is not None:
+                label = f"{d.pid} T{d.latest_tid} LOCK"
+        elif d.assignment_source == "revived":
+            # HIDE_LABEL for REVIVED, but keep the team color box.
+            label = ""
+        else:
+            # hide UNKNOWN completely
+            if not debug:
+                return
 
     if label:
         font = cv2.FONT_HERSHEY_SIMPLEX
