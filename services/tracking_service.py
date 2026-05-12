@@ -94,7 +94,8 @@ def _compute_iou_single(box1, box2):
 def _get_detections_with_rescue(model, frame, base_conf=0.10, rescue_conf=0.05):
     """Primary pass at base_conf, rescue pass at rescue_conf for far players."""
     # Robust parsing: YOLO model() or model.predict() might return list or single Result
-    results1_raw = model.predict(frame, conf=base_conf, verbose=False)
+    # Use half=False to avoid fusion errors on T4
+    results1_raw = model.predict(frame, conf=base_conf, verbose=False, half=False)
     
     if isinstance(results1_raw, list) and len(results1_raw) > 0:
         res1 = results1_raw[0]
@@ -111,7 +112,8 @@ def _get_detections_with_rescue(model, frame, base_conf=0.10, rescue_conf=0.05):
         main_dets = np.hstack([xyxy, conf, cls])
 
     if len(main_dets) < 15: # If sparse frame, try rescue
-        results2_raw = model.predict(frame, conf=rescue_conf, verbose=False)
+        # Use half=False to avoid fusion errors on T4
+        results2_raw = model.predict(frame, conf=rescue_conf, verbose=False, half=False)
         if isinstance(results2_raw, list) and len(results2_raw) > 0:
             res2 = results2_raw[0]
         else:
@@ -995,7 +997,7 @@ def _run_tracking_impl(
             _green_pct = float(np.count_nonzero(_gmask)) / _gmask.size
 
             # Ultra-low conf YOLO pass for diagnostics
-            _raw_results = model.predict(detect_frame, conf=0.05, verbose=False)
+            _raw_results = model.predict(detect_frame, conf=0.05, verbose=False, half=False)
             if isinstance(_raw_results, list) and len(_raw_results) > 0:
                 _raw_res = _raw_results[0]
             else:
@@ -1423,7 +1425,8 @@ def _run_tracking_impl(
         if not ball_detected:
             try:
                 ball_cls = [FOOTBALL_BALL_CLASS] if _using_football_model else [32]
-                ball_results = model(frame, verbose=False, conf=0.15, classes=ball_cls, half=_use_half)
+                # Use half=False to avoid fusion errors on T4
+                ball_results = model(frame, verbose=False, conf=0.15, classes=ball_cls, half=False)
                 if ball_results[0].boxes is not None and len(ball_results[0].boxes) > 0:
                     ball_boxes = ball_results[0].boxes.xyxy.cpu().tolist()
                     ball_confs = ball_results[0].boxes.conf.cpu().tolist()
