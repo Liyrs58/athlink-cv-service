@@ -728,3 +728,93 @@ class TestShadowBuffer:
             cost=0.18, frame_width=1920, frame_height=1080,
         )
         assert ok, f"Valid relink must be accepted; reason={reason}"
+
+
+class TestShadowGatedRevival:
+    """Revival from snapshot must pass shadow-buffer eligibility check."""
+
+    def _make_track(self, tid):
+        class T:
+            track_id = tid
+            time_since_update = 0
+        return T()
+
+    def test_revival_blocked_when_relink_gap_too_small(self):
+        """Player P7 exits at frame 10; tid re-appears at frame 12 (gap=2 < min=8) → UNKNOWN."""
+        import numpy as np
+        from services.identity_core import IdentityCore, ShadowEntry
+
+        identity = IdentityCore()
+        identity.shadow_buffer._min_gap = 8
+
+        emb = np.random.randn(512).astype(np.float32)
+        emb /= np.linalg.norm(emb)
+
+        # Seed P7 slot with matching embedding so Hungarian selects it (not P1)
+        # Seed all other slots with orthogonal embeddings to make P7 uniquely cheap
+        slot_p7 = identity._slot_by_pid("P7")
+        slot_p7.embedding = emb.copy()
+        for slot in identity.slots:
+            if slot is not slot_p7 and slot.embedding is None:
+                rand_emb = np.random.randn(512).astype(np.float32)
+                rand_emb /= np.linalg.norm(rand_emb)
+                slot.embedding = rand_emb
+
+        entry = ShadowEntry(
+            pid="P7", last_tid=7, last_seen_frame=10,
+            last_bbox=None, last_center=(100.0, 400.0),
+            last_embedding=emb.copy(), team_id=0,
+            exit_edge="left", stable_count=15,
+        )
+        identity.shadow_buffer.add(entry, added_frame=10)
+
+        identity.begin_frame(12, present_tids={7})
+        track_to_pid, meta = identity.assign_tracks(
+            tracks=[self._make_track(7)],
+            embeddings={7: emb},
+            positions={7: (110.0, 405.0)},
+            allow_new_assignments=True,
+        )
+        identity.end_frame()
+
+        assert track_to_pid.get(7) != "P7", \
+            "Gap=2 < min=8: revival of P7 must be blocked, got P7"
+        assert identity.shadow_relink_rejected >= 1, \
+            "shadow_relink_rejected must increment"
+
+    def test_revival_accepted_when_all_gates_pass(self):
+        """P7 locked to tid=7; exits; re-enters at frame 25 (gap=15>=8) with same embedding — accept."""
+        import numpy as np
+        from services.identity_core import IdentityCore, ShadowEntry
+
+        identity = IdentityCore()
+        identity.shadow_buffer._require_edge = False
+        identity.shadow_buffer._max_cost = 0.40
+
+        emb = np.random.randn(512).astype(np.float32)
+        emb /= np.linalg.norm(emb)
+
+        entry = ShadowEntry(
+            pid="P7", last_tid=7, last_seen_frame=10,
+            last_bbox=None, last_center=(100.0, 400.0),
+            last_embedding=emb.copy(), team_id=None,
+            exit_edge="left", stable_count=20,
+        )
+        identity.shadow_buffer.add(entry, added_frame=10)
+
+        slot = identity._slot_by_pid("P7")
+        slot.embedding = emb.copy()
+        slot.state = "active"
+        identity.locks.try_create_lock(7, "P7", "hungarian", frame_id=0)
+
+        identity.begin_frame(25, present_tids={7})
+        track_to_pid, meta = identity.assign_tracks(
+            tracks=[self._make_track(7)],
+            embeddings={7: emb},
+            positions={7: (110.0, 405.0)},
+            allow_new_assignments=True,
+        )
+        identity.end_frame()
+
+        assert track_to_pid.get(7) == "P7", \
+            f"Valid re-entry at gap=15 must emit P7, got {track_to_pid.get(7)}"

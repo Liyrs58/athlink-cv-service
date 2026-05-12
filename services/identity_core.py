@@ -817,6 +817,33 @@ class IdentityCore:
 
                 slot.pending_seen_seq = self.identity_frame_seq
 
+                # ── Shadow gate: block assignment if shadow eligibility fails ──
+                if self.shadow_buffer.has_shadow(slot.pid):
+                    _candidate_center = positions.get(tid, (0.0, 0.0)) if positions else (0.0, 0.0)
+                    _sg_ok, _sg_reason = self.shadow_buffer.check_relink_eligibility(
+                        pid=slot.pid,
+                        candidate_center=_candidate_center,
+                        candidate_team=None,
+                        current_frame=self.frame_id,
+                        cost=cst,
+                        frame_width=getattr(self, '_frame_width', 1920),
+                        frame_height=getattr(self, '_frame_height', 1080),
+                    )
+                    self.shadow_relink_attempts += 1
+                    if not _sg_ok:
+                        self.shadow_relink_rejected += 1
+                        print(f"[ShadowGate] frame={self.frame_id} tid={tid} pid={slot.pid} "
+                              f"blocked reason={_sg_reason}")
+                        meta_map[tid] = AssignmentMeta(
+                            pid=None, source="shadow_rejected",
+                            identity_state=IdentityState.UNKNOWN,
+                            confidence=0.0, identity_valid=False,
+                        )
+                        continue
+                    self.shadow_relink_accepted += 1
+                    self.shadow_buffer.remove(slot.pid)
+                    print(f"[ShadowRelink] frame={self.frame_id} tid={tid} pid={slot.pid} accepted cost={cst:.3f}")
+
                 track_to_pid[tid] = slot.pid
                 old_pid = getattr(slot, '_last_assigned_pid', None)
                 self._activate_slot(slot, tid, positions)
@@ -1124,6 +1151,30 @@ class IdentityCore:
                     note_reject("stable_lock_protected")
                     continue
 
+            # ── Shadow gate ──
+            if self.shadow_buffer.has_shadow(pid):
+                _candidate_center = positions.get(tid, (0.0, 0.0)) if positions else (0.0, 0.0)
+                _sg_ok, _sg_reason = self.shadow_buffer.check_relink_eligibility(
+                    pid=pid, candidate_center=_candidate_center, candidate_team=None,
+                    current_frame=self.frame_id, cost=cst,
+                    frame_width=getattr(self, '_frame_width', 1920),
+                    frame_height=getattr(self, '_frame_height', 1080),
+                )
+                self.shadow_relink_attempts += 1
+                if not _sg_ok:
+                    self.shadow_relink_rejected += 1
+                    print(f"[ShadowGate] frame={self.frame_id} tid={tid} pid={pid} "
+                          f"blocked reason={_sg_reason} (scene revival)")
+                    meta[tid] = AssignmentMeta(
+                        pid=None, source="shadow_rejected",
+                        identity_state=IdentityState.UNKNOWN,
+                        confidence=0.0, identity_valid=False,
+                    )
+                    continue
+                self.shadow_relink_accepted += 1
+                self.shadow_buffer.remove(pid)
+                print(f"[ShadowRelink] frame={self.frame_id} tid={tid} pid={pid} accepted cost={cst:.3f} (scene revival)")
+
             revived[tid] = pid
             meta[tid] = AssignmentMeta(
                 pid=pid, source="revived",
@@ -1206,6 +1257,26 @@ class IdentityCore:
             existing_lk = self.locks.get_lock(tid)
             if existing_lk is not None and existing_lk.pid != pid:
                 continue
+
+            # ── Shadow gate ──
+            if self.shadow_buffer.has_shadow(pid):
+                _candidate_center = positions.get(tid, (0.0, 0.0)) if positions else (0.0, 0.0)
+                _sg_ok, _sg_reason = self.shadow_buffer.check_relink_eligibility(
+                    pid=pid, candidate_center=_candidate_center, candidate_team=None,
+                    current_frame=self.frame_id, cost=cst,
+                    frame_width=getattr(self, '_frame_width', 1920),
+                    frame_height=getattr(self, '_frame_height', 1080),
+                )
+                self.shadow_relink_attempts += 1
+                if not _sg_ok:
+                    self.shadow_relink_rejected += 1
+                    force_rejected += 1
+                    print(f"[ShadowGate] frame={self.frame_id} tid={tid} pid={pid} "
+                          f"blocked reason={_sg_reason} (force_scene revival)")
+                    continue
+                self.shadow_relink_accepted += 1
+                self.shadow_buffer.remove(pid)
+                print(f"[ShadowRelink] frame={self.frame_id} tid={tid} pid={pid} accepted cost={cst:.3f} (force_scene revival)")
 
             revived[tid] = pid
             meta[tid] = AssignmentMeta(
@@ -1315,6 +1386,25 @@ class IdentityCore:
                       f"attempted_pid={pid} reason=tid_stable_lock_protected")
                 self.locks.soft_recovery_rebinds_blocked += 1
                 continue
+
+            # ── Shadow gate ──
+            if self.shadow_buffer.has_shadow(pid):
+                _candidate_center = positions.get(tid, (0.0, 0.0)) if positions else (0.0, 0.0)
+                _sg_ok, _sg_reason = self.shadow_buffer.check_relink_eligibility(
+                    pid=pid, candidate_center=_candidate_center, candidate_team=None,
+                    current_frame=self.frame_id, cost=cst,
+                    frame_width=getattr(self, '_frame_width', 1920),
+                    frame_height=getattr(self, '_frame_height', 1080),
+                )
+                self.shadow_relink_attempts += 1
+                if not _sg_ok:
+                    self.shadow_relink_rejected += 1
+                    print(f"[ShadowGate] frame={self.frame_id} tid={tid} pid={pid} "
+                          f"blocked reason={_sg_reason} (soft revival)")
+                    continue
+                self.shadow_relink_accepted += 1
+                self.shadow_buffer.remove(pid)
+                print(f"[ShadowRelink] frame={self.frame_id} tid={tid} pid={pid} accepted cost={cst:.3f} (soft revival)")
 
             revived[tid] = pid
             meta[tid] = AssignmentMeta(
@@ -1736,6 +1826,10 @@ class IdentityCore:
         print(f"  pan_takeovers_blocked             = {self.pan_takeovers_blocked}")
         print(f"  pan_ttl_extensions                = {self.pan_ttl_extensions}")
         print(f"  official_pid_blocks               = {self.official_pid_blocks}")
+        print(f"\n[ShadowGateMetrics]")
+        print(f"  shadow_relink_attempts       = {self.shadow_relink_attempts}")
+        print(f"  shadow_relink_accepted       = {self.shadow_relink_accepted}")
+        print(f"  shadow_relink_rejected       = {self.shadow_relink_rejected}")
 
         violations = []
         if not ok_collapse:
@@ -1768,4 +1862,7 @@ class IdentityCore:
             "pan_takeovers_blocked": self.pan_takeovers_blocked,
             "pan_ttl_extensions": self.pan_ttl_extensions,
             "official_pid_blocks": self.official_pid_blocks,
+            "shadow_relink_attempts": self.shadow_relink_attempts,
+            "shadow_relink_accepted": self.shadow_relink_accepted,
+            "shadow_relink_rejected": self.shadow_relink_rejected,
         }
