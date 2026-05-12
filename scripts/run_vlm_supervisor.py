@@ -5,7 +5,7 @@ import sys
 from pathlib import Path
 
 try:
-    import google.generativeai as genai
+    from google import genai
     from PIL import Image
     HAS_GENAI = True
 except ImportError:
@@ -27,9 +27,7 @@ def main():
         print("      Get a free key from Google AI Studio and set it.")
         sys.exit(1)
 
-    genai.configure(api_key=api_key)
-    # Using gemini-1.5-flash as it is fast, highly capable, and has a great free tier.
-    model = genai.GenerativeModel('gemini-1.5-flash')
+    client = genai.Client(api_key=api_key)
 
     casefiles_dir = Path(f"temp/{args.job_id}/vlm_casefiles")
     if not casefiles_dir.exists():
@@ -73,7 +71,10 @@ def main():
         img = Image.open(contact_sheet_path)
 
         try:
-            response = model.generate_content([prompt, img])
+            response = client.models.generate_content(
+                model='gemini-2.5-flash',
+                contents=[prompt, img]
+            )
             text = response.text
 
             # Try to extract JSON from response
