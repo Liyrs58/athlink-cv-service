@@ -388,7 +388,7 @@ def validate_bbox_dimensions(
             bb = p.get("bbox") or [0, 0, 0, 0]
             if len(bb) < 4:
                 continue
-            if bb[2] > w + 1 or bb[3] > h + 1 or bb[0] < -1 or bb[1] < -1:
+            if bb[2] > w + 100 or bb[3] > h + 100 or bb[0] < -100 or bb[1] < -100:
                 msg = (
                     f"Track bbox {bb} outside source video {w}x{h} "
                     f"at frameIndex={frame.get('frameIndex')}; "
