@@ -68,6 +68,15 @@ STABLE_PROTECT_THRESHOLD = 10
 LOCK_PROMOTE_FRAMES = 5
 
 
+def _unwrap_emb(emb) -> Optional[np.ndarray]:
+    """Return the raw embedding ndarray from either a plain array or a dual-embedding dict."""
+    if emb is None:
+        return None
+    if isinstance(emb, dict):
+        return emb.get("emb")
+    return emb
+
+
 class IdentityState(str, Enum):
     LOCKED = "locked"
     REVIVED = "revived"
@@ -105,7 +114,7 @@ class PlayerSlot:
     velocity_pitch: Optional[Tuple[float, float]] = None
     hsv_signature: Optional[np.ndarray] = None
 
-    def update_embedding(self, emb: np.ndarray) -> None:
+    def update_embedding(self, emb) -> None:
         if isinstance(emb, dict):
             # Support dual-embedding: {"emb": ..., "hsv": ...}
             hsv = emb.get("hsv")
@@ -757,7 +766,7 @@ class IdentityCore:
         seeded = 0
         for i, tid in enumerate(tids[:len(empty_slots)]):
             slot = empty_slots[i]
-            emb = embed_map.get(tid)
+            emb = _unwrap_emb(embed_map.get(tid))
             if emb is not None:
                 slot.embedding = emb.copy()
                 slot.last_position = positions.get(tid, (0, 0))
@@ -1320,7 +1329,14 @@ class IdentityCore:
             e = t_emb.astype(np.float32)
             n = np.linalg.norm(e)
             if n > 0: e /= n
-            cos = float(np.clip(np.dot(e, slot.embedding), -1.0, 1.0))
+            try:
+                cos = float(np.clip(np.dot(e, slot.embedding), -1.0, 1.0))
+            except Exception as ex:
+                print(f"FATAL: np.dot crashed: {ex}")
+                print(f"type(e)={type(e)} e.shape={getattr(e, 'shape', None)} e.dtype={getattr(e, 'dtype', None)}")
+                print(f"type(slot.embedding)={type(slot.embedding)} shape={getattr(slot.embedding, 'shape', None)} dtype={getattr(slot.embedding, 'dtype', None)}")
+                print(f"slot.embedding repr: {repr(slot.embedding)[:200]}")
+                import sys; sys.exit(1)
             emb_cost = 1.0 - (cos + 1.0) * 0.5
 
         # 4. First-Order Spatial Cost (Prediction)
