@@ -87,10 +87,28 @@ def main():
         prompt = case_data.get("vlm_prompt", "")
         img = Image.open(contact_sheet_path)
 
+        if args.severity_routing:
+            if severity == "low":
+                print("  -> Low severity: deterministic only, skipping VLM")
+                continue
+            elif severity == "medium":
+                active_backend = "qwen_local" # conceptual routing to 3B
+                model_name = "qwen2.5-vl-3b"
+            elif severity == "high":
+                active_backend = args.vlm_backend # user default or gemini
+                model_name = "gemini-2.5-flash" if active_backend == "gemini" else "qwen2.5-vl-7b"
+            else:
+                active_backend = args.vlm_backend
+                model_name = "gemini-2.5-flash"
+        else:
+            active_backend = args.vlm_backend
+            model_name = "gemini-2.5-flash"
+
         # Caching logic
         import hashlib
+        # include model name in cache key
         prompt_hash = hashlib.md5(prompt.encode()).hexdigest()
-        cache_key = f"{window_id}_{prompt_hash}_{args.vlm_backend}"
+        cache_key = f"{window_id}_{prompt_hash}_{model_name}_{active_backend}"
         cache_path = case_dir / f"vlm_cache_{cache_key}.json"
         
         if cache_path.exists():
@@ -99,9 +117,9 @@ def main():
                 result = json.load(f)
         else:
             try:
-                if args.vlm_backend == "gemini" and client:
+                if active_backend == "gemini" and client:
                     response = client.models.generate_content(
-                        model='gemini-2.5-flash',
+                        model=model_name,
                         contents=[
                             prompt + "\n\nProvide your answer ONLY as a JSON object matching this schema: {\"decision\": \"accept_patch | reject_patch | needs_human | no_change\", \"confidence\": 0.0, \"reason_code\": \"string\", \"pid\": \"P13\", \"frame_start\": 0, \"frame_end\": 0, \"recommended_action\": \"reject_revival | split_tracklet | swap_pid_after_frame | no_change\", \"human_review_required\": false}", 
                             img
@@ -110,7 +128,7 @@ def main():
                     text = response.text
                 else:
                     # Mock response for local models not yet implemented
-                    text = '{"decision": "needs_human", "confidence": 0.0, "reason_code": "NOT_IMPLEMENTED"}'
+                    text = '{"decision": "needs_human", "confidence": 0.0, "reason_code": "NOT_IMPLEMENTED", "human_review_required": true}'
 
                 # Try to extract JSON from response
                 import re

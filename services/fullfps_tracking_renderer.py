@@ -80,8 +80,10 @@ class TrackObservation:
     team_id: int = -1
     identity_valid: bool = False
     assignment_source: str = ""
-    confidence: float = 0.0
+    detection_confidence: float = 0.0
+    identity_confidence: float = 0.0
     is_official: bool = False
+    consensus: str = "NEEDS_REVIEW"
 
 
 @dataclass
@@ -92,12 +94,14 @@ class RenderDecision:
     team_id: int
     state: RenderState
     bbox: Optional[list[float]] = None
-    confidence: float = 0.0
+    detection_confidence: float = 0.0
+    identity_confidence: float = 0.0
     alpha: float = 1.0
     assignment_source: str = ""
     hidden_reason: Optional[HideReason] = None
     raw_frame_idx: int = -1
     is_official: bool = False
+    consensus: str = "NEEDS_REVIEW"
 
 
 class RendererDimensionError(Exception):
@@ -361,11 +365,13 @@ def build_observations(
                     pid=(player.get("playerId") or player.get("displayId")) if key.startswith("PID:") else None,
                     tid=_player_tid(player),
                     bbox=raw_bbox,
-                    team_id=int(player.get("team_id", -1)),
-                    identity_valid=bool(player.get("identity_valid")),
-                    assignment_source=source,
-                    confidence=float(player.get("identity_confidence", 0.0) or 0.0),
-                    is_official=bool(player.get("is_official")),
+                    team_id=player.get("team_id", -1),
+                    identity_valid=player.get("identity_valid", False),
+                    assignment_source=player.get("assignment_source", ""),
+                    detection_confidence=float(player.get("confidence", 0.0) or 0.0),
+                    identity_confidence=float(player.get("identity_confidence", 0.0) or 0.0),
+                    is_official=player.get("is_official", False),
+                    consensus=player.get("consensus", "NEEDS_REVIEW"),
                 )
             )
 
@@ -506,11 +512,13 @@ def render_frames(
                         team_id=eo.team_id,
                         state=RenderState.VISIBLE,
                         bbox=list(eo.bbox),
-                        confidence=eo.confidence,
+                        detection_confidence=eo.detection_confidence,
+                        identity_confidence=eo.identity_confidence,
                         alpha=1.0,
                         assignment_source=eo.assignment_source,
                         raw_frame_idx=f,
                         is_official=eo.is_official,
+                        consensus=eo.consensus,
                     )
                     # Suppress ghost tracks on officials
                     if decision.latest_tid is not None and decision.latest_tid in officials_tids_by_frame.get(f, set()):
@@ -522,17 +530,21 @@ def render_frames(
 
             if prev_obs is None and next_obs is None:
                 continue
+            
+            latest_obs = prev_obs if prev_obs is not None else next_obs
 
             decision = RenderDecision(
                 key=key,
-                pid=(prev_obs or next_obs).pid,
-                latest_tid=(prev_obs or next_obs).tid,
-                team_id=(prev_obs or next_obs).team_id,
+                pid=latest_obs.pid,
+                latest_tid=latest_obs.tid,
+                team_id=latest_obs.team_id,
                 state=RenderState.HIDDEN,
-                confidence=(prev_obs or next_obs).confidence,
-                assignment_source=(prev_obs or next_obs).assignment_source,
+                detection_confidence=latest_obs.detection_confidence,
+                identity_confidence=latest_obs.identity_confidence,
+                assignment_source=latest_obs.assignment_source,
                 raw_frame_idx=f,
-                is_official=(prev_obs or next_obs).is_official,
+                is_official=latest_obs.is_official,
+                consensus=latest_obs.consensus,
             )
 
             if prev_obs is not None and next_obs is not None:
@@ -643,7 +655,7 @@ def render_frames(
                 RenderState.HIDDEN: 0,
             }
             group.sort(
-                key=lambda d: (STATE_RANK[d.state], d.confidence, -abs(f - d.raw_frame_idx)),
+                key=lambda d: (STATE_RANK[d.state], d.identity_confidence, -abs(f - d.raw_frame_idx)),
                 reverse=True,
             )
             for loser in group[1:]:
@@ -849,15 +861,13 @@ def _draw_decision(
     render_mode: str = "production",
     show_officials: bool = False,
     show_raw_id: bool = False,
-    show_confidence: bool = False
+    show_confidence: bool = False,
+    audit_verbose: bool = False,
+    audit_focus: Optional[list[str]] = None,
 ) -> None:
     if d.bbox is None:
         return
     
-    is_official_track = getattr(d, 'is_official', False) or d.key.startswith("OFFICIAL:")
-    if is_official_track and not show_officials:
-        return
-
     h, w = frame.shape[:2]
     x1 = max(0, min(int(d.bbox[0]), w - 1))
     y1 = max(0, min(int(d.bbox[1]), h - 1))
@@ -865,65 +875,105 @@ def _draw_decision(
     y2 = max(0, min(int(d.bbox[3]), h - 1))
     if x2 <= x1 or y2 <= y1:
         return
-    color = _color_for(d, render_mode)
-    thickness = 2 if d.state == RenderState.VISIBLE else 1
-    cv2.rectangle(frame, (x1, y1), (x2, y2), color, thickness)
-
-    label = ""
-    if is_official_track:
-        label = "REF"
-    elif render_mode == "audit":
-        parts = []
-        if d.pid:
-            parts.append(d.pid)
-            tag = "LOCK" if d.assignment_source == "locked" else "REV"
-            parts.append(tag)
+        
+    text = None
+    if render_mode == "production":
+        # Production: show box for everyone, but only text for confirmed players
+        if d.is_official:
+            return
+        if d.consensus != "CONFIRMED":
+            text = None
+        elif d.state == RenderState.HELD:
+            text = None
         else:
-            parts.append("UNK")
-            if d.latest_tid is not None:
-                parts.append(f"raw={d.latest_tid}")
+            text = d.pid
+
+        color = (255, 255, 255) # White box
+        bg_color = (130, 0, 0) if d.team_id == 0 else (0, 0, 130) if d.team_id == 1 else (50, 50, 50)
+        thickness = 2
+    
+    else: # audit or casefile
+        if d.is_official and not show_officials:
+            return
             
-        if show_raw_id and d.latest_tid is not None and d.pid:
-            parts.append(f"raw={d.latest_tid}")
-            
-        if show_confidence and hasattr(d, 'confidence'):
-            parts.append(f"c={d.confidence:.2f}")
-            
-        label = " | ".join(parts)
-    elif render_mode == "casefile":
-        if d.pid:
-            tag = "LOCK" if d.assignment_source == "locked" else "REV"
-            label = f"{d.pid} {tag}"
-            if show_raw_id and d.latest_tid is not None:
-                label += f" T{d.latest_tid}"
-    else: # production
-        if d.pid:
-            if d.assignment_source == "locked":
-                label = f"{d.pid} LOCK"
-            elif d.assignment_source == "revived":
-                # HIDE_LABEL for REVIVED, but keep the team color box.
-                label = ""
+        dimmed = False
+        thickness = 2
+        if audit_focus is not None:
+            if d.pid not in audit_focus:
+                dimmed = True
+                thickness = 1
             else:
-                # hide UNKNOWN completely
-                if not debug:
-                    return
+                thickness = 4
+                
+        if d.is_official:
+            color = (128, 0, 128) # Purple
+            bg_color = (64, 0, 64)
+            status_code = "O"
+        elif d.consensus == "CONFIRMED":
+            color = (0, 255, 0) # Green
+            bg_color = (0, 128, 0)
+            status_code = "C"
+        elif d.consensus == "REJECTED":
+            color = (0, 0, 255) # Red
+            bg_color = (0, 0, 128)
+            status_code = "X"
+        elif d.consensus == "AMBIGUOUS" or d.consensus == "NEEDS_REVIEW":
+            color = (0, 165, 255) # Orange
+            bg_color = (0, 80, 128)
+            status_code = "A" if d.consensus == "AMBIGUOUS" else "?"
         else:
-            if not debug:
-                return
+            color = (128, 128, 128) # Gray
+            bg_color = (64, 64, 64)
+            status_code = "U"
+            
+        if d.assignment_source == "locked":
+            src_code = "L"
+        elif d.assignment_source == "revived":
+            src_code = "R"
+        else:
+            src_code = "U"
+            
+        if dimmed:
+            color = (color[0]//2, color[1]//2, color[2]//2)
+            bg_color = (bg_color[0]//2, bg_color[1]//2, bg_color[2]//2)
+            
+        if audit_verbose:
+            parts = [d.pid or "UNK"]
+            parts.append(d.assignment_source.upper() if d.assignment_source else "UNASSIGNED")
+            parts.append(d.consensus)
+            if show_raw_id and d.latest_tid is not None:
+                parts.append(f"raw={d.latest_tid}")
+            if show_confidence:
+                if d.pid:
+                    parts.append(f"id={d.identity_confidence:.2f}")
+                else:
+                    parts.append(f"det={d.detection_confidence:.2f}")
+            text = " | ".join(parts)
+        else:
+            parts = [d.pid or "UNK"]
+            if d.pid:
+                parts.append(f"{src_code}{status_code}")
+            if show_raw_id and d.latest_tid is not None:
+                parts.append(f"r{d.latest_tid}")
+            if show_confidence:
+                if d.pid:
+                    parts.append(f"id{d.identity_confidence:.2f}")
+                else:
+                    parts.append(f"det{d.detection_confidence:.2f}")
+            text = " ".join(parts)
 
-    if label:
+    cv2.rectangle(frame, (x1, y1), (x2, y2), color, thickness)
+    if text:
         font = cv2.FONT_HERSHEY_SIMPLEX
-        scale = 0.45
+        scale = 0.4
         text_th = 1
-        (tw, th), _ = cv2.getTextSize(label, font, scale, text_th)
-        bx1 = x1
-        by1 = max(0, y1 - th - 4)
-        bx2 = min(w - 1, x1 + tw + 6)
-        by2 = by1 + th + 4
+        (tw, th), _ = cv2.getTextSize(text, font, scale, text_th)
+        bx1, by1 = x1, max(0, y1 - th - 6)
+        bx2, by2 = min(w - 1, x1 + tw + 6), by1 + th + 6
         overlay = frame.copy()
-        cv2.rectangle(overlay, (bx1, by1), (bx2, by2), (30, 30, 30), -1)
-        cv2.addWeighted(overlay, 0.55, frame, 0.45, 0, frame)
-        cv2.putText(frame, label, (bx1 + 3, by2 - 3), font, scale, (255, 255, 255),
+        cv2.rectangle(overlay, (bx1, by1), (bx2, by2), bg_color, -1)
+        cv2.addWeighted(overlay, 0.6, frame, 0.4, 0, frame)
+        cv2.putText(frame, text, (bx1 + 3, by2 - 4), font, scale, (255, 255, 255),
                     text_th, cv2.LINE_AA)
 
 
@@ -968,6 +1018,8 @@ def render_video(
     show_officials: bool = False,
     show_raw_id: bool = False,
     show_confidence: bool = False,
+    audit_verbose: bool = False,
+    audit_focus: Optional[list[str]] = None,
 ) -> dict:
     """Run the full renderer. Returns the manifest dict."""
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
@@ -1048,7 +1100,9 @@ def render_video(
                     render_mode=render_mode,
                     show_officials=show_officials,
                     show_raw_id=show_raw_id,
-                    show_confidence=show_confidence
+                    show_confidence=show_confidence,
+                    audit_verbose=audit_verbose,
+                    audit_focus=audit_focus,
                 )
         writer.write(frame)
         if write_contact_sheet and f in contact_sample_indices:

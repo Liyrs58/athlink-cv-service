@@ -120,23 +120,28 @@ class PatchValidator:
             
             for p in frame_data.get("players", []):
                 pid = p.get("playerId")
-                if not pid:
-                    continue
-                    
                 raw_tid = p.get("rawTrackId")
                 bbox = p.get("bbox")
                 cx = (bbox[0] + bbox[2]) / 2.0
                 cy = (bbox[1] + bbox[3]) / 2.0
                 
-                # Rule: Two different PIDs cannot share the same raw_track_id
+                # Rule: Two different player objects cannot share the same raw_track_id
                 if raw_tid in raw_tids_in_frame:
                     other_pid = raw_tids_in_frame[raw_tid]
+                    if other_pid is None or pid is None:
+                        return PatchRejection(
+                            patch, "PID_UNK_RAW_COLLISION_REJECT",
+                            f"PID {pid} and PID {other_pid} share raw_track_id {raw_tid} in frame {fi}"
+                        )
                     return PatchRejection(
-                        patch, "PHYSICALITY_SPATIAL_DUPLICATE_REJECT",
+                        patch, "RAW_TRACK_DUPLICATE_REJECT",
                         f"PIDs {pid} and {other_pid} share raw_track_id {raw_tid} in frame {fi}"
                     )
                 raw_tids_in_frame[raw_tid] = pid
                 
+                if not pid:
+                    continue
+                    
                 # Rule: No two PIDs can be in the exact same spatial location
                 for (opid, ocx, ocy) in bboxes_in_frame:
                     dist = math.hypot(cx - ocx, cy - ocy)
@@ -150,7 +155,7 @@ class PatchValidator:
                 
                 if pid in pids_in_frame:
                     return PatchRejection(
-                        patch, "CREATES_DUPLICATE_PID",
+                        patch, "PID_DUPLICATE_REJECT",
                         f"Duplicate {pid} in frame {fi}"
                     )
                 pids_in_frame.add(pid)
@@ -166,8 +171,10 @@ class PatchValidator:
                 
                 gap = fi2 - fi1
                 if gap > 150: # Large temporal gap without explicit occlusion handling
-                    # We might skip temporal gap check for now, or just warn.
-                    pass
+                    return PatchRejection(
+                        patch, "PHYSICALITY_TEMPORAL_GAP_REJECT",
+                        f"pid={pid} has unexplained gap of {gap} frames between {fi1} and {fi2}"
+                    )
                 
                 # Speed check
                 dist = math.hypot(cx2 - cx1, cy2 - cy1)
@@ -268,7 +275,7 @@ class IdentityPatchService:
                 rejected.append(rejection.to_dict())
                 if "SPEED" in rejection.reason:
                     physicality_rejects["speed"] += 1
-                elif "SPATIAL" in rejection.reason or "DUPLICATE" in rejection.reason:
+                elif "SPATIAL" in rejection.reason or "DUPLICATE" in rejection.reason or "COLLISION" in rejection.reason:
                     physicality_rejects["spatial_duplicate"] += 1
                 elif "TEMPORAL" in rejection.reason:
                     physicality_rejects["temporal_gap"] += 1

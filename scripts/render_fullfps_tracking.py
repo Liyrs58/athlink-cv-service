@@ -45,6 +45,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--strict", action="store_true",
                    help="Fail on missing camera_motion/identity_metrics, "
                         "dimension mismatch, duplicate PID, or hungarian/provisional render.")
+    p.add_argument("--audit-verbose", action="store_true",
+                   help="Use verbose labels instead of compact labels in audit mode")
+    p.add_argument("--audit-focus", type=str,
+                   help="Comma-separated list of PIDs to focus on (e.g. P1,P2). Others will be dimmed.")
     return p.parse_args()
 
 
@@ -79,6 +83,8 @@ def main() -> int:
         show_officials=args.show_officials,
         show_raw_id=args.show_raw_id,
         show_confidence=args.show_confidence,
+        audit_verbose=args.audit_verbose,
+        audit_focus=args.audit_focus.split(",") if args.audit_focus else None,
     )
 
     print("=" * 60)

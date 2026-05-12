@@ -884,16 +884,18 @@ class TrackerCore:
                     slot = self.identity.get_slot(meta.pid)
                     team_id = slot.team_id if slot else None
                     team_confidence = 0.91 if team_id is not None else 0.0
+                    consensus = "CONFIRMED" if source == "locked" else "AMBIGUOUS"
                 else:
                     # Uncertain — render as raw track (T<id>), no P-id
                     out_pid = None
                     source = "unassigned"
                     identity_valid = False
-                    identity_confidence = float(meta.confidence) if meta else 0.0
+                    identity_confidence = 0.0
                     player_id = None
                     display_id = "?" if assignment_pending else None
                     team_id = None
                     team_confidence = 0.0
+                    consensus = "NEEDS_REVIEW"
 
                 players.append({
                     "trackId": out_pid if out_pid is not None else int(tid),
@@ -914,6 +916,7 @@ class TrackerCore:
                     "team_confidence": team_confidence,
                     "role": "player" if player_id else "unknown",
                     "is_official": False,
+                    "consensus": consensus,
                 })
 
             officials_list = []
@@ -922,7 +925,7 @@ class TrackerCore:
                 ofc_obj = {
                     "trackId": int(ofc.track_id),
                     "rawTrackId": int(ofc.track_id),
-                    "playerId": f"OFFICIAL_{int(ofc.track_id)}",
+                    "playerId": None,
                     "displayId": "REF",
                     "assignment_pending": False,
                     "bbox": [float(ox1), float(oy1), float(ox2), float(oy2)],
@@ -931,13 +934,14 @@ class TrackerCore:
                     "gameState": state.value,
                     "analysis_valid": True,
                     "crop_quality": 1.0,
-                    "identity_valid": True,
+                    "identity_valid": False,
                     "assignment_source": "locked",
-                    "identity_confidence": 1.0,
+                    "identity_confidence": 0.0,
                     "team_id": None,
                     "team_confidence": 0.0,
                     "role": "official",
                     "is_official": True,
+                    "consensus": "CONFIRMED",
                 }
                 officials_list.append(ofc_obj)
                 players.append(ofc_obj)
@@ -947,9 +951,61 @@ class TrackerCore:
             if last_ball is not None:
                 ball_list.append(last_ball)
 
+            # Enforce 1:1 Identity Invariants
+            final_players = []
+            seen_raw = {}
+            seen_pid = {}
+            
+            for p in players:
+                raw = p.get("rawTrackId")
+                pid = p.get("playerId")
+                
+                # If this raw track ID is already seen...
+                if raw in seen_raw:
+                    existing = seen_raw[raw]
+                    # Keep the one with higher identity confidence
+                    if p.get("identity_confidence", 0) > existing.get("identity_confidence", 0):
+                        existing["playerId"] = None
+                        existing["identity_valid"] = False
+                        existing["identity_confidence"] = 0.0
+                        existing["consensus"] = "NEEDS_REVIEW"
+                        existing["assignment_source"] = "unassigned"
+                    else:
+                        p["playerId"] = None
+                        p["identity_valid"] = False
+                        p["identity_confidence"] = 0.0
+                        p["consensus"] = "NEEDS_REVIEW"
+                        p["assignment_source"] = "unassigned"
+                        pid = None
+
+                seen_raw[raw] = p
+                
+                # If this PID is already seen...
+                if pid is not None:
+                    if pid in seen_pid:
+                        existing = seen_pid[pid]
+                        # Keep the one with higher confidence
+                        if p.get("identity_confidence", 0) > existing.get("identity_confidence", 0):
+                            existing["playerId"] = None
+                            existing["identity_valid"] = False
+                            existing["identity_confidence"] = 0.0
+                            existing["consensus"] = "NEEDS_REVIEW"
+                            existing["assignment_source"] = "unassigned"
+                        else:
+                            p["playerId"] = None
+                            p["identity_valid"] = False
+                            p["identity_confidence"] = 0.0
+                            p["consensus"] = "NEEDS_REVIEW"
+                            p["assignment_source"] = "unassigned"
+                    else:
+                        seen_pid[pid] = p
+
+            for p in players:
+                final_players.append(p)
+
             self.results.append({
                 "frameIndex": int(video_frame),
-                "players": players,
+                "players": final_players,
                 "officials": officials_list,
                 "ball": ball_list,
                 "detection_count": len(dets),
