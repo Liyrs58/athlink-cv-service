@@ -615,3 +615,112 @@ class TestOfficialHardGate:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+class TestShadowBuffer:
+    """Shadow buffer captures departing locks; evicts on TTL; gates relinks."""
+
+    def _make_shadow_entry(self, pid="P7", last_tid=7, last_seen=10,
+                           center=(100.0, 200.0), team_id=0, exit_edge="left",
+                           stable_count=20):
+        from services.identity_core import ShadowEntry
+        import numpy as np
+        emb = np.random.randn(512).astype(np.float32)
+        emb /= np.linalg.norm(emb)
+        return ShadowEntry(
+            pid=pid, last_tid=last_tid, last_seen_frame=last_seen,
+            last_bbox=(80, 150, 120, 250), last_center=center,
+            last_embedding=emb, team_id=team_id, exit_edge=exit_edge,
+            stable_count=stable_count,
+        )
+
+    def test_shadow_entry_captured_on_lock_expiry(self):
+        """When a locked slot's lock expires, a ShadowEntry must be created."""
+        import numpy as np
+        from services.identity_core import IdentityCore, ShadowBuffer
+
+        identity = IdentityCore()
+        lk, _ = identity.locks.try_create_lock(7, "P7", "hungarian", frame_id=0, ttl=2)
+        slot = identity._slot_by_pid("P7")
+        slot.state = "active"
+        slot.last_position = (100.0, 200.0)
+
+        identity.begin_frame(5, present_tids=set())
+        identity.end_frame()
+
+        assert identity.shadow_buffer.has_shadow("P7"), \
+            "P7 must have a shadow entry after lock expiry"
+
+    def test_shadow_evicts_after_ttl(self):
+        """ShadowEntry must be evicted after SHADOW_TTL_FRAMES."""
+        from services.identity_core import ShadowBuffer
+        buf = ShadowBuffer(ttl_frames=10)
+        buf.add(self._make_shadow_entry(), added_frame=0)
+        assert buf.has_shadow("P7")
+        buf.evict_expired(current_frame=11)
+        assert not buf.has_shadow("P7"), "P7 shadow must evict after TTL"
+
+    def test_shadow_not_evicted_before_ttl(self):
+        """ShadowEntry must survive within TTL window."""
+        from services.identity_core import ShadowBuffer
+        buf = ShadowBuffer(ttl_frames=90)
+        buf.add(self._make_shadow_entry(), added_frame=0)
+        buf.evict_expired(current_frame=89)
+        assert buf.has_shadow("P7"), "P7 shadow must not evict before TTL"
+
+    def test_relink_blocked_if_gap_too_small(self):
+        """Relink must be rejected if time gap < MIN_RELINK_GAP_FRAMES."""
+        from services.identity_core import ShadowBuffer
+        buf = ShadowBuffer(ttl_frames=90, min_relink_gap=8)
+        buf.add(self._make_shadow_entry(last_seen=10), added_frame=10)
+        ok, reason = buf.check_relink_eligibility(
+            pid="P7", candidate_center=(105.0, 205.0),
+            candidate_team=0, current_frame=15,
+            cost=0.18, frame_width=1920, frame_height=1080,
+        )
+        assert not ok, f"Gap=5 < min=8 must block relink; got ok={ok}, reason={reason}"
+        assert "gap" in reason.lower()
+
+    def test_relink_blocked_if_cost_too_high(self):
+        """Relink must be rejected if cost > SHADOW_MAX_COST."""
+        from services.identity_core import ShadowBuffer
+        buf = ShadowBuffer(ttl_frames=90, min_relink_gap=8, max_cost=0.22)
+        buf.add(self._make_shadow_entry(last_seen=10, exit_edge="left",
+                                        center=(50.0, 400.0)), added_frame=10)
+        ok, reason = buf.check_relink_eligibility(
+            pid="P7", candidate_center=(60.0, 410.0),
+            candidate_team=0, current_frame=25,
+            cost=0.30,
+            frame_width=1920, frame_height=1080,
+        )
+        assert not ok, "Cost=0.30 > max=0.22 must block relink"
+        assert "cost" in reason.lower()
+
+    def test_relink_blocked_if_wrong_team(self):
+        """Relink must be rejected if candidate team != shadow team."""
+        from services.identity_core import ShadowBuffer
+        buf = ShadowBuffer(ttl_frames=90, min_relink_gap=8, max_cost=0.22)
+        buf.add(self._make_shadow_entry(last_seen=10, team_id=0), added_frame=10)
+        ok, reason = buf.check_relink_eligibility(
+            pid="P7", candidate_center=(50.0, 400.0),
+            candidate_team=1,
+            current_frame=25, cost=0.15,
+            frame_width=1920, frame_height=1080,
+        )
+        assert not ok, "Wrong team must block shadow relink"
+        assert "team" in reason.lower()
+
+    def test_valid_relink_accepted(self):
+        """Valid relink (gap ok, cost ok, same team, no edge required) must be accepted."""
+        from services.identity_core import ShadowBuffer
+        buf = ShadowBuffer(ttl_frames=90, min_relink_gap=8, max_cost=0.22,
+                           edge_margin_px=96, require_edge=False)
+        buf.add(self._make_shadow_entry(
+            last_seen=10, team_id=0, exit_edge="left", center=(50.0, 400.0)
+        ), added_frame=10)
+        ok, reason = buf.check_relink_eligibility(
+            pid="P7", candidate_center=(80.0, 390.0),
+            candidate_team=0, current_frame=25,
+            cost=0.18, frame_width=1920, frame_height=1080,
+        )
+        assert ok, f"Valid relink must be accepted; reason={reason}"

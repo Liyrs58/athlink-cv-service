@@ -69,6 +69,109 @@ EMB_ALPHA = 0.25
 STABLE_PROTECT_THRESHOLD = 10
 LOCK_PROMOTE_FRAMES = 5
 
+# ── Shadow buffer configuration (env-configurable) ────────────────────
+_SHADOW_TTL_FRAMES   = int(os.environ.get("ATHLINK_SHADOW_TTL_FRAMES", "90"))
+_MIN_RELINK_GAP      = int(os.environ.get("ATHLINK_MIN_RELINK_GAP_FRAMES", "8"))
+_EDGE_MARGIN_PX      = int(os.environ.get("ATHLINK_EDGE_MARGIN_PX", "96"))
+_SHADOW_MAX_COST     = float(os.environ.get("ATHLINK_SHADOW_MAX_COST", "0.22"))
+_SHADOW_REQUIRE_EDGE = int(os.environ.get("ATHLINK_SHADOW_REQUIRE_EDGE", "1")) == 1
+
+
+@dataclass
+class ShadowEntry:
+    pid: str
+    last_tid: int
+    last_seen_frame: int
+    last_bbox: Optional[Tuple]
+    last_center: Tuple[float, float]
+    last_embedding: Optional[np.ndarray]
+    team_id: Optional[int]
+    exit_edge: str
+    stable_count: int
+    _added_frame: int = 0
+
+
+class ShadowBuffer:
+    """Holds departed locked players in SHADOW state. Gates re-linking."""
+
+    def __init__(
+        self,
+        ttl_frames: int = _SHADOW_TTL_FRAMES,
+        min_relink_gap: int = _MIN_RELINK_GAP,
+        max_cost: float = _SHADOW_MAX_COST,
+        edge_margin_px: int = _EDGE_MARGIN_PX,
+        require_edge: bool = _SHADOW_REQUIRE_EDGE,
+    ):
+        self._ttl = ttl_frames
+        self._min_gap = min_relink_gap
+        self._max_cost = max_cost
+        self._edge_margin = edge_margin_px
+        self._require_edge = require_edge
+        self._entries: Dict[str, ShadowEntry] = {}
+
+    def add(self, entry: ShadowEntry, added_frame: int) -> None:
+        entry._added_frame = added_frame
+        self._entries[entry.pid] = entry
+
+    def has_shadow(self, pid: str) -> bool:
+        return pid in self._entries
+
+    def get(self, pid: str) -> Optional[ShadowEntry]:
+        return self._entries.get(pid)
+
+    def evict_expired(self, current_frame: int) -> List[str]:
+        expired = [
+            pid for pid, e in self._entries.items()
+            if current_frame - e._added_frame > self._ttl
+        ]
+        for pid in expired:
+            del self._entries[pid]
+        return expired
+
+    def check_relink_eligibility(
+        self,
+        pid: str,
+        candidate_center: Tuple[float, float],
+        candidate_team: Optional[int],
+        current_frame: int,
+        cost: float,
+        frame_width: int,
+        frame_height: int,
+    ) -> Tuple[bool, str]:
+        entry = self._entries.get(pid)
+        if entry is None:
+            return False, "no_shadow"
+
+        gap = current_frame - entry.last_seen_frame
+        if gap < self._min_gap:
+            return False, f"gap={gap} < min_relink_gap={self._min_gap}"
+
+        if cost > self._max_cost:
+            return False, f"cost={cost:.3f} > max={self._max_cost}"
+
+        if entry.team_id is not None and candidate_team is not None:
+            if entry.team_id != candidate_team:
+                return False, f"team_mismatch shadow={entry.team_id} candidate={candidate_team}"
+
+        if self._require_edge and entry.exit_edge != "interior":
+            cx, cy = candidate_center
+            near_edge = (
+                cx < self._edge_margin or
+                cx > frame_width - self._edge_margin or
+                cy < self._edge_margin or
+                cy > frame_height - self._edge_margin
+            )
+            if not near_edge:
+                return False, f"require_edge=True but candidate ({cx:.0f},{cy:.0f}) not near edge"
+
+        return True, ""
+
+    def remove(self, pid: str) -> None:
+        self._entries.pop(pid, None)
+
+    def all_pids(self) -> List[str]:
+        return list(self._entries.keys())
+
 
 def _env_bool(name: str, default: bool = False) -> bool:
     val = os.environ.get(name)
@@ -91,6 +194,19 @@ def _unwrap_emb(emb) -> Optional[np.ndarray]:
     if isinstance(emb, dict):
         return emb.get("emb")
     return emb
+
+
+def _edge_for_center(cx: float, cy: float, fw: int, fh: int, margin: int) -> str:
+    """Return the nearest frame edge name, or 'interior' if not near any edge."""
+    if cx < margin:
+        return "left"
+    if cx > fw - margin:
+        return "right"
+    if cy < margin:
+        return "top"
+    if cy > fh - margin:
+        return "bottom"
+    return "interior"
 
 
 class IdentityState(str, Enum):
@@ -256,6 +372,12 @@ class IdentityCore:
         self.fast_pan_frames: int = 0
         self.cut_frames: int = 0
         self.official_pid_blocks: int = 0
+
+        # Shadow buffer
+        self.shadow_buffer = ShadowBuffer()
+        self.shadow_relink_attempts: int = 0
+        self.shadow_relink_accepted: int = 0
+        self.shadow_relink_rejected: int = 0
 
     # ------------------------------------------------------------------
     # Single source of truth for restricted identity mode
