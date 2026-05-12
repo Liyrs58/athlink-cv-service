@@ -791,14 +791,27 @@ def _run_tracking_impl(
 
     # FIX 4: Standalone BoT-SORT tracker for state-managed coasting
     from boxmot.trackers.botsort.botsort import BotSort
-    # ReID model initialization (OSNet) — FIX 1: Force x1_0 for better discrimination
+    # Robust OSNet path resolution — check /content and environment before default
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    candidate_reid_paths = [
+        os.environ.get("OSNET_WEIGHTS", ""),
+        "/content/osnet_x1_0_msmt17.pt",
+        "/content/athlink-cv-service/models/osnet_x1_0_msmt17.pt",
+        os.path.join(repo_root, "models", "osnet_x1_0_msmt17.pt"),
+        os.path.join(repo_root, "osnet_x1_0_msmt17.pt"),
+    ]
     reid_model_path = Path("models/osnet_x1_0_msmt17.pt")
+    for cp in candidate_reid_paths:
+        if cp and os.path.exists(cp) and os.path.getsize(cp) > 1_000_000:
+            reid_model_path = Path(cp)
+            break
+
     tracker = BotSort(
         reid_weights=reid_model_path,
         device=_detect_device(),
         half=_use_half,
     )
-    logger.info(f"ReID model loaded: {reid_model_path}")
+    logger.info(f"ReID model initialized with weights: {reid_model_path}")
     print(f"✓ ReID model initialized: {reid_model_path}")
 
     # Patch hyperparameters for V2 manually to avoid YAML/Namespace issues

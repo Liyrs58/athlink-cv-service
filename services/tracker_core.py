@@ -48,7 +48,11 @@ class ReIDExtractor:
 
     OSNet weights: /content/osnet_x1_0_msmt17.pt (upload to Colab)
     """
-    OSNET_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "models", "osnet_x1_0_msmt17.pt")
+    HF_OSNET_REPO = "kaiyangzhou/osnet"
+    HF_OSNET_FILE = (
+        "osnet_x1_0_msmt17_combineall_256x128_amsgrad_ep150_"
+        "stp60_lr0.0015_b64_fb10_softmax_labelsmooth_flip_jitter.pth"
+    )
 
     def __init__(self, device="cpu"):
         self.device = "cuda" if "cuda" in str(device) else "cpu"
@@ -59,6 +63,7 @@ class ReIDExtractor:
         self.model = None
         self.transform = None
         self.feat_dim = 52  # HSV fallback dim
+        self.target_size = (256, 128)  # default, overridden when model loads
 
         # Try OSNet first
         self._try_load_osnet()
@@ -70,34 +75,67 @@ class ReIDExtractor:
         if self.model is None:
             print("[ReID] torchvision not found. Using HSV fallback only — same-team identity unreliable.")
 
+    def _candidate_osnet_paths(self) -> list[str]:
+        repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        return [
+            os.environ.get("OSNET_WEIGHTS", ""),
+            "/content/osnet_x1_0_msmt17.pt",
+            "/content/athlink-cv-service/models/osnet_x1_0_msmt17.pt",
+            os.path.join(repo_root, "models", "osnet_x1_0_msmt17.pt"),
+            os.path.join(repo_root, "osnet_x1_0_msmt17.pt"),
+        ]
+
+    def _find_osnet_weights(self) -> str | None:
+        for path in self._candidate_osnet_paths():
+            if not path:
+                continue
+            if os.path.exists(path) and os.path.getsize(path) > 1_000_000:
+                print(f"[ReID] Found OSNet weights at {path}")
+                return path
+        return None
+
+    def _download_osnet_weights(self, target_path: str) -> bool:
+        os.makedirs(os.path.dirname(target_path), exist_ok=True)
+
+        try:
+            from huggingface_hub import hf_hub_download
+            import shutil
+
+            print("[ReID] Downloading OSNet via huggingface_hub...")
+            downloaded = hf_hub_download(
+                repo_id=self.HF_OSNET_REPO,
+                filename=self.HF_OSNET_FILE,
+                local_dir=os.path.dirname(target_path),
+                local_dir_use_symlinks=False,
+            )
+
+            if downloaded != target_path:
+                shutil.copy2(downloaded, target_path)
+
+            print(f"[ReID] OSNet downloaded to {target_path}")
+            return True
+
+        except Exception as e:
+            print(f"[ReID] huggingface_hub OSNet download failed: {e}")
+            return False
+
     def _try_load_osnet(self):
-        if not os.path.exists(self.OSNET_PATH):
-            print(f"[ReID] OSNet weights not found at {self.OSNET_PATH} — attempting to download...")
-            import urllib.request
-            os.makedirs(os.path.dirname(self.OSNET_PATH), exist_ok=True)
-            # Multiple fallback URLs for the MSMT17-trained OSNet x1.0 weights
-            osnet_urls = [
-                "https://huggingface.co/kaiyangzhou/osnet/resolve/main/osnet_x1_0_msmt17_combineall_256x128_amsgrad_ep150_stp60_lr0.0015_b64_fb10_softmax_labelsmooth_flip_jitter.pth",
-                "https://huggingface.co/kaiyangzhou/osnet/resolve/main/osnet_x1_0_imagenet.pth",
-            ]
-            downloaded = False
-            for url in osnet_urls:
-                try:
-                    print(f"[ReID] Trying: {url.split('/')[-1]}")
-                    urllib.request.urlretrieve(url, self.OSNET_PATH)
-                    print(f"[ReID] Successfully downloaded OSNet weights to {self.OSNET_PATH}")
-                    downloaded = True
-                    break
-                except Exception as e:
-                    print(f"[ReID] Download failed from {url}: {e}")
-            if not downloaded:
-                print("[ReID] All OSNet download URLs failed.")
+        osnet_path = self._find_osnet_weights()
+
+        if osnet_path is None:
+            repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            osnet_path = os.path.join(repo_root, "models", "osnet_x1_0_msmt17.pt")
+
+            if not self._download_osnet_weights(osnet_path):
+                print("[ReID] OSNet unavailable; falling back.")
                 return
+
+        print(f"[ReID] Loading OSNet from {osnet_path}")
         try:
             import torchreid
 
             # Load raw checkpoint and unwrap if needed
-            ckpt = torch.load(self.OSNET_PATH, map_location="cpu")
+            ckpt = torch.load(osnet_path, map_location="cpu")
             state_dict = ckpt.get("state_dict", ckpt) if isinstance(ckpt, dict) else ckpt
 
             # Strip "module." prefix (DataParallel checkpoints)
@@ -228,8 +266,8 @@ class TrackerCore:
         yolo_device = "cuda" if ("cuda" in str(device) or str(device) == "0") else "cpu"
         self.yolo = YOLO(yolo_path)
         self.yolo.to(yolo_device)
-        if yolo_device == "cuda":
-            self.yolo.half()
+        # We don't call .half() here, as it can cause dtype mismatch errors during fusion.
+        # Instead, we pass half=True to the predict() call below.
 
         # Derive class-id sets from model.names so we work with either:
         #   roboflow_players.pt  → {0:'ball', 1:'goalkeeper', 2:'player', 3:'referee'}
@@ -308,7 +346,9 @@ class TrackerCore:
         coco yolov8 → {0:person, 32:sports ball}. Output cls is normalised
         to roboflow numbering so downstream consumers stay unchanged."""
         self._last_ball_det = None
-        results = self.yolo.predict(frame, conf=0.05, verbose=False)
+        # Use built-in half parameter to handle fusion safely on GPU
+        use_half = "cuda" in str(self.device) or str(self.device) == "0"
+        results = self.yolo.predict(frame, conf=0.05, verbose=False, half=use_half)
         boxes = results[0].boxes
         if boxes is None or len(boxes) == 0:
             return np.empty((0, 6))
@@ -1133,7 +1173,8 @@ def run_tracking(video_path, job_id, frame_stride=1, max_frames=None, device="cp
 
             # Raw YOLO inference for diagnostics — share with tracker.detect via
             # a single-pass that records the histogram, then filters.
-            yolo_results = tracker.yolo.predict(frame, conf=0.05, verbose=False)
+            use_half = ("cuda" in str(device) or str(device) == "0")
+            yolo_results = tracker.yolo.predict(frame, conf=0.05, verbose=False, half=use_half)
             yolo_boxes = yolo_results[0].boxes
             if yolo_boxes is None or len(yolo_boxes) == 0:
                 raw_classes = []
