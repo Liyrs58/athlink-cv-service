@@ -236,6 +236,7 @@ class PlayerSlot:
     last_pitch: Optional[Tuple[float, float]] = None
     embedding: Optional[np.ndarray] = None
     stability_counter: int = 0
+    last_lock_stable_count: int = 0  # stable_count of the most recently held lock
     pending_tid: Optional[int] = None
     pending_streak: int = 0
     pending_seen_seq: int = 0  # identity_frame_seq when last matched
@@ -528,7 +529,15 @@ class IdentityCore:
     # Lifecycle
     # ------------------------------------------------------------------
 
-    def begin_frame(self, frame_id: int, present_tids: Optional[Set[int]] = None) -> None:
+    def begin_frame(
+        self,
+        frame_id: int,
+        present_tids: Optional[Set[int]] = None,
+        frame_width: int = 1920,
+        frame_height: int = 1080,
+    ) -> None:
+        self._frame_width = frame_width
+        self._frame_height = frame_height
         self.frame_id = frame_id
         self.assigned_this_frame = 0
         self.unmatched_tracks = 0
@@ -544,9 +553,46 @@ class IdentityCore:
         self.locks.in_collapse = self.in_soft_collapse
         if present_tids is not None:
             self._present_tids = set(present_tids)
+            # Snapshot lock stable_counts onto slots before tick removes expired locks
+            for lk in self.locks._tid_to_lock.values():
+                s = self._slot_by_pid(lk.pid)
+                if s is not None:
+                    s.last_lock_stable_count = lk.stable_count
             self.locks.tick(frame_id, present_tids, restricted=restricted)
         else:
             self._present_tids = set()
+        # ── Shadow capture: slots whose lock just expired enter SHADOW state ──
+        self.shadow_buffer.evict_expired(frame_id)
+        live_lock_pids = {lk.pid for lk in self.locks._tid_to_lock.values()}
+        for slot in self.slots:
+            pid = slot.pid
+            if slot.state not in ("active", "dormant"):
+                continue
+            if self.shadow_buffer.has_shadow(pid):
+                continue
+            if pid in live_lock_pids:
+                continue  # still has a live lock
+            stable = slot.last_lock_stable_count
+            if stable >= 1 and slot.last_position is not None:
+                cx, cy = slot.last_position
+                fw = getattr(self, '_frame_width', 1920)
+                fh = getattr(self, '_frame_height', 1080)
+                em = _edge_for_center(cx, cy, fw, fh, _EDGE_MARGIN_PX)
+                raw_emb = _unwrap_emb(slot.embedding)
+                entry = ShadowEntry(
+                    pid=pid,
+                    last_tid=slot.active_track_id or -1,
+                    last_seen_frame=slot.last_seen_frame,
+                    last_bbox=None,
+                    last_center=(cx, cy),
+                    last_embedding=raw_emb.copy() if raw_emb is not None else None,
+                    team_id=getattr(slot, 'team_id', None),
+                    exit_edge=em,
+                    stable_count=stable,
+                )
+                self.shadow_buffer.add(entry, added_frame=frame_id)
+                print(f"[Shadow] frame={frame_id} pid={pid} tid={slot.active_track_id} "
+                      f"exit_edge={em} shadow_captured stable_count={stable}")
 
     # ------------------------------------------------------------------
     # assign_tracks — single entry point every frame

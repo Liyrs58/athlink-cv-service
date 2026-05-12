@@ -72,6 +72,8 @@ class IdentityLockManager:
         self.in_restricted: bool = False
         # Legacy alias kept for callers that set in_collapse
         self.in_collapse: bool = False
+        # Track last tick frame to support frame-gap-aware TTL decay
+        self._last_tick_frame: int = -1
 
     # ------------------------------------------------------------------
     # Query
@@ -372,6 +374,7 @@ class IdentityLockManager:
         In restricted mode: convert to DORMANT instead of expiring.
         Dormant locks reserve the pid — they decay on a longer timer.
         """
+        self._last_tick_frame = frame_id
         to_expire = []
         for tid, lk in self._tid_to_lock.items():
             if tid in present_tids:
@@ -380,7 +383,9 @@ class IdentityLockManager:
                     lk.dormant = False
                 continue
 
-            lk.ttl -= 1
+            # Decay by the actual frame gap since last seen (handles skipped/strided frames)
+            frames_absent = max(1, frame_id - lk.last_seen_frame)
+            lk.ttl -= frames_absent
 
             if lk.ttl <= 0:
                 # Auto-dormant for sufficiently-stable locks even in normal play.
