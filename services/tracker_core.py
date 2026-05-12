@@ -580,6 +580,17 @@ class TrackerCore:
         )
         player_tracks = filtered_tracks
         self._suspected_officials_this_frame = suspected_officials
+        
+        # Collect all official/suspected-official TIDs to block in identity
+        _official_tids_this_frame = set()
+        for ofc in (self._officials_this_frame or []):
+            if hasattr(ofc, 'track_id'):
+                _official_tids_this_frame.add(int(ofc.track_id))
+        for sofc in (suspected_officials or []):
+            if hasattr(sofc, 'track_id'):
+                _official_tids_this_frame.add(int(sofc.track_id))
+        self._official_tids_this_frame = _official_tids_this_frame
+        
         # ── Prompt 11: Score crop quality for each track ──
         quality_scores = self.crop_quality.score_batch(player_tracks, frame, video_frame)
         self.crop_quality.maybe_log(video_frame)
@@ -891,6 +902,7 @@ class TrackerCore:
                 memory_ok_tids=memory_ok_tids,
                 allow_new_assignments=not restricted,
                 camera_motion=camera_motion,
+                official_tids=getattr(self, '_official_tids_this_frame', None),
             )
             meta_by_tid.update(normal_meta)
             self.identity.end_frame(video_frame)
