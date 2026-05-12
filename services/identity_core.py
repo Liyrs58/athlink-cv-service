@@ -54,12 +54,12 @@ COST_REJECT_THRESHOLD = 0.72
 REVIVAL_COST_THRESHOLD = 0.60
 SOFT_REVIVE_COST_MAX = 0.38           # was 0.30 — loosened with real OSNet embeddings
 SOFT_REVIVE_AUTO_ACCEPT_COST = 0.15
-SOFT_REVIVE_MARGIN_MIN = 0.003        # was 0.005
-SCENE_REVIVE_WINDOW = 90
-SCENE_REVIVE_COST_MAX = 0.38          # was 0.30
-SCENE_REVIVE_MARGIN_MIN = 0.003       # was 0.005
-SCENE_REVIVE_FORCE_COST_MAX = 0.42    # was 0.35 (last-resort path only)
-RECOVERY_PATCH_ID = "reid-recovery-v4-osnet-aware-loosen"
+SCENE_REVIVE_FORCE_COST_MAX = 0.42
+STRICT_COLOR_THRESHOLD = 0.45       # Threshold for hard color reject
+SPATIAL_GATE_RADIUS = 150.0         # 150px safety valve
+SOFT_REVIVE_MARGIN_MIN = 0.025      # Tightened from 0.003
+SCENE_REVIVE_MARGIN_MIN = 0.025     # Tightened from 0.003
+RECOVERY_PATCH_ID = "reid-v5-first-order-motion-gated"
 LOW_CONFIDENCE_THRESHOLD = 0.55
 EMB_ALPHA = 0.25
 STABLE_PROTECT_THRESHOLD = 10
@@ -99,8 +99,19 @@ class PlayerSlot:
     last_assigned_tid: Optional[int] = None  # for continuity bias in cost matrix
     last_assigned_seq: int = 0
     team_id: Optional[int] = None
+    velocity_px: Optional[Tuple[float, float]] = None
+    velocity_pitch: Optional[Tuple[float, float]] = None
+    hsv_signature: Optional[np.ndarray] = None
 
     def update_embedding(self, emb: np.ndarray) -> None:
+        if isinstance(emb, dict):
+            # Support dual-embedding: {"emb": ..., "hsv": ...}
+            hsv = emb.get("hsv")
+            if hsv is not None:
+                self.update_color(hsv)
+            emb = emb.get("emb")
+            if emb is None: return
+
         emb = emb.astype(np.float32)
         norm = np.linalg.norm(emb)
         if norm > 0:
@@ -112,6 +123,39 @@ class PlayerSlot:
             norm2 = np.linalg.norm(self.embedding)
             if norm2 > 0:
                 self.embedding /= norm2
+
+    def update_color(self, hsv: np.ndarray) -> None:
+        hsv = hsv.astype(np.float32)
+        norm = np.linalg.norm(hsv)
+        if norm > 0: hsv /= norm
+        if self.hsv_signature is None:
+            self.hsv_signature = hsv
+        else:
+            # Slower EMA for color signature
+            self.hsv_signature = 0.85 * self.hsv_signature + 0.15 * hsv
+            norm2 = np.linalg.norm(self.hsv_signature)
+            if norm2 > 0: self.hsv_signature /= norm2
+
+    def predict_position(self, current_frame: int) -> Optional[Tuple[float, float]]:
+        if self.last_position is None: return None
+        if self.velocity_px is None: return self.last_position
+        dt = current_frame - self.last_seen_frame
+        if dt <= 0: return self.last_position
+        # Linear prediction
+        return (
+            self.last_position[0] + self.velocity_px[0] * dt,
+            self.last_position[1] + self.velocity_px[1] * dt
+        )
+
+    def predict_pitch(self, current_frame: int) -> Optional[Tuple[float, float]]:
+        if self.last_pitch is None: return None
+        if self.velocity_pitch is None: return self.last_pitch
+        dt = current_frame - self.last_seen_frame
+        if dt <= 0: return self.last_pitch
+        return (
+            self.last_pitch[0] + self.velocity_pitch[0] * dt,
+            self.last_pitch[1] + self.velocity_pitch[1] * dt
+        )
 
 
 class IdentityCore:
@@ -937,42 +981,13 @@ class IdentityCore:
         if not self._soft_snapshot or len(tracks) == 0:
             return {}, {}
 
-        track_ids = [int(t.track_id) for t in tracks]
-        snap_pids = list(self._soft_snapshot.keys())
+        # Use the centralized First-Order cost matrix logic (Prediction + Gating)
+        cost, track_ids, snap_pids = self._snapshot_cost_matrix(
+            self._soft_snapshot, tracks, embeddings, positions,
+            emb_weight=0.85, pos_weight=0.15,
+        )
         n_t, n_s = len(track_ids), len(snap_pids)
-        cost = np.full((n_t, n_s), 1e3, dtype=np.float32)
         debug_costs = []
-
-        for i, tid in enumerate(track_ids):
-            t_emb = embeddings.get(tid)
-            t_pos = positions.get(tid)
-            t_pitch = self.pitch_positions.get(tid)
-            t_team = self.team_labels.get(tid)
-            for j, pid in enumerate(snap_pids):
-                s = self._soft_snapshot[pid]
-                if (t_team is not None and s.get("team_id") is not None
-                        and t_team != s["team_id"]):
-                    cost[i, j] = 1e3
-                    continue
-                emb_c, pos_c = 0.5, 0.5
-                if t_emb is not None and s["embedding"] is not None:
-                    e = t_emb.astype(np.float32)
-                    n = np.linalg.norm(e)
-                    if n > 0: e /= n
-                    cos = float(np.clip(np.dot(e, s["embedding"]), -1.0, 1.0))
-                    emb_c = 1.0 - (cos + 1.0) * 0.5
-                if t_pitch is not None and s.get("pitch") is not None:
-                    pos_c = assignment_position_cost(s["pitch"], t_pitch)
-                elif t_pos is not None and s["position"] is not None:
-                    dx = float(t_pos[0] - s["position"][0])
-                    dy = float(t_pos[1] - s["position"][1])
-                    pos_c = min((dx * dx + dy * dy) ** 0.5 / 300.0, 1.0)
-                cst = 0.85 * emb_c + 0.15 * pos_c
-                cost[i, j] = cst
-                if is_first_recovery_frame:
-                    debug_costs.append(
-                        {"tid": tid, "pid": pid, "cost": float(cst), "emb": emb_c, "pos": pos_c}
-                    )
 
         r_idx, c_idx = linear_sum_assignment(cost)
         pairs = sorted(zip(r_idx, c_idx), key=lambda rc: cost[rc[0], rc[1]])
@@ -981,6 +996,9 @@ class IdentityCore:
 
         for r, c in pairs:
             cst = float(cost[r, c])
+            if is_first_recovery_frame:
+                debug_costs.append({"tid": track_ids[r], "pid": snap_pids[c], "cost": cst})
+
             if cst >= REVIVAL_COST_THRESHOLD:
                 continue
             tid = track_ids[r]
@@ -993,16 +1011,11 @@ class IdentityCore:
             margin = None
             if len(valid_row) >= 2:
                 margin = float(np.sort(valid_row)[1] - np.sort(valid_row)[0])
+
             # Stricter thresholds during fast pan/cut to prevent wrong revivals
+            cost_max = SOFT_REVIVE_COST_MAX
+            margin_min = SOFT_REVIVE_MARGIN_MIN
             if self._camera_motion_restricted():
-                # Pan-safe gate: strict appearance cost and margin requirements
-                cost_max_pan = 0.18  # Very tight appearance cost during pan
-                margin_min_pan = 0.03  # Require clear disambiguation
-                ok, reason = self._revive_margin_ok(
-                    cst, margin, cost_max_pan, margin_min_pan, auto_accept_cost=0.10
-                )
-                if not ok and reason == "cost_too_high":
-                    # Cost driven by appearance alone — check components
                     row_costs = cost[r, :]
                     valid_row = row_costs[row_costs < 1e2]
                     if is_first_recovery_frame and len(debug_costs) > 0:
@@ -1092,30 +1105,71 @@ class IdentityCore:
         cost = np.full((len(track_ids), len(snap_pids)), 1e3, dtype=np.float32)
 
         for i, tid in enumerate(track_ids):
-            t_emb = embeddings.get(tid)
+            t_data = embeddings.get(tid)
+            t_emb = t_data.get("emb") if isinstance(t_data, dict) else t_data
+            t_hsv = t_data.get("hsv") if isinstance(t_data, dict) else None
+
             t_pitch = self.pitch_positions.get(tid)
             t_pos = positions.get(tid)
             t_team = self.team_labels.get(tid)
+
             for j, pid in enumerate(snap_pids):
                 s = snap[pid]
+                slot = self._slot_by_pid(pid)
+
+                # 1. Team Gate
                 if (t_team is not None and s.get("team_id") is not None
                         and t_team != s["team_id"]):
                     continue
+
+                # 2. Hard Color Gate (GK Protection)
+                if t_hsv is not None and slot is not None and slot.hsv_signature is not None:
+                    hsv_sim = float(np.clip(np.dot(t_hsv, slot.hsv_signature), 0.0, 1.0))
+                    hsv_dist = 1.0 - hsv_sim
+                    if hsv_dist > STRICT_COLOR_THRESHOLD:
+                        continue
+
                 emb_c, pos_c = 0.5, 0.5
-                if t_emb is not None and s["embedding"] is not None:
+
+                # 3. Visual Embedding Cost (OSNet)
+                if t_emb is not None and s.get("embedding") is not None:
                     e = t_emb.astype(np.float32)
                     n = np.linalg.norm(e)
-                    if n > 0:
-                        e /= n
+                    if n > 0: e /= n
                     cos = float(np.clip(np.dot(e, s["embedding"]), -1.0, 1.0))
                     emb_c = 1.0 - (cos + 1.0) * 0.5
-                if t_pitch is not None and s.get("pitch") is not None:
-                    pos_c = assignment_position_cost(s["pitch"], t_pitch)
-                elif t_pos is not None and s["position"] is not None:
-                    dx = float(t_pos[0] - s["position"][0])
-                    dy = float(t_pos[1] - s["position"][1])
-                    pos_c = min((dx * dx + dy * dy) ** 0.5 / 300.0, 1.0)
-                cost[i, j] = emb_weight * emb_c + pos_weight * pos_c
+
+                # 4. First-Order Spatial Cost (Prediction)
+                if slot is not None:
+                    pred_pos = slot.predict_position(self.frame_id)
+                    pred_pitch = slot.predict_pitch(self.frame_id)
+                else:
+                    pred_pos = s.get("position")
+                    pred_pitch = s.get("pitch")
+
+                if t_pitch is not None and pred_pitch is not None:
+                    pos_c = assignment_position_cost(pred_pitch, t_pitch)
+                elif t_pos is not None and pred_pos is not None:
+                    dx = float(t_pos[0] - pred_pos[0])
+                    dy = float(t_pos[1] - pred_pos[1])
+                    dist = (dx * dx + dy * dy) ** 0.5
+
+                    # 5. Spatial Gating (Safety Valve)
+                    if dist > SPATIAL_GATE_RADIUS:
+                        continue
+
+                    pos_c = min(dist / 300.0, 1.0)
+
+                # 6. Dynamic Weighting
+                # If visual is getting noisy (emb_c high), trust motion more
+                w_emb = emb_weight
+                w_pos = pos_weight
+                if emb_c > 0.25:
+                    w_emb = emb_weight * 0.8
+                    w_pos = 1.0 - w_emb
+
+                cost[i, j] = w_emb * emb_c + w_pos * pos_c
+
         return cost, track_ids, snap_pids
 
     def _apply_revival(
@@ -1166,17 +1220,41 @@ class IdentityCore:
         tid: int,
         positions: Dict[int, Tuple[float, float]],
     ) -> None:
+        new_pos = positions.get(tid, slot.last_position)
+        new_pitch = self.pitch_positions.get(tid)
+
+        # Update velocity if we have previous history and the gap is reasonable
+        if slot.last_position is not None and slot.last_seen_frame > 0:
+            dt = self.frame_id - slot.last_seen_frame
+            if 0 < dt < 30: # 1s max gap for velocity calc
+                inv_dt = 1.0 / dt
+                v_px = ((new_pos[0] - slot.last_position[0]) * inv_dt,
+                        (new_pos[1] - slot.last_position[1]) * inv_dt)
+                if slot.velocity_px is None:
+                    slot.velocity_px = v_px
+                else:
+                    slot.velocity_px = (0.7 * slot.velocity_px[0] + 0.3 * v_px[0],
+                                        0.7 * slot.velocity_px[1] + 0.3 * v_px[1])
+
+                if new_pitch is not None and slot.last_pitch is not None:
+                    v_pi = ((new_pitch[0] - slot.last_pitch[0]) * inv_dt,
+                            (new_pitch[1] - slot.last_pitch[1]) * inv_dt)
+                    if slot.velocity_pitch is None:
+                        slot.velocity_pitch = v_pi
+                    else:
+                        slot.velocity_pitch = (0.7 * slot.velocity_pitch[0] + 0.3 * v_pi[0],
+                                               0.7 * slot.velocity_pitch[1] + 0.3 * v_pi[1])
+
         slot.active_track_id = tid
         slot.last_assigned_tid = int(tid)
         slot.last_assigned_seq = self.identity_frame_seq
         slot.seen_this_frame = True
         slot.state = "active"
         slot.last_seen_frame = self.frame_id
-        slot.last_position = positions.get(tid, slot.last_position)
+        slot.last_position = new_pos
+        slot.last_pitch = new_pitch if new_pitch is not None else slot.last_pitch
         slot.stability_counter += 1
-        t_pitch = self.pitch_positions.get(tid)
-        if t_pitch is not None:
-            slot.last_pitch = t_pitch
+        slot.team_id = self.team_labels.get(tid, slot.team_id)
         if slot.stability_counter >= 5 and slot.team_id is None:
             t_team = self.team_labels.get(tid)
             if t_team is not None:
@@ -1211,32 +1289,41 @@ class IdentityCore:
     def _slot_cost(
         self,
         slot: PlayerSlot,
-        t_emb: Optional[np.ndarray],
+        t_data: Optional[Dict | np.ndarray],
         t_pos: Optional[Tuple[float, float]],
         tid: Optional[int] = None,
         camera_motion: Optional[Dict] = None,
     ) -> float:
-        # Boot: empty lost slots eagerly accept — but NEVER during any restricted mode
+        t_emb = t_data.get("emb") if isinstance(t_data, dict) else t_data
+        t_hsv = t_data.get("hsv") if isinstance(t_data, dict) else None
+
+        # 1. Boot: empty lost slots eagerly accept — but NEVER during any restricted mode
         if not self._identity_restricted and slot.state == "lost" and slot.embedding is None:
             return 0.30
 
-        # Team hard gate
+        # 2. Team hard gate
         if tid is not None:
             t_team = self.team_labels.get(tid)
             if t_team is not None and slot.team_id is not None and t_team != slot.team_id:
                 return float(COST_REJECT_THRESHOLD + 0.05)
 
+        # 3. Hard Color Gate (GK Protection)
+        if t_hsv is not None and slot.hsv_signature is not None:
+            hsv_sim = float(np.clip(np.dot(t_hsv, slot.hsv_signature), 0.0, 1.0))
+            if (1.0 - hsv_sim) > STRICT_COLOR_THRESHOLD:
+                return float(COST_REJECT_THRESHOLD + 0.10)
+
         emb_cost = 0.5
         if t_emb is not None and slot.embedding is not None:
             e = t_emb.astype(np.float32)
             n = np.linalg.norm(e)
-            if n > 0:
-                e /= n
+            if n > 0: e /= n
             cos = float(np.clip(np.dot(e, slot.embedding), -1.0, 1.0))
             emb_cost = 1.0 - (cos + 1.0) * 0.5
 
-        # Apply camera motion compensation to slot position before cost calculation
-        slot_pos_for_cost = slot.last_position
+        # 4. First-Order Spatial Cost (Prediction)
+        pred_pos = slot.predict_position(self.frame_id)
+        slot_pos_for_cost = pred_pos if pred_pos is not None else slot.last_position
         log_motion_comp = False
         if camera_motion is not None and slot.last_position is not None and t_pos is not None:
             slot_x, slot_y = slot.last_position

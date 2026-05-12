@@ -72,8 +72,18 @@ class ReIDExtractor:
 
     def _try_load_osnet(self):
         if not os.path.exists(self.OSNET_PATH):
-            print(f"[ReID] OSNet weights not found at {self.OSNET_PATH} — skipping")
-            return
+            print(f"[ReID] OSNet weights not found at {self.OSNET_PATH} — attempting to download...")
+            import urllib.request
+            os.makedirs(os.path.dirname(self.OSNET_PATH), exist_ok=True)
+            try:
+                urllib.request.urlretrieve(
+                    "https://huggingface.co/kaiyangzhou/osnet/resolve/main/osnet_x1_0_msmt17.pt", 
+                    self.OSNET_PATH
+                )
+                print(f"[ReID] Successfully downloaded OSNet weights to {self.OSNET_PATH}")
+            except Exception as e:
+                print(f"[ReID] Failed to download OSNet weights: {e}")
+                return
         try:
             import torchreid
 
@@ -364,17 +374,24 @@ class TrackerCore:
             tids.append(tr.track_id)
             crops.append(crop)
 
+        embed_map = {}
+        hsv_map = {}
+        for tr in tracks:
+            hsv_map[tr.track_id] = self._extract_torso_hsv(frame, tr.bbox)
+
         if self.reid is not None and self.reid.mode in ("OSNet", "ResNet50"):
             feats = self.reid.extract(crops)
             if len(feats) == len(tids):
-                return {tids[i]: feats[i] for i in range(len(tids))}
+                for i, tid in enumerate(tids):
+                    embed_map[tid] = {
+                        "emb": feats[i],
+                        "hsv": hsv_map.get(tid)
+                    }
+                return embed_map
 
-        # HSV fallback
-        embed_map = {}
-        for tr in tracks:
-            emb = self._extract_torso_hsv(frame, tr.bbox)
-            if emb is not None:
-                embed_map[tr.track_id] = emb
+        # Fallback (or if ReID failed)
+        for tid, hsv in hsv_map.items():
+            embed_map[tid] = {"emb": hsv, "hsv": hsv}
         return embed_map
 
     def _pixel_to_pitch(self, frame_w: int, frame_h: int,
