@@ -686,6 +686,7 @@ class IdentityCore:
         allow_new_assignments: bool = True,
         camera_motion: Optional[Dict] = None,
         official_tids: Optional[Set[int]] = None,
+        tid_bboxes: Optional[Dict[int, list]] = None,
     ) -> Tuple[Dict[int, str], Dict[int, AssignmentMeta]]:
         """
         allow_new_assignments=False OR _identity_restricted=True:
@@ -739,6 +740,15 @@ class IdentityCore:
                     self.official_pid_blocks += 1
                     print(f"[IdentityGate] frame={self.frame_id} tid={tid} blocked=official_role")
             tracks = [tr for tr in tracks if int(tr.track_id) not in _blocked]
+
+        # ── Cluster / congestion detection ─────────────────────────────────
+        _cluster_tids: Set[int] = set()
+        if tid_bboxes:
+            _cluster_tids = self.congestion_detector.detect(
+                list(tid_bboxes.items())
+            )
+            if _cluster_tids and self.frame_id % self.debug_every == 0:
+                print(f"[ClusterDetect] frame={self.frame_id} cluster_tids={sorted(_cluster_tids)}")
 
         # Internal gate — overrides caller if they passed wrong value
         restricted = self._identity_restricted
@@ -923,6 +933,18 @@ class IdentityCore:
                     self.shadow_buffer.remove(slot.pid)
                     print(f"[ShadowRelink] frame={self.frame_id} tid={tid} pid={slot.pid} accepted cost={cst:.3f}")
 
+                # ── Cluster freeze: block new provisional assignment inside dense cluster ──
+                if tid in _cluster_tids:
+                    self.cluster_freeze_blocks += 1
+                    print(f"[ClusterFreeze] frame={self.frame_id} tid={tid} pid={slot.pid} "
+                          f"reason=dense_cluster provisional_blocked")
+                    meta_map[tid] = AssignmentMeta(
+                        pid=None, source="cluster_frozen",
+                        identity_state=IdentityState.UNKNOWN,
+                        confidence=0.0, identity_valid=False,
+                    )
+                    continue
+
                 track_to_pid[tid] = slot.pid
                 old_pid = getattr(slot, '_last_assigned_pid', None)
                 self._activate_slot(slot, tid, positions)
@@ -959,51 +981,56 @@ class IdentityCore:
                           f"cost_ok={cost_ok} congested={is_congested} active_locks={n_active_locks}")
 
                 if lock_ready and cost_ok:
-                    # Pan-safe gate: restrict new locks/rebinds/takeovers during fast_pan/cut
-                    pan_restricted = self._camera_motion_restricted()
-                    reason = self._camera_motion_reason() if pan_restricted else None
-                    relinked_absent = False
-
-                    # Block all lock attempts (new, rebind, takeover) during pan motion
-                    if pan_restricted:
-                        self.pan_lock_attempts_blocked += 1
-                        if self.frame_id % self.debug_every == 0:
-                            print(f"[PanGate] frame={self.frame_id} tid={tid} pid={slot.pid} "
-                                  f"action=block_lock_creation reason={reason}")
+                    if tid in _cluster_tids:
+                        self.cluster_freeze_blocks += 1
+                        print(f"[ClusterFreeze] frame={self.frame_id} tid={tid} pid={slot.pid} "
+                              f"reason=dense_cluster lock_blocked")
                     else:
-                        existing_tid_for_pid = self.locks.get_tid_for_pid(slot.pid)
-                        if (existing_tid_for_pid is not None
-                                and existing_tid_for_pid != tid
-                                and existing_tid_for_pid not in self._present_tids):
-                            relinked_absent = self._relink_absent_existing_lock(
-                                slot.pid, existing_tid_for_pid, tid,
-                                source="hungarian_absent", cost=cst,
-                            )
-                            if relinked_absent:
-                                self.revived_count += 1
-                                lk_new = self.locks.get_lock(tid)
-                                status = "relinked_absent"
-                            else:
-                                lk_new, status = None, "blocked_absent_lock"
+                        # Pan-safe gate: restrict new locks/rebinds/takeovers during fast_pan/cut
+                        pan_restricted = self._camera_motion_restricted()
+                        reason = self._camera_motion_reason() if pan_restricted else None
+                        relinked_absent = False
+
+                        # Block all lock attempts (new, rebind, takeover) during pan motion
+                        if pan_restricted:
+                            self.pan_lock_attempts_blocked += 1
+                            if self.frame_id % self.debug_every == 0:
+                                print(f"[PanGate] frame={self.frame_id} tid={tid} pid={slot.pid} "
+                                      f"action=block_lock_creation reason={reason}")
                         else:
-                            lk_new, status = self.locks.try_create_lock(
-                                tid=tid, pid=slot.pid, source="hungarian",
-                                frame_id=self.frame_id, confidence=cst,
-                                allow_takeover=True,
-                                allow_rebind=True,
-                            )
+                            existing_tid_for_pid = self.locks.get_tid_for_pid(slot.pid)
+                            if (existing_tid_for_pid is not None
+                                    and existing_tid_for_pid != tid
+                                    and existing_tid_for_pid not in self._present_tids):
+                                relinked_absent = self._relink_absent_existing_lock(
+                                    slot.pid, existing_tid_for_pid, tid,
+                                    source="hungarian_absent", cost=cst,
+                                )
+                                if relinked_absent:
+                                    self.revived_count += 1
+                                    lk_new = self.locks.get_lock(tid)
+                                    status = "relinked_absent"
+                                else:
+                                    lk_new, status = None, "blocked_absent_lock"
+                            else:
+                                lk_new, status = self.locks.try_create_lock(
+                                    tid=tid, pid=slot.pid, source="hungarian",
+                                    frame_id=self.frame_id, confidence=cst,
+                                    allow_takeover=True,
+                                    allow_rebind=True,
+                                )
 
-                        if self.frame_id % self.debug_every == 0:
-                            print(f"[LockAttemptResult] frame={self.frame_id} tid={tid} pid={slot.pid} status={status}")
+                            if self.frame_id % self.debug_every == 0:
+                                print(f"[LockAttemptResult] frame={self.frame_id} tid={tid} pid={slot.pid} status={status}")
 
-                        if status in ("created", "refreshed", "relinked_absent"):
-                            print(f"[LockCreate] frame={self.frame_id} tid={tid} pid={slot.pid} cost={cst:.3f} status={status}")
-                            slot.pending_tid = None
-                            slot.pending_streak = 0
+                            if status in ("created", "refreshed", "relinked_absent"):
+                                print(f"[LockCreate] frame={self.frame_id} tid={tid} pid={slot.pid} cost={cst:.3f} status={status}")
+                                slot.pending_tid = None
+                                slot.pending_streak = 0
 
                 self.assigned_this_frame += 1
                 is_locked = self.locks.is_tid_locked(tid)
-                is_relinked_revival = is_locked and self.locks.get_pid(tid) == slot.pid and status == "relinked_absent" if lock_ready and cost_ok and not pan_restricted else False
+                is_relinked_revival = is_locked and self.locks.get_pid(tid) == slot.pid and status == "relinked_absent" if lock_ready and cost_ok and tid not in _cluster_tids and not pan_restricted else False
                 meta_map[tid] = AssignmentMeta(
                     pid=slot.pid,
                     source="revived" if is_relinked_revival else ("locked" if is_locked else "provisional"),
@@ -1149,6 +1176,7 @@ class IdentityCore:
         tracks: Sequence[object],
         embeddings: Dict[int, np.ndarray],
         positions: Dict[int, Tuple[float, float]],
+        cluster_tids: Optional[Set[int]] = None,
     ) -> Tuple[Dict[int, str], Dict[int, AssignmentMeta]]:
         """Scene revival after bench→play. Only unlocked tracks passed in."""
         revived: Dict[int, str] = {}
@@ -1254,6 +1282,18 @@ class IdentityCore:
                 self.shadow_buffer.remove(pid)
                 print(f"[ShadowRelink] frame={self.frame_id} tid={tid} pid={pid} accepted cost={cst:.3f} (scene revival)")
 
+            # ── Cluster freeze: block revival inside dense cluster ──────────
+            if cluster_tids and tid in cluster_tids:
+                self.cluster_freeze_blocks += 1
+                print(f"[ClusterFreeze] frame={self.frame_id} tid={tid} pid={pid} "
+                      f"reason=dense_cluster revival_blocked")
+                meta[tid] = AssignmentMeta(
+                    pid=None, source="cluster_frozen",
+                    identity_state=IdentityState.UNKNOWN,
+                    confidence=0.0, identity_valid=False,
+                )
+                continue
+
             revived[tid] = pid
             meta[tid] = AssignmentMeta(
                 pid=pid, source="revived",
@@ -1284,6 +1324,7 @@ class IdentityCore:
         tracks: Sequence[object],
         embeddings: Dict[int, np.ndarray],
         positions: Dict[int, Tuple[float, float]],
+        cluster_tids: Optional[Set[int]] = None,
     ) -> Tuple[Dict[int, str], Dict[int, AssignmentMeta]]:
         """Last-resort scene recovery before the 90-frame window exits."""
         revived: Dict[int, str] = {}
@@ -1357,6 +1398,18 @@ class IdentityCore:
                 self.shadow_buffer.remove(pid)
                 print(f"[ShadowRelink] frame={self.frame_id} tid={tid} pid={pid} accepted cost={cst:.3f} (force_scene revival)")
 
+            # ── Cluster freeze: block revival inside dense cluster ──────────
+            if cluster_tids and tid in cluster_tids:
+                self.cluster_freeze_blocks += 1
+                print(f"[ClusterFreeze] frame={self.frame_id} tid={tid} pid={pid} "
+                      f"reason=dense_cluster revival_blocked")
+                meta[tid] = AssignmentMeta(
+                    pid=None, source="cluster_frozen",
+                    identity_state=IdentityState.UNKNOWN,
+                    confidence=0.0, identity_valid=False,
+                )
+                continue
+
             revived[tid] = pid
             meta[tid] = AssignmentMeta(
                 pid=pid, source="revived",
@@ -1380,6 +1433,7 @@ class IdentityCore:
         embeddings: Dict[int, np.ndarray],
         positions: Dict[int, Tuple[float, float]],
         is_first_recovery_frame: bool = False,
+        cluster_tids: Optional[Set[int]] = None,
     ) -> Tuple[Dict[int, str], Dict[int, AssignmentMeta]]:
         """Soft revival with stable-lock protection, margin check, team gate."""
         revived: Dict[int, str] = {}
@@ -1484,6 +1538,18 @@ class IdentityCore:
                 self.shadow_relink_accepted += 1
                 self.shadow_buffer.remove(pid)
                 print(f"[ShadowRelink] frame={self.frame_id} tid={tid} pid={pid} accepted cost={cst:.3f} (soft revival)")
+
+            # ── Cluster freeze: block revival inside dense cluster ──────────
+            if cluster_tids and tid in cluster_tids:
+                self.cluster_freeze_blocks += 1
+                print(f"[ClusterFreeze] frame={self.frame_id} tid={tid} pid={pid} "
+                      f"reason=dense_cluster revival_blocked")
+                meta[tid] = AssignmentMeta(
+                    pid=None, source="cluster_frozen",
+                    identity_state=IdentityState.UNKNOWN,
+                    confidence=0.0, identity_valid=False,
+                )
+                continue
 
             revived[tid] = pid
             meta[tid] = AssignmentMeta(
@@ -1905,6 +1971,7 @@ class IdentityCore:
         print(f"  pan_takeovers_blocked             = {self.pan_takeovers_blocked}")
         print(f"  pan_ttl_extensions                = {self.pan_ttl_extensions}")
         print(f"  official_pid_blocks               = {self.official_pid_blocks}")
+        print(f"  cluster_freeze_blocks             = {self.cluster_freeze_blocks}")
         print(f"\n[ShadowGateMetrics]")
         print(f"  shadow_relink_attempts       = {self.shadow_relink_attempts}")
         print(f"  shadow_relink_accepted       = {self.shadow_relink_accepted}")
@@ -1941,6 +2008,7 @@ class IdentityCore:
             "pan_takeovers_blocked": self.pan_takeovers_blocked,
             "pan_ttl_extensions": self.pan_ttl_extensions,
             "official_pid_blocks": self.official_pid_blocks,
+            "cluster_freeze_blocks": self.cluster_freeze_blocks,
             "shadow_relink_attempts": self.shadow_relink_attempts,
             "shadow_relink_accepted": self.shadow_relink_accepted,
             "shadow_relink_rejected": self.shadow_relink_rejected,

@@ -263,3 +263,183 @@ class TestCongestionDetector:
         from services.identity_core import CongestionDetector
         det = CongestionDetector()
         assert det.detect([]) == set()
+
+
+class TestClusterFreeze:
+    """Cluster freeze blocks new locks/revivals inside dense groups."""
+
+    def _make_track(self, tid):
+        class T:
+            track_id = tid
+            time_since_update = 0
+        return T()
+
+    def _make_bbox(self, cx, cy, w=50, h=120):
+        return [cx - w//2, cy - h//2, cx + w//2, cy + h//2]
+
+    def test_new_lock_blocked_in_cluster(self):
+        """New lock creation must be blocked for TID inside a dense cluster."""
+        import numpy as np
+        from services.identity_core import IdentityCore
+
+        identity = IdentityCore()
+        identity.congestion_detector._min_nb = 2
+
+        emb = np.random.randn(512).astype(np.float32)
+        emb /= np.linalg.norm(emb)
+
+        slot = identity.slots[0]
+        slot.embedding = emb.copy()
+        slot.state = "active"
+        slot.pending_streak = 10
+        slot.pending_tid = 7
+        # identity_frame_seq starts at 0; assign_tracks increments to 1 first thing,
+        # then checks seq_ok = pending_seen_seq == identity_frame_seq - 1 == 0.
+        # Set pending_seen_seq = 0 so seq_ok=True and streak increments (→11 >= 5).
+        slot.pending_seen_seq = 0
+        slot.last_assigned_tid = 7
+
+        tight_bboxes = {
+            7:  self._make_bbox(300, 400),
+            8:  self._make_bbox(305, 402),
+            9:  self._make_bbox(310, 405),
+        }
+
+        identity.begin_frame(1, present_tids={7, 8, 9})
+        # identity_frame_seq is 0 at init; assign_tracks will increment to 1
+        # so seq_ok = (0 == 0) = True — streak increments
+        track_to_pid, meta = identity.assign_tracks(
+            tracks=[self._make_track(7)],
+            embeddings={7: emb},
+            positions={7: (300.0, 400.0)},
+            allow_new_assignments=True,
+            tid_bboxes=tight_bboxes,
+        )
+        identity.end_frame()
+
+        lk = identity.locks.get_lock(7)
+        assert lk is None, "New lock must be blocked inside dense cluster"
+        assert identity.cluster_freeze_blocks >= 1
+
+    def test_existing_lock_preserved_in_cluster(self):
+        """Existing stable lock survives cluster freeze — same-tid pair always passes."""
+        import numpy as np
+        from services.identity_core import IdentityCore
+
+        identity = IdentityCore()
+
+        emb = np.random.randn(512).astype(np.float32)
+        emb /= np.linalg.norm(emb)
+
+        identity.locks.try_create_lock(7, "P7", "hungarian", frame_id=0)
+
+        tight_bboxes = {
+            7:  [275, 340, 325, 460],
+            8:  [280, 342, 330, 462],
+            9:  [285, 345, 335, 465],
+        }
+
+        identity.begin_frame(5, present_tids={7, 8, 9})
+        track_to_pid, meta = identity.assign_tracks(
+            tracks=[self._make_track(7)],
+            embeddings={7: emb},
+            positions={7: (300.0, 400.0)},
+            allow_new_assignments=True,
+            tid_bboxes=tight_bboxes,
+        )
+        identity.end_frame()
+
+        assert track_to_pid.get(7) == "P7", \
+            "Existing stable lock P7 must pass through cluster freeze"
+
+    def test_p7_striker_exit_not_inherited_during_congestion(self):
+        """Regression: different tid in cluster must not inherit P7."""
+        import numpy as np
+        from services.identity_core import IdentityCore
+
+        identity = IdentityCore()
+
+        emb7 = np.random.randn(512).astype(np.float32)
+        emb7 /= np.linalg.norm(emb7)
+
+        slot7 = identity._slot_by_pid("P7")
+        slot7.embedding = emb7.copy()
+        slot7.state = "active"
+        slot7.pending_streak = 10
+        slot7.pending_tid = 15
+        slot7.last_assigned_tid = 15
+        # identity_frame_seq starts at 0; assign_tracks increments to 1,
+        # so seq_ok = (pending_seen_seq == 0) = True → streak increments
+        slot7.pending_seen_seq = 0
+
+        tight_bboxes = {
+            15: self._make_bbox(490, 380),
+            16: self._make_bbox(495, 382),
+            17: self._make_bbox(500, 385),
+        }
+
+        identity.begin_frame(30, present_tids={15, 16, 17})
+        emb_new = emb7.copy()
+        emb_new += 0.3 * np.random.randn(512).astype(np.float32)
+        emb_new /= np.linalg.norm(emb_new)
+
+        track_to_pid, meta = identity.assign_tracks(
+            tracks=[self._make_track(15)],
+            embeddings={15: emb_new},
+            positions={15: (515.0, 440.0)},
+            allow_new_assignments=True,
+            tid_bboxes=tight_bboxes,
+        )
+        identity.end_frame()
+
+        assert track_to_pid.get(15) != "P7", \
+            "P7 must not be inherited by tid=15 in dense cluster"
+        assert identity.cluster_freeze_blocks >= 1
+
+    def test_p6_cannot_revive_through_cluster(self):
+        """Regression: P6 revival must be blocked when target TID is in cluster."""
+        import numpy as np
+        from services.identity_core import IdentityCore, ShadowEntry
+
+        identity = IdentityCore()
+        identity.shadow_buffer._require_edge = False
+        identity.shadow_buffer._max_cost = 0.99
+
+        emb = np.random.randn(512).astype(np.float32)
+        emb /= np.linalg.norm(emb)
+
+        entry = ShadowEntry(
+            pid="P6", last_tid=6, last_seen_frame=5,
+            last_bbox=None, last_center=(400.0, 300.0),
+            last_embedding=emb.copy(), team_id=0,
+            exit_edge="interior", stable_count=20,
+        )
+        identity.shadow_buffer.add(entry, added_frame=5)
+
+        slot = identity._slot_by_pid("P6")
+        slot.embedding = emb.copy()
+        slot.state = "active"
+        slot.pending_streak = 10
+        slot.pending_tid = 21
+        slot.pending_seen_seq = 0
+
+        tight_bboxes = {
+            20: self._make_bbox(830, 140),
+            21: self._make_bbox(835, 143),
+            22: self._make_bbox(840, 148),
+        }
+
+        identity.begin_frame(20, present_tids={20, 21, 22})
+        identity.identity_frame_seq = 1
+        track_to_pid, meta = identity.assign_tracks(
+            tracks=[self._make_track(21)],
+            embeddings={21: emb},
+            positions={21: (855.0, 200.0)},
+            allow_new_assignments=True,
+            tid_bboxes=tight_bboxes,
+        )
+        identity.end_frame()
+
+        assert track_to_pid.get(21) != "P6", \
+            "P6 must not revive to cluster-congested winger TID"
+        assert identity.cluster_freeze_blocks >= 1
