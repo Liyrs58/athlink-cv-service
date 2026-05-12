@@ -122,11 +122,10 @@ class ReIDExtractor:
                 self.model.half()
             self.model.eval()
             self.transform = T.Compose([
-                T.ToPILImage(),
-                T.Resize((256, 128)),
                 T.ToTensor(),
                 T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
             ])
+            self.target_size = (256, 128)
             self.mode = "OSNet"
             self.feat_dim = 512
             print(f"[ReID] OSNet loaded — classifier head replaced with Identity, backbone active")
@@ -144,11 +143,10 @@ class ReIDExtractor:
                 self.model.half()
             self.model.eval()
             self.transform = T.Compose([
-                T.ToPILImage(),
-                T.Resize((128, 128)),
                 T.ToTensor(),
                 T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
             ])
+            self.target_size = (128, 128)
             self.mode = "ResNet50"
             self.feat_dim = 2048
             print("[ReID] ResNet50 fallback loaded — generic, identity confidence limited")
@@ -157,8 +155,8 @@ class ReIDExtractor:
             self.model = None
 
     def _zero_tensor(self) -> torch.Tensor:
-        """Zero crop matching whatever Resize the active transform uses (OSNet 256x128 or ResNet 128x128)."""
-        h, w = self.transform.transforms[1].size
+        """Zero crop matching target size."""
+        h, w = self.target_size
         return torch.zeros(3, h, w)
 
     def extract(self, crops: list) -> list:
@@ -167,20 +165,33 @@ class ReIDExtractor:
             return []
         features_list = []
         batch_size = 32
+        
+        # GPU Accelerated Preprocessing
+        h_target, w_target = self.target_size
+        
         for i in range(0, len(crops), batch_size):
             batch_crops = crops[i:i + batch_size]
-            tensors = []
+            batch_tensors = []
+            
             for c in batch_crops:
                 if c is None or c.size == 0:
-                    tensors.append(self._zero_tensor())
+                    batch_tensors.append(self._zero_tensor().to(self.device))
                 else:
                     try:
-                        tensors.append(self.transform(c))
+                        # Move to GPU as-is (H, W, C) -> (C, H, W)
+                        t = torch.from_numpy(c.transpose(2, 0, 1)).to(self.device).float() / 255.0
+                        # Resize on GPU
+                        t = torch.nn.functional.interpolate(t.unsqueeze(0), size=(h_target, w_target), mode='bilinear', align_corners=False).squeeze(0)
+                        # Normalize on GPU
+                        t = T.functional.normalize(t, mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+                        batch_tensors.append(t)
                     except Exception:
-                        tensors.append(self._zero_tensor())
-            batch_tensor = torch.stack(tensors).to(self.device)
+                        batch_tensors.append(self._zero_tensor().to(self.device))
+            
+            batch_tensor = torch.stack(batch_tensors)
             if "cuda" in str(self.device):
                 batch_tensor = batch_tensor.half()
+            
             with torch.no_grad():
                 feat = self.model(batch_tensor)
                 feat = torch.nn.functional.normalize(feat, p=2, dim=1)
