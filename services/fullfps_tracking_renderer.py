@@ -955,7 +955,7 @@ def render_video(
 
     # Observation build returns counters too; recompute via render_frames separately
     # so we have a single source of truth.
-    obs_by_key, counters = build_observations(
+    obs_by_key, counters, _ = build_observations(
         tracking_results,
         frame_dims=(width, height),
         debug_unknown=debug_unknown,
