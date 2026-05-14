@@ -51,7 +51,7 @@ except ModuleNotFoundError:
 
 DORMANT_TTL = 180
 MAX_SLOTS = 22
-DEFAULT_PLAYER_SLOT_CAP = 14
+DEFAULT_PLAYER_SLOT_CAP = 22
 COST_REJECT_THRESHOLD = 0.72
 REVIVAL_COST_THRESHOLD = 0.60
 SOFT_REVIVE_COST_MAX = 0.38           # was 0.30 — loosened with real OSNet embeddings
@@ -493,7 +493,7 @@ class IdentityCore:
             min(self.MAX_SLOTS, _env_int("ATHLINK_MAX_PLAYER_SLOTS", DEFAULT_PLAYER_SLOT_CAP)),
         )
         self.allow_extended_player_slots = _env_bool("ATHLINK_ALLOW_NEW_PLAYER_SLOTS", False)
-        print("[ReID] using HSV fallback only for appearance matching")
+        # Note: actual ReID mode (OSNet/ResNet50/HSV) is logged by ReIDExtractor in tracker_core.py
         print(
             f"[IdentityConfig] max_player_slots={self.max_player_slots} "
             f"allow_extended={self.allow_extended_player_slots}"
@@ -810,7 +810,7 @@ class IdentityCore:
                     stable_count=stable,
                 )
                 self.shadow_buffer.add(entry, added_frame=frame_id)
-                print(f"[Shadow] frame={frame_id} pid={pid} tid={slot.active_track_id} "
+                print(f"[Shadow] frame={frame_id} pid={pid} tid={slot.active_track_id or 'expired'} "
                       f"exit_edge={em} shadow_captured stable_count={stable}")
 
     # ------------------------------------------------------------------
