@@ -72,6 +72,8 @@ class IdentityLockManager:
         self.in_restricted: bool = False
         # Legacy alias kept for callers that set in_collapse
         self.in_collapse: bool = False
+        # Set True during soft_recovery/soft_collapse to skip dormancy
+        self.in_recovery: bool = False
         # Track last tick frame to support frame-gap-aware TTL decay
         self._last_tick_frame: int = -1
 
@@ -391,9 +393,10 @@ class IdentityLockManager:
                 # Auto-dormant for sufficiently-stable locks even in normal play.
                 # Otherwise a 308-frame-stable player going off-screen for 150 frames
                 # gets hard-released, then recreated as a NEW pid — pure churn.
+                # Don't dormant during recovery—keep locks active for revival attempts
                 should_dormant = (
                     not lk.dormant and (
-                        restricted or lk.stable_count >= STABLE_AUTO_DORMANT_THRESHOLD
+                        (restricted and not self.in_recovery) or lk.stable_count >= STABLE_AUTO_DORMANT_THRESHOLD
                     )
                 )
                 if should_dormant:
