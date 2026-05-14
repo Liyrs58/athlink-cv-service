@@ -695,6 +695,7 @@ def build_manifest(
     unknown_suppressed_object_frames: int | None = None,
     identity_sources_rendered: dict[str, int] | None = None,
     rendered_frames: int | None = None,
+    color_thread_metrics: Optional[dict[str, Any]] = None,
 ) -> dict:
     """Assemble manifest. Asserts hard invariants before returning."""
     visible_obj = locked_obj = revived_obj = 0
@@ -829,6 +830,8 @@ def build_manifest(
     }
     if identity_metrics:
         manifest["identity_metrics"] = identity_metrics
+    if color_thread_metrics:
+        manifest.update(color_thread_metrics)
 
     # Hard invariants.
     # OpenCV frame_count metadata can be slightly off from actual readable frames.
@@ -867,6 +870,8 @@ def _draw_decision(
     audit_verbose: bool = False,
     audit_focus: Optional[list[str]] = None,
     show_predicted: bool = False,
+    override_color: Optional[tuple[int, int, int]] = None,
+    override_label: Optional[str] = None,
 ) -> None:
     if d.bbox is None:
         return
@@ -945,7 +950,9 @@ def _draw_decision(
             bg_color = (bg_color[0]//2, bg_color[1]//2, bg_color[2]//2)
             
         if audit_verbose:
-            parts = [d.pid or "UNK"]
+            parts = [override_label or d.pid or "UNK"]
+            if override_label and d.pid:
+                parts.append(d.pid)
             parts.append(d.assignment_source.upper() if d.assignment_source else "UNASSIGNED")
             parts.append(d.consensus)
             if show_raw_id and d.latest_tid is not None:
@@ -957,7 +964,9 @@ def _draw_decision(
                     parts.append(f"det={d.detection_confidence:.2f}")
             text = " | ".join(parts)
         else:
-            parts = [d.pid or "UNK"]
+            parts = [override_label or d.pid or "UNK"]
+            if override_label and d.pid:
+                parts.append(d.pid)
             if d.pid:
                 parts.append(f"{src_code}{status_code}")
             if show_raw_id and d.latest_tid is not None:
@@ -968,6 +977,10 @@ def _draw_decision(
                 else:
                     parts.append(f"det{d.detection_confidence:.2f}")
             text = " ".join(parts)
+
+    if override_color is not None:
+        color = override_color
+        bg_color = tuple(max(0, min(255, int(c * 0.45))) for c in override_color)
 
     cv2.rectangle(frame, (x1, y1), (x2, y2), color, thickness)
     if text:
@@ -982,6 +995,404 @@ def _draw_decision(
         cv2.addWeighted(overlay, 0.6, frame, 0.4, 0, frame)
         cv2.putText(frame, text, (bx1 + 3, by2 - 4), font, scale, (255, 255, 255),
                     text_th, cv2.LINE_AA)
+
+
+# ---- Color-thread overlay ------------------------------------------------------
+
+
+def load_color_threads(path: Optional[str], strict: bool = False) -> dict:
+    if not path or not os.path.exists(path):
+        if strict and path:
+            raise FileNotFoundError(f"color_threads.json missing at {path}")
+        return {}
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        if strict:
+            raise
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _thread_color_bgr(thread: dict) -> tuple[int, int, int]:
+    color = thread.get("color", {}) or {}
+    rgb = color.get("rgb")
+    if isinstance(rgb, list) and len(rgb) >= 3:
+        r, g, b = [max(0, min(255, int(v))) for v in rgb[:3]]
+        return (b, g, r)
+    hex_color = str(color.get("hex", "")).strip().lstrip("#")
+    if len(hex_color) == 6:
+        try:
+            r = int(hex_color[0:2], 16)
+            g = int(hex_color[2:4], 16)
+            b = int(hex_color[4:6], 16)
+            return (b, g, r)
+        except ValueError:
+            pass
+    return (255, 255, 255)
+
+
+def _clamp_point(point: Any, frame_dims: tuple[int, int]) -> Optional[tuple[int, int]]:
+    if not isinstance(point, (list, tuple)) or len(point) < 2:
+        return None
+    width, height = frame_dims
+    x = max(0, min(width - 1, int(round(float(point[0])))))
+    y = max(0, min(height - 1, int(round(float(point[1])))))
+    return (x, y)
+
+
+def _segment_center(segment: dict, key: str, frame_dims: tuple[int, int]) -> Optional[tuple[int, int]]:
+    point = segment.get(key)
+    clamped = _clamp_point(point, frame_dims)
+    if clamped is not None:
+        return clamped
+    bbox_key = "first_bbox" if key == "first_center" else "last_bbox"
+    bbox = segment.get(bbox_key)
+    if isinstance(bbox, list) and len(bbox) >= 4:
+        return _clamp_point(bbox_center([float(v) for v in bbox[:4]]), frame_dims)
+    return None
+
+
+def _build_color_thread_segment_index(
+    color_threads: dict,
+) -> dict[int, list[tuple[int, int, dict, dict, tuple[int, int, int]]]]:
+    index: dict[int, list[tuple[int, int, dict, dict, tuple[int, int, int]]]] = defaultdict(list)
+    for thread in color_threads.get("threads", []) or []:
+        color = _thread_color_bgr(thread)
+        for segment in thread.get("segments", []) or []:
+            raw_tid = segment.get("raw_track_id")
+            if raw_tid is None:
+                continue
+            try:
+                start = int(segment.get("start_frame", 0))
+                end = int(segment.get("end_frame", start))
+                tid = int(raw_tid)
+            except (TypeError, ValueError):
+                continue
+            index[tid].append((start, end, thread, segment, color))
+    for spans in index.values():
+        spans.sort(key=lambda item: (item[0], item[1]))
+    return dict(index)
+
+
+def _lookup_color_thread(
+    segment_index: dict[int, list[tuple[int, int, dict, dict, tuple[int, int, int]]]],
+    raw_tid: Optional[int],
+    frame_idx: int,
+) -> Optional[tuple[dict, dict, tuple[int, int, int]]]:
+    if raw_tid is None:
+        return None
+    try:
+        tid = int(raw_tid)
+    except (TypeError, ValueError):
+        return None
+    for start, end, thread, segment, color in segment_index.get(tid, []):
+        if start <= frame_idx <= end:
+            return thread, segment, color
+    return None
+
+
+def build_color_thread_runtime_index(
+    color_threads: dict,
+    tracking_results: dict,
+    frame_dims: tuple[int, int],
+    total_raw_frames: Optional[int] = None,
+    *,
+    max_predicted_gap_frames: int = 120,
+) -> dict:
+    """Normalize color-thread sidecar data for frame-order drawing."""
+    segment_index = _build_color_thread_segment_index(color_threads)
+    predicted_by_frame: dict[int, list[dict]] = defaultdict(list)
+    warnings_by_frame: dict[int, list[dict]] = defaultdict(list)
+    total_frames = total_raw_frames or 0
+    observed_points = 0
+
+    for thread in color_threads.get("threads", []) or []:
+        color = _thread_color_bgr(thread)
+        segments = sorted(
+            thread.get("segments", []) or [],
+            key=lambda seg: int(seg.get("start_frame", 0)),
+        )
+        observed_points += sum(int(seg.get("frame_count", 0) or 0) for seg in segments)
+        by_segment_id = {str(seg.get("segment_id")): seg for seg in segments}
+        for previous, current in zip(segments, segments[1:]):
+            prev_end = int(previous.get("end_frame", 0))
+            cur_start = int(current.get("start_frame", prev_end))
+            gap = cur_start - prev_end - 1
+            if gap <= 0 or gap > max_predicted_gap_frames:
+                continue
+            start = _segment_center(previous, "last_center", frame_dims)
+            end = _segment_center(current, "first_center", frame_dims)
+            if start is None or end is None:
+                continue
+            for frame_idx in range(prev_end + 1, cur_start):
+                if total_frames and not 0 <= frame_idx < total_frames:
+                    continue
+                predicted_by_frame[frame_idx].append(
+                    {
+                        "thread_id": thread.get("thread_id"),
+                        "start": start,
+                        "end": end,
+                        "color": color,
+                    }
+                )
+
+        for event in thread.get("events", []) or []:
+            if event.get("status") not in {"needs_review", "reviewed"}:
+                continue
+            try:
+                event_frame = int(event.get("frame", 0))
+            except (TypeError, ValueError):
+                event_frame = 0
+            event_segment = by_segment_id.get(str(event.get("segment_id"))) or by_segment_id.get(
+                str(event.get("next_segment_id"))
+            )
+            point = None
+            if event_segment is not None:
+                point = _segment_center(event_segment, "first_center", frame_dims)
+            if point is None:
+                point = _clamp_point(event.get("candidate_center"), frame_dims)
+            if point is None:
+                continue
+            start_frame = max(0, event_frame - 8)
+            end_frame = event_frame + 8
+            if total_frames:
+                end_frame = min(total_frames - 1, end_frame)
+            for frame_idx in range(start_frame, end_frame + 1):
+                warnings_by_frame[frame_idx].append(
+                    {
+                        "thread_id": thread.get("thread_id"),
+                        "point": point,
+                        "color": color,
+                        "event_type": event.get("type", "event"),
+                    }
+                )
+
+    metrics = {
+        "color_threads_present": bool(color_threads.get("threads")),
+        "color_threads_count": len(color_threads.get("threads", []) or []),
+        "color_thread_events": len(color_threads.get("events", []) or []),
+        "color_thread_review_events": sum(
+            1 for event in color_threads.get("events", []) or []
+            if event.get("status") == "needs_review"
+        ),
+        "color_thread_observed_points": observed_points,
+        "color_thread_predicted_frames": sum(len(items) for items in predicted_by_frame.values()),
+    }
+    return {
+        "segment_index": segment_index,
+        "predicted_by_frame": dict(predicted_by_frame),
+        "warnings_by_frame": dict(warnings_by_frame),
+        "metrics": metrics,
+    }
+
+
+def _color_thread_points_for_frame(
+    frame_record: Optional[dict],
+    frame_idx: int,
+    runtime: dict,
+    frame_dims: tuple[int, int],
+) -> list[dict]:
+    if not frame_record:
+        return []
+    points: list[dict] = []
+    for player in frame_record.get("players", []) or []:
+        tid = _player_tid(player)
+        bbox = player.get("bbox")
+        if tid is None or not isinstance(bbox, list) or len(bbox) < 4:
+            continue
+        hit = _lookup_color_thread(runtime.get("segment_index", {}), tid, frame_idx)
+        if hit is None:
+            continue
+        thread, segment, color = hit
+        center = _clamp_point(bbox_center([float(v) for v in bbox[:4]]), frame_dims)
+        if center is None:
+            continue
+        try:
+            raw_tid = int(tid)
+        except (TypeError, ValueError):
+            continue
+        points.append(
+            {
+                "frame": frame_idx,
+                "thread_id": thread.get("thread_id"),
+                "segment_id": segment.get("segment_id"),
+                "raw_track_id": raw_tid,
+                "center": center,
+                "bbox": [float(v) for v in bbox[:4]],
+                "color": color,
+                "player": player,
+            }
+        )
+    return points
+
+
+def _draw_dotted_line(
+    frame: np.ndarray,
+    start: tuple[int, int],
+    end: tuple[int, int],
+    color: tuple[int, int, int],
+    *,
+    thickness: int = 2,
+    dash: int = 8,
+) -> int:
+    dx = end[0] - start[0]
+    dy = end[1] - start[1]
+    dist = max(1.0, float(np.hypot(dx, dy)))
+    drawn = 0
+    step = dash * 2
+    for offset in range(0, int(dist), step):
+        start_t = offset / dist
+        end_t = min(1.0, (offset + dash) / dist)
+        p1 = (int(round(start[0] + dx * start_t)), int(round(start[1] + dy * start_t)))
+        p2 = (int(round(start[0] + dx * end_t)), int(round(start[1] + dy * end_t)))
+        cv2.line(frame, p1, p2, color, thickness, cv2.LINE_AA)
+        drawn += 1
+    return drawn
+
+
+def _draw_warning_marker(
+    frame: np.ndarray,
+    point: tuple[int, int],
+    color: tuple[int, int, int],
+) -> None:
+    cv2.circle(frame, point, 9, color, 2, cv2.LINE_AA)
+    cv2.putText(
+        frame,
+        "!",
+        (point[0] - 4, max(12, point[1] - 11)),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.55,
+        color,
+        2,
+        cv2.LINE_AA,
+    )
+
+
+def _draw_color_threads(
+    frame: np.ndarray,
+    frame_idx: int,
+    current_points: list[dict],
+    runtime: dict,
+    history_by_thread: dict[str, list[dict]],
+    *,
+    trail_history_frames: int = 150,
+) -> dict[str, int]:
+    metrics = {
+        "color_thread_frames_drawn": 0,
+        "color_thread_trail_segments_drawn": 0,
+        "color_thread_predicted_segments_drawn": 0,
+        "color_thread_warning_markers_drawn": 0,
+        "color_thread_raw_boxes_drawn": 0,
+        "color_thread_current_points_drawn": 0,
+    }
+    for point in current_points:
+        thread_id = str(point.get("thread_id"))
+        history_by_thread.setdefault(thread_id, []).append(point)
+        metrics["color_thread_current_points_drawn"] += 1
+
+    min_frame = frame_idx - trail_history_frames
+    for thread_id in list(history_by_thread):
+        history_by_thread[thread_id] = [
+            p for p in history_by_thread[thread_id] if int(p.get("frame", 0)) >= min_frame
+        ]
+        if not history_by_thread[thread_id]:
+            del history_by_thread[thread_id]
+
+    overlay = frame.copy()
+    drew_anything = False
+    for history in history_by_thread.values():
+        if len(history) < 2:
+            continue
+        history.sort(key=lambda p: int(p.get("frame", 0)))
+        for prev, cur in zip(history, history[1:]):
+            start = prev["center"]
+            end = cur["center"]
+            color = cur["color"]
+            gap = int(cur.get("frame", 0)) - int(prev.get("frame", 0))
+            if gap <= 3:
+                cv2.line(overlay, start, end, color, 2, cv2.LINE_AA)
+            else:
+                _draw_dotted_line(overlay, start, end, color, thickness=2)
+            metrics["color_thread_trail_segments_drawn"] += 1
+            drew_anything = True
+
+    for predicted in runtime.get("predicted_by_frame", {}).get(frame_idx, []):
+        _draw_dotted_line(overlay, predicted["start"], predicted["end"], predicted["color"], thickness=2)
+        metrics["color_thread_predicted_segments_drawn"] += 1
+        drew_anything = True
+
+    for warning in runtime.get("warnings_by_frame", {}).get(frame_idx, []):
+        _draw_warning_marker(overlay, warning["point"], warning["color"])
+        metrics["color_thread_warning_markers_drawn"] += 1
+        drew_anything = True
+
+    if drew_anything:
+        cv2.addWeighted(overlay, 0.62, frame, 0.38, 0, frame)
+        metrics["color_thread_frames_drawn"] = 1
+    return metrics
+
+
+def _draw_color_thread_raw_boxes(
+    frame: np.ndarray,
+    current_points: list[dict],
+    *,
+    show_raw_id: bool = False,
+    show_confidence: bool = False,
+) -> int:
+    h, w = frame.shape[:2]
+    drawn = 0
+    for point in current_points:
+        bbox = point.get("bbox")
+        if not isinstance(bbox, list) or len(bbox) < 4:
+            continue
+        x1 = max(0, min(w - 1, int(bbox[0])))
+        y1 = max(0, min(h - 1, int(bbox[1])))
+        x2 = max(0, min(w - 1, int(bbox[2])))
+        y2 = max(0, min(h - 1, int(bbox[3])))
+        if x2 <= x1 or y2 <= y1:
+            continue
+        color = point["color"]
+        player = point.get("player", {}) or {}
+        pid = player.get("playerId") or player.get("displayId")
+        parts = [str(point.get("thread_id") or "CT")]
+        if pid:
+            parts.append(str(pid))
+        if show_raw_id:
+            parts.append(f"r{point.get('raw_track_id')}")
+        if show_confidence:
+            confidence = player.get("identity_confidence", player.get("confidence"))
+            if confidence is not None:
+                try:
+                    parts.append(f"{float(confidence):.2f}")
+                except (TypeError, ValueError):
+                    pass
+        text = " ".join(parts)
+        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        scale = 0.42
+        text_th = 1
+        (tw, th), _ = cv2.getTextSize(text, font, scale, text_th)
+        bx1, by1 = x1, max(0, y1 - th - 7)
+        bx2, by2 = min(w - 1, x1 + tw + 6), by1 + th + 7
+        bg_color = tuple(max(0, min(255, int(c * 0.45))) for c in color)
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (bx1, by1), (bx2, by2), bg_color, -1)
+        cv2.addWeighted(overlay, 0.68, frame, 0.32, 0, frame)
+        cv2.putText(frame, text, (bx1 + 3, by2 - 5), font, scale, (255, 255, 255), text_th, cv2.LINE_AA)
+        drawn += 1
+    return drawn
+
+
+def _color_thread_for_decision(
+    decision: RenderDecision,
+    runtime: dict,
+) -> Optional[tuple[dict, dict, tuple[int, int, int]]]:
+    if decision.latest_tid is None:
+        return None
+    lookup_frame = decision.raw_frame_idx if decision.raw_frame_idx >= 0 else 0
+    return _lookup_color_thread(runtime.get("segment_index", {}), decision.latest_tid, lookup_frame)
 
 
 # ---- Top-level pipeline --------------------------------------------------------
@@ -1028,6 +1439,7 @@ def render_video(
     audit_verbose: bool = False,
     audit_focus: Optional[list[str]] = None,
     show_predicted: bool = False,
+    color_threads_path: Optional[str] = None,
 ) -> dict:
     """Run the full renderer. Returns the manifest dict."""
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
@@ -1052,6 +1464,7 @@ def render_video(
     if not identity_metrics:
         if strict and identity_metrics_path:
             raise FileNotFoundError(f"identity_metrics.json missing at {identity_metrics_path}")
+    color_threads = load_color_threads(color_threads_path, strict=strict) if color_threads_path else {}
 
     # Dimension check.
     warnings = validate_bbox_dimensions(
@@ -1078,6 +1491,21 @@ def render_video(
         debug_unknown=debug_unknown or (render_mode == "audit"),
         debug_officials=debug_officials or show_officials,
     )
+    color_thread_runtime = {}
+    color_thread_draw_metrics: dict[str, int] = defaultdict(int)
+    if render_mode == "color_threads":
+        color_thread_runtime = build_color_thread_runtime_index(
+            color_threads,
+            tracking_results,
+            frame_dims=(width, height),
+            total_raw_frames=total_raw_frames,
+        )
+        if color_threads_path and not color_thread_runtime.get("metrics", {}).get("color_threads_present"):
+            print(f"[Renderer] WARNING no color threads loaded from {color_threads_path}")
+    tracking_frames_by_idx: dict[int, dict] = {}
+    if color_thread_runtime:
+        for pos, frame_record in enumerate(tracking_results.get("frames", []) or []):
+            tracking_frames_by_idx[int(frame_record.get("frameIndex", pos))] = frame_record
 
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     writer = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
@@ -1093,6 +1521,7 @@ def render_video(
 
     t0 = time.time()
     f = 0
+    color_thread_history: dict[str, list[dict]] = {}
     while True:
         ret, frame = cap.read()
         if not ret or frame is None:
@@ -1101,8 +1530,42 @@ def render_video(
             frame = cv2.resize(frame, (width, height))
 
         frame_decisions = decisions[f] if f < len(decisions) else []
+        current_thread_points: list[dict] = []
+        raw_thread_tids: set[int] = set()
+        if color_thread_runtime:
+            current_thread_points = _color_thread_points_for_frame(
+                tracking_frames_by_idx.get(f),
+                f,
+                color_thread_runtime,
+                frame_dims=(width, height),
+            )
+            raw_thread_tids = {
+                int(point["raw_track_id"])
+                for point in current_thread_points
+                if point.get("raw_track_id") is not None
+            }
+            per_frame_metrics = _draw_color_threads(
+                frame,
+                f,
+                current_thread_points,
+                color_thread_runtime,
+                color_thread_history,
+            )
+            per_frame_metrics["color_thread_raw_boxes_drawn"] += _draw_color_thread_raw_boxes(
+                frame,
+                current_thread_points,
+                show_raw_id=show_raw_id,
+                show_confidence=show_confidence,
+            )
+            for key, value in per_frame_metrics.items():
+                color_thread_draw_metrics[key] += value
         for d in frame_decisions:
             if d.state != RenderState.HIDDEN:
+                thread_hit = _color_thread_for_decision(d, color_thread_runtime) if color_thread_runtime else None
+                if render_mode == "color_threads" and d.latest_tid in raw_thread_tids:
+                    continue
+                override_color = thread_hit[2] if thread_hit else None
+                override_label = thread_hit[0].get("thread_id") if thread_hit else None
                 _draw_decision(
                     frame, d, debug,
                     render_mode=render_mode,
@@ -1112,6 +1575,8 @@ def render_video(
                     audit_verbose=audit_verbose,
                     audit_focus=audit_focus,
                     show_predicted=show_predicted,
+                    override_color=override_color,
+                    override_label=override_label,
                 )
         writer.write(frame)
         if write_contact_sheet and f in contact_sample_indices:
@@ -1136,6 +1601,14 @@ def render_video(
         if strict:
             raise RuntimeError(msg)
 
+    color_thread_draw_defaults = {
+        "color_thread_frames_drawn": 0,
+        "color_thread_trail_segments_drawn": 0,
+        "color_thread_predicted_segments_drawn": 0,
+        "color_thread_warning_markers_drawn": 0,
+        "color_thread_raw_boxes_drawn": 0,
+        "color_thread_current_points_drawn": 0,
+    }
     manifest = build_manifest(
         decisions=decisions,
         total_raw_frames=total_raw_frames,
@@ -1151,6 +1624,19 @@ def render_video(
         unknown_suppressed_object_frames=counters.get("unknown_suppressed_object_frames", 0),
         identity_sources_rendered=counters.get("identity_sources_rendered", {}),
         rendered_frames=rendered_count,
+        color_thread_metrics={
+            "color_threads_path": color_threads_path,
+            **(color_thread_runtime.get("metrics", {}) if color_thread_runtime else {
+                "color_threads_present": False,
+                "color_threads_count": 0,
+                "color_thread_events": 0,
+                "color_thread_review_events": 0,
+                "color_thread_observed_points": 0,
+                "color_thread_predicted_frames": 0,
+            }),
+            **color_thread_draw_defaults,
+            **dict(color_thread_draw_metrics),
+        },
     )
 
     if manifest["duplicate_pid_suppressed_object_frames"] > 0:

@@ -22,6 +22,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--track-results", help="Path to track_results.json")
     p.add_argument("--camera-motion", help="Path to camera_motion.json")
     p.add_argument("--identity-metrics", help="Path to identity_metrics.json")
+    p.add_argument("--color-threads", help="Path to color_threads.json for render-mode=color_threads")
     p.add_argument("--out", help="Output video path")
     p.add_argument("--identity-stride", type=int, default=5)
     p.add_argument("--render-stride", type=int, default=1)
@@ -34,8 +35,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--write-contact-sheet", action="store_true")
     p.add_argument("--no-qa-json", action="store_true",
                    help="Disable per-frame QA JSON output (default is on)")
-    p.add_argument("--render-mode", choices=["production", "audit", "casefile"], default="production",
-                   help="Render mode: production (clean), audit (show all boxes/IDs), casefile (VLM debug)")
+    p.add_argument("--render-mode", choices=["production", "audit", "casefile", "color_threads"], default="production",
+                   help="Render mode: production (clean), audit, casefile, color_threads")
     p.add_argument("--show-officials", action="store_true",
                    help="Show officials even if normally suppressed (default: false)")
     p.add_argument("--show-raw-id", action="store_true",
@@ -61,7 +62,13 @@ def main() -> int:
     track_results = args.track_results or f"temp/{job_id}/tracking/track_results.json"
     camera_motion = args.camera_motion or f"temp/{job_id}/tracking/camera_motion.json"
     identity_metrics = args.identity_metrics or f"temp/{job_id}/tracking/identity_metrics.json"
-    output_path = args.out or f"temp/{job_id}/annotated_tracking_fullfps_game_smooth.mp4"
+    color_threads = args.color_threads or f"temp/{job_id}/tracking/color_threads.json"
+    if args.out:
+        output_path = args.out
+    elif args.render_mode == "color_threads":
+        output_path = f"temp/{job_id}/audit_color_threads.mp4"
+    else:
+        output_path = f"temp/{job_id}/annotated_tracking_fullfps_game_smooth.mp4"
 
     if args.render_stride != 1:
         print(f"[CLI] WARNING: --render-stride {args.render_stride} ignored; renderer always uses 1.")
@@ -88,6 +95,7 @@ def main() -> int:
         audit_verbose=args.audit_verbose,
         audit_focus=args.audit_focus.split(",") if args.audit_focus else None,
         show_predicted=args.show_predicted,
+        color_threads_path=color_threads if args.render_mode == "color_threads" else args.color_threads,
     )
 
     print("=" * 60)
@@ -103,6 +111,9 @@ def main() -> int:
     print(f"  official_suppressed={manifest['official_suppressed_object_frames']}")
     print(f"  fast_pan_frames={manifest['fast_pan_frames']} cut_frames={manifest['cut_frames']}")
     print(f"  identity_sources_rendered={manifest['identity_sources_rendered']}")
+    if manifest.get("color_threads_path"):
+        print(f"  color_threads={manifest.get('color_threads_count', 0)} "
+              f"review_events={manifest.get('color_thread_review_events', 0)}")
     if manifest.get("warnings"):
         print(f"  warnings={','.join(manifest['warnings'])}")
     print("=" * 60)

@@ -1,15 +1,21 @@
 """Tests for services/fullfps_tracking_renderer.py."""
 
 import pytest
+import numpy as np
 
 from services.fullfps_tracking_renderer import (
     MAX_HOLD_RAW_FRAMES,
     PAN_LABEL_FREEZE_FRAMES,
     HideReason,
     RenderState,
+    _color_thread_points_for_frame,
+    _draw_color_thread_raw_boxes,
+    _draw_color_threads,
     build_cumulative_offset,
+    build_color_thread_runtime_index,
     build_manifest,
     build_observations,
+    load_color_threads,
     render_entity_key,
     render_frames,
     tracking_frame_range,
@@ -296,6 +302,31 @@ def test_manifest_invariants(tmp_path):
     assert manifest["render_untracked_tail_frames"] == 0
 
 
+def test_manifest_records_color_thread_metrics(tmp_path):
+    decisions = render_frames(_basic_tracking([]), motions=[], total_raw_frames=4,
+                              frame_dims=(1920, 1080))
+    manifest = build_manifest(
+        decisions=decisions,
+        total_raw_frames=4,
+        source_video="/dev/null",
+        output_video=str(tmp_path / "out.mp4"),
+        source_fps=30.0,
+        identity_metrics={},
+        motions=[],
+        tracking_results=_basic_tracking([]),
+        color_thread_metrics={
+            "color_threads_path": "temp/job/tracking/color_threads.json",
+            "color_threads_present": True,
+            "color_threads_count": 2,
+            "color_thread_review_events": 1,
+        },
+    )
+    assert manifest["new_identities_created_during_render"] == 0
+    assert manifest["color_threads_present"] is True
+    assert manifest["color_threads_count"] == 2
+    assert manifest["color_thread_review_events"] == 1
+
+
 def test_tracking_frame_range_reports_partial_coverage():
     frames = [
         _frame(10, [_player(playerId="P1", identity_valid=True, assignment_source="locked")]),
@@ -389,6 +420,94 @@ def test_manifest_warns_when_source_video_name_looks_annotated(tmp_path):
         camera_motion_present=False,
     )
     assert "SOURCE_VIDEO_NAME_LOOKS_ANNOTATED" in manifest["warnings"]
+
+
+# ---- Color-thread overlay ------------------------------------------------------
+
+
+def test_load_color_threads_missing_returns_empty(tmp_path):
+    assert load_color_threads(str(tmp_path / "missing.json")) == {}
+
+
+def test_color_thread_runtime_normalizes_points_and_colors():
+    color_threads = {
+        "threads": [
+            {
+                "thread_id": "CT01",
+                "color": {"hex": "#010203"},
+                "segments": [
+                    {
+                        "segment_id": "seg_00001",
+                        "raw_track_id": 1,
+                        "start_frame": 0,
+                        "end_frame": 2,
+                        "first_center": [-10, 20],
+                        "last_center": [150, 90],
+                    }
+                ],
+                "events": [],
+            }
+        ],
+        "events": [],
+    }
+    tracking = _basic_tracking([
+        _frame(1, [_player(rawTrackId=1, bbox=[80, 40, 140, 90])]),
+    ])
+
+    runtime = build_color_thread_runtime_index(color_threads, tracking, frame_dims=(100, 80))
+
+    points = _color_thread_points_for_frame(tracking["frames"][0], 1, runtime, frame_dims=(100, 80))
+    point = points[0]
+    assert point["thread_id"] == "CT01"
+    assert point["color"] == (3, 2, 1)
+    assert point["center"] == (99, 65)
+    assert runtime["metrics"]["color_threads_count"] == 1
+
+
+def test_draw_color_threads_draws_trail_pixels():
+    frame = np.zeros((80, 100, 3), dtype=np.uint8)
+    runtime = {
+        "predicted_by_frame": {},
+        "warnings_by_frame": {},
+    }
+    history = {}
+
+    _draw_color_threads(
+        frame,
+        0,
+        [{"frame": 0, "thread_id": "CT01", "center": (10, 10), "color": (0, 255, 0)}],
+        runtime,
+        history,
+    )
+    metrics = _draw_color_threads(
+        frame,
+        1,
+        [{"frame": 1, "thread_id": "CT01", "center": (40, 40), "color": (0, 255, 0)}],
+        runtime,
+        history,
+    )
+
+    assert metrics["color_thread_trail_segments_drawn"] == 1
+    assert int(frame.sum()) > 0
+
+
+def test_color_thread_raw_boxes_draw_unassigned_player():
+    frame = np.zeros((80, 100, 3), dtype=np.uint8)
+    points = [
+        {
+            "frame": 0,
+            "thread_id": "CT01",
+            "raw_track_id": 7,
+            "bbox": [10, 10, 30, 50],
+            "color": (0, 255, 0),
+            "player": _player(rawTrackId=7, identity_valid=False, assignment_source="unassigned"),
+        }
+    ]
+
+    drawn = _draw_color_thread_raw_boxes(frame, points, show_raw_id=True)
+
+    assert drawn == 1
+    assert int(frame.sum()) > 0
 
 
 def test_strict_fails_on_dimension_mismatch():
