@@ -810,18 +810,14 @@ def _run_tracking_impl(
 
     _disable_reid = os.environ.get("ATHLINK_DISABLE_REID", "0") == "1"
 
-    # Only pass reid_weights if model file exists AND is large enough to be valid
-    reid_weights_for_botsort = None
-    if reid_model_path and os.path.exists(reid_model_path) and os.path.getsize(reid_model_path) > 10_000_000:
-        reid_weights_for_botsort = reid_model_path
-    else:
-        _disable_reid = True  # Force disable if weights missing/invalid
+    # Pass reid_weights as Path object (BotSort expects Path, not str)
+    reid_weights_for_botsort = Path(reid_model_path) if reid_model_path else None
 
     tracker = BotSort(
         reid_weights=reid_weights_for_botsort,
         device=_detect_device(),
         half=_use_half,
-        with_reid=False,  # Always start with False to be safe
+        with_reid=not _disable_reid,
     )
     reid_status = "DISABLED" if _disable_reid else str(reid_model_path)
     logger.info(f"ReID model initialized: {reid_status}")
