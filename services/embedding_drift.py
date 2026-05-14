@@ -38,13 +38,28 @@ class DriftTracker:
             self.pid_decision_log[pid] = []
     
     def update_drift(self, pid: str, embedding: Optional[np.ndarray]) -> Optional[float]:
-        """Compute and record drift for a player. Returns similarity score or None."""
+        """Compute and record drift for a player. Returns similarity score or None.
+
+        Also performs adaptive anchor reset: if last 5 similarities are all < 0.5,
+        the anchor is reset to the current embedding to avoid permanent drift from
+        an unrepresentative initial pose.
+        """
         if pid not in self.pid_anchors or embedding is None or embedding.size == 0:
             return None
-        
+
         anchor = self.pid_anchors[pid]
         similarity = compute_cosine_similarity(anchor, embedding)
         self.pid_history[pid].append(similarity)
+
+        # Adaptive anchor reset: if last 5 similarities < 0.5, reset anchor
+        if len(self.pid_history[pid]) >= 5:
+            recent = self.pid_history[pid][-5:]
+            if all(s < 0.5 for s in recent):
+                self.pid_anchors[pid] = embedding.copy()
+                self.pid_history[pid] = []
+                print(f"[DriftAnchorReset] pid={pid} anchor reset (5 consecutive < 0.5)")
+                return 1.0  # First frame after reset is identical to new anchor
+
         return similarity
     
     def should_trigger_vlm(self, pid: str, similarity: Optional[float]) -> bool:

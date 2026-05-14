@@ -74,7 +74,7 @@ LOCK_PROMOTE_FRAMES = 5
 # ── Shadow buffer configuration (env-configurable) ────────────────────
 _SHADOW_TTL_FRAMES   = int(os.environ.get("ATHLINK_SHADOW_TTL_FRAMES", "90"))
 _MIN_RELINK_GAP      = int(os.environ.get("ATHLINK_MIN_RELINK_GAP_FRAMES", "8"))
-_EDGE_MARGIN_PX      = int(os.environ.get("ATHLINK_EDGE_MARGIN_PX", "96"))
+_EDGE_MARGIN_PX      = int(os.environ.get("ATHLINK_EDGE_MARGIN_PX", "150"))
 _SHADOW_MAX_COST     = float(os.environ.get("ATHLINK_SHADOW_MAX_COST", "0.22"))
 _SHADOW_REQUIRE_EDGE = int(os.environ.get("ATHLINK_SHADOW_REQUIRE_EDGE", "1")) == 1
 
@@ -201,7 +201,7 @@ def _unwrap_emb(emb) -> Optional[np.ndarray]:
 # ── Congestion detector configuration ────────────────────────────────
 _CLUSTER_IOU_THRESHOLD = float(os.environ.get("ATHLINK_CLUSTER_IOU_THRESHOLD", "0.10"))
 _CLUSTER_RADIUS_PX     = float(os.environ.get("ATHLINK_CLUSTER_RADIUS_PX", "80"))
-_CLUSTER_MIN_NEIGHBORS = int(os.environ.get("ATHLINK_CLUSTER_MIN_NEIGHBORS", "2"))
+_CLUSTER_MIN_NEIGHBORS = int(os.environ.get("ATHLINK_CLUSTER_MIN_NEIGHBORS", "3"))
 
 
 def _bbox_iou(a: list, b: list) -> float:
@@ -275,7 +275,7 @@ class CongestionDetector:
 
 # ── Physicality validator configuration ──────────────────────────────
 _MAX_PIXEL_JUMP_PER_SEC  = float(os.environ.get("ATHLINK_MAX_PIXEL_JUMP_PER_SEC", "650"))
-_MAX_RELINK_PIXEL_JUMP   = float(os.environ.get("ATHLINK_MAX_RELINK_PIXEL_JUMP", "450"))
+_MAX_RELINK_PIXEL_JUMP   = float(os.environ.get("ATHLINK_MAX_RELINK_PIXEL_JUMP", "300"))
 _MIN_PATCH_DISTANCE_PX   = float(os.environ.get("ATHLINK_MIN_PATCH_DISTANCE_PX", "24"))
 _REJECT_OFFICIAL_PID     = int(os.environ.get("ATHLINK_REJECT_OFFICIAL_PID", "1")) == 1
 
@@ -356,9 +356,11 @@ def check_physicality(
                 )
 
         # Relink-specific: large absolute jump even if speed threshold would pass
-        if frame_gap > 1 and dist > max_relink_pixel_jump:
+        # Gap-scaled threshold: tight at gap=1, relaxes for longer gaps (up to gap=10)
+        scaled_max = max_relink_pixel_jump + 15.0 * min(frame_gap - 1, 10)
+        if frame_gap > 1 and dist > scaled_max:
             return False, "IMPOSSIBLE_PIXEL_JUMP", (
-                f"pid={pid} dist={dist:.1f}px > max_relink={max_relink_pixel_jump} gap={frame_gap}f"
+                f"pid={pid} dist={dist:.1f}px > scaled_max={scaled_max:.0f} (base={max_relink_pixel_jump} + 15*gap_bonus) gap={frame_gap}f"
             )
 
     # 4. Double occupancy — same PID already assigned this frame
@@ -1181,7 +1183,14 @@ class IdentityCore:
                                     lk_new = self.locks.get_lock(tid)
                                     status = "relinked_absent"
                                 else:
-                                    lk_new, status = None, "blocked_absent_lock"
+                                    # Only block if the competing lock is stable (stable_count >= 20)
+                                    # For unstable competing locks, allow dormant PID to compete
+                                    competing_lock = self.locks.get_lock(existing_tid_for_pid)
+                                    if competing_lock and competing_lock.stable_count >= 20:
+                                        lk_new, status = None, "blocked_absent_lock"
+                                    else:
+                                        # Unstable competing lock — let normal assignment path handle it
+                                        lk_new, status = None, "blocked_unstable_competing"
                             else:
                                 lk_new, status = self.locks.try_create_lock(
                                     tid=tid, pid=slot.pid, source="hungarian",
