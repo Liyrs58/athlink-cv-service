@@ -808,13 +808,16 @@ def _run_tracking_impl(
             reid_model_path = Path(cp)
             break
 
+    _disable_reid = os.environ.get("ATHLINK_DISABLE_REID", "0") == "1"
     tracker = BotSort(
         reid_weights=reid_model_path,
         device=_detect_device(),
         half=_use_half,
+        with_reid=not _disable_reid,
     )
-    logger.info(f"ReID model initialized with weights: {reid_model_path}")
-    print(f"✓ ReID model initialized: {reid_model_path}")
+    reid_status = "DISABLED" if _disable_reid else str(reid_model_path)
+    logger.info(f"ReID model initialized: {reid_status}")
+    print(f"✓ ReID model initialized: {reid_status}")
 
     # Patch hyperparameters for V2 manually to avoid YAML/Namespace issues
     # FIX 2: Aggressive match_thresh for fast pans (0.95→0.30), proximity (0.9→0.5)
