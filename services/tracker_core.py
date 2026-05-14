@@ -951,6 +951,31 @@ class TrackerCore:
                     f"blocked={stale_memory_blocked+len(overlay_blocked_tids)} "
                     f"unassigned={unassigned_n} restricted={restricted} reason={restricted_reason}"
                 )
+
+            # ── VLM Gating: Check embedding drift before re-analyzing ──
+            high_drift_pids = []
+            should_reanalyze_vlm = False
+            vlm_skip_reason = None
+
+            # Check if any tracked player (with valid P-id) has high drift (similarity < threshold)
+            if meta_by_tid:
+                for tid, meta in meta_by_tid.items():
+                    if meta.pid and meta.pid != "UNK":
+                        if hasattr(self.identity, 'drift_tracker'):
+                            tracker = self.identity.drift_tracker
+                            # Check if this P-id has drift data and if latest similarity is below threshold
+                            if meta.pid in tracker.pid_history:
+                                history = tracker.pid_history[meta.pid]
+                                if history and history[-1] < tracker.drift_threshold:
+                                    high_drift_pids.append(meta.pid)
+                                    should_reanalyze_vlm = True
+
+                # Log VLM gating decision
+                if should_reanalyze_vlm:
+                    print(f"[VLMGate] Frame {video_frame}: REANALYZE high_drift_pids={high_drift_pids}")
+                elif video_frame % 30 == 0:
+                    print(f"[VLMGate] Frame {video_frame}: SKIPPED no high drift detected ({len(meta_by_tid)} active)")
+
         elif is_play:
             # No tracks this frame — still tick the lock TTLs so stale ones expire
             self.identity.begin_frame(video_frame, present_tids=set())
