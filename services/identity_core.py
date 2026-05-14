@@ -944,7 +944,9 @@ class IdentityCore:
             self.locks.refresh_lock(tid, self.frame_id, confidence=lk.confidence)
             locked_kept += 1
 
-            emb = embeddings.get(tid)
+            emb_data = embeddings.get(tid)
+            # embeddings store dicts with "emb" key; extract the numpy array
+            emb = emb_data.get("emb") if isinstance(emb_data, dict) else emb_data
             if (emb is not None
                     and lk.stable_count >= MEMORY_UPDATE_MIN_STABLE
                     and not restricted
@@ -1196,10 +1198,13 @@ class IdentityCore:
                                 slot.pending_tid = None
                                 slot.pending_streak = 0
                                 # Track embedding anchor for drift monitoring
-                                emb = embeddings.get(tid)
-                                if emb is not None:
-                                    self.drift_tracker.create_anchor(slot.pid, emb)
-                                    print(f"[DriftAnchor] pid={slot.pid} frame={self.frame_id} anchor_created")
+                                emb_data = embeddings.get(tid)
+                                if emb_data is not None:
+                                    # embeddings store dicts with "emb" key; extract the numpy array
+                                    emb = emb_data.get("emb") if isinstance(emb_data, dict) else emb_data
+                                    if emb is not None:
+                                        self.drift_tracker.create_anchor(slot.pid, emb)
+                                        print(f"[DriftAnchor] pid={slot.pid} frame={self.frame_id} anchor_created")
 
                 self.assigned_this_frame += 1
                 is_locked = self.locks.is_tid_locked(tid)
