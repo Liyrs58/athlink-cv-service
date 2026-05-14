@@ -775,6 +775,15 @@ class IdentityCore:
         restricted = self._identity_restricted
         self.locks.in_restricted = restricted
         self.locks.in_collapse = self.in_soft_collapse
+        self.locks.in_recovery = self.in_soft_recovery or self.in_soft_collapse
+
+        # Extend TTL for dormant locks during recovery BEFORE tick processes dormancy
+        if self.in_soft_recovery or self.in_soft_collapse:
+            ext_count = self.locks.extend_dormant_ttl_for_pan(frame_id, extension=300)
+            if ext_count > 0:
+                reason = "soft_recovery" if self.in_soft_recovery else "soft_collapse"
+                print(f"[RecoveryTTLExtend] Frame {frame_id}: extended TTL for {ext_count} dormant locks ({reason})")
+
         if present_tids is not None:
             self._present_tids = set(present_tids)
             # Snapshot lock stable_counts onto slots before tick removes expired locks
@@ -865,17 +874,6 @@ class IdentityCore:
                 # Also extend for cuts to preserve identity continuity across scene transitions
                 ext_count = self.locks.extend_dormant_ttl_for_pan(self.frame_id)
                 self.pan_ttl_extensions += ext_count
-
-        # Flag recovery mode in lock manager to skip dormancy during recovery
-        self.locks.in_recovery = self.in_soft_recovery or self.in_soft_collapse
-
-        # Extend TTL for dormant locks during soft_recovery/soft_collapse to preserve them
-        # Use aggressive extension (300 frames ≈ full reset of 300-frame dormant TTL) to keep them alive
-        if self.in_soft_recovery or self.in_soft_collapse:
-            ext_count = self.locks.extend_dormant_ttl_for_pan(self.frame_id, extension=300)
-            if ext_count > 0:
-                reason = "soft_recovery" if self.in_soft_recovery else "soft_collapse"
-                print(f"[RecoveryTTLExtend] Frame {self.frame_id}: extended TTL for {ext_count} dormant locks ({reason})")
 
         meta_map: Dict[int, AssignmentMeta] = {}
         track_to_pid: Dict[int, str] = {}
