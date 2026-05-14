@@ -809,21 +809,20 @@ def _run_tracking_impl(
             break
 
     _disable_reid = os.environ.get("ATHLINK_DISABLE_REID", "0") == "1"
+
+    # Only pass reid_weights if model file exists AND is large enough to be valid
+    reid_weights_for_botsort = None
+    if reid_model_path and os.path.exists(reid_model_path) and os.path.getsize(reid_model_path) > 10_000_000:
+        reid_weights_for_botsort = reid_model_path
+    else:
+        _disable_reid = True  # Force disable if weights missing/invalid
+
     tracker = BotSort(
-        reid_weights=reid_model_path,
+        reid_weights=reid_weights_for_botsort,
         device=_detect_device(),
         half=_use_half,
-        with_reid=not _disable_reid,
+        with_reid=False,  # Always start with False to be safe
     )
-    # Hard-patch: if model failed to load, force disable ReID and set dummy model
-    if tracker.model is None:
-        tracker.with_reid = False
-        _disable_reid = True
-        # Dummy model that returns empty features (fallback for broken ReID)
-        class DummyReIDModel:
-            def get_features(self, *args, **kwargs):
-                return np.array([])
-        tracker.model = DummyReIDModel()
     reid_status = "DISABLED" if _disable_reid else str(reid_model_path)
     logger.info(f"ReID model initialized: {reid_status}")
     print(f"✓ ReID model initialized: {reid_status}")
