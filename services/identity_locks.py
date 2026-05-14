@@ -395,9 +395,9 @@ class IdentityLockManager:
                 # gets hard-released, then recreated as a NEW pid — pure churn.
                 # Don't dormant during recovery—keep locks active for revival attempts
                 should_dormant = (
-                    not lk.dormant and (
-                        (restricted and not self.in_recovery) or lk.stable_count >= STABLE_AUTO_DORMANT_THRESHOLD
-                    )
+                    not lk.dormant and
+                    not self.in_recovery and
+                    (restricted or lk.stable_count >= STABLE_AUTO_DORMANT_THRESHOLD)
                 )
                 if should_dormant:
                     lk.dormant = True
