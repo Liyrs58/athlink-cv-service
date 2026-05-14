@@ -106,3 +106,7 @@ node_modules/
 nextjs-bridge/node_modules/
 nextjs-bridge/.next/
 athlink-cv-service.tar.gz
+models/*.pt
+models/*.pth
+models/*.pth.tar*
+models/*.tar

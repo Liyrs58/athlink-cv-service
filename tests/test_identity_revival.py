@@ -1,10 +1,77 @@
 """
 Tests for Phase 1 identity continuity fixes:
+- OSNet weight priority order (Task 1)
 - Snapshot freshness timestamp (Task 2)
 - Team-gate revival (Task 3)
 - Tighter revival margins (Task 4)
 """
+import os
 import numpy as np
+
+
+def test_osnet_weight_priority_order(tmp_path):
+    """_find_osnet_weights must prefer football > sports > MSMT17."""
+    import sys
+    for m in list(sys.modules):
+        if m.startswith("services"):
+            del sys.modules[m]
+
+    # Create fake weight files in tmp_path
+    football = tmp_path / "football_osnet_x1_0.pth.tar"
+    sports   = tmp_path / "sports_model.pth.tar-60"
+    msmt17   = tmp_path / "osnet_x1_0_msmt17.pt"
+
+    # Write 2MB dummy content so size check passes
+    dummy = b"x" * 2_000_000
+    for f in [football, sports, msmt17]:
+        f.write_bytes(dummy)
+
+    # Point env vars to our tmp files
+    os.environ["OSNET_FOOTBALL_WEIGHTS"] = str(football)
+    os.environ["OSNET_SPORTS_WEIGHTS"]   = str(sports)
+    os.environ["OSNET_WEIGHTS"]          = str(msmt17)
+
+    # Import _find_osnet_weights as a standalone function by parsing it out of tracker_core
+    # without triggering torch/ultralytics imports (those aren't available in the test env)
+    import importlib.util, types, sys as _sys
+
+    # Build minimal stubs for heavy deps so the module-level imports don't crash
+    import numpy as _np
+    for stub_name in ["torch", "ultralytics", "cv2", "boxmot"]:
+        mod = types.ModuleType(stub_name)
+        _sys.modules[stub_name] = mod
+        if stub_name == "torch":
+            mod.cuda = types.SimpleNamespace(is_available=lambda: False)
+            mod.backends = types.SimpleNamespace(mps=types.SimpleNamespace(is_available=lambda: False))
+        if stub_name == "ultralytics":
+            mod.YOLO = lambda *a, **kw: None
+    _sys.modules["numpy"] = _np
+
+    try:
+        # Clear any cached services modules
+        for m in list(_sys.modules):
+            if m.startswith("services"):
+                del _sys.modules[m]
+
+        from services.tracker_core import ReIDExtractor
+        ext = ReIDExtractor.__new__(ReIDExtractor)
+        result = ext._find_osnet_weights()
+        assert result == str(football), f"Expected football weights, got: {result}"
+
+        # Remove football — should fall to sports
+        os.environ.pop("OSNET_FOOTBALL_WEIGHTS")
+        football.unlink()
+        result2 = ext._find_osnet_weights()
+        assert result2 == str(sports), f"Expected sports weights, got: {result2}"
+
+        # Remove sports — should fall to MSMT17
+        os.environ.pop("OSNET_SPORTS_WEIGHTS")
+        sports.unlink()
+        result3 = ext._find_osnet_weights()
+        assert result3 == str(msmt17), f"Expected MSMT17 weights, got: {result3}"
+    finally:
+        for k in ["OSNET_FOOTBALL_WEIGHTS", "OSNET_SPORTS_WEIGHTS", "OSNET_WEIGHTS"]:
+            os.environ.pop(k, None)
 
 
 def test_snapshot_records_freshness_timestamp():

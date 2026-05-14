@@ -969,7 +969,7 @@ class IdentityCore:
                     and lk.stable_count >= MEMORY_UPDATE_MIN_STABLE
                     and not restricted
                     and (memory_ok_tids is None or tid in memory_ok_tids)):
-                slot.update_embedding(emb)
+                slot.update_embedding(emb, frame_id=self.frame_id)
                 # Update embedding drift for locked tracks
                 similarity = self.drift_tracker.update_drift(pid, emb)
                 if similarity is not None:
@@ -1145,7 +1145,7 @@ class IdentityCore:
                     emb = embeddings.get(tid)
                     if emb is not None:
                         if memory_ok_tids is None or tid in memory_ok_tids:
-                            slot.update_embedding(emb)
+                            slot.update_embedding(emb, frame_id=self.frame_id)
                         else:
                             memory_skips += 1
 
