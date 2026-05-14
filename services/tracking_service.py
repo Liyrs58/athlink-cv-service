@@ -815,6 +815,10 @@ def _run_tracking_impl(
         half=_use_half,
         with_reid=not _disable_reid,
     )
+    # Hard-patch: if model failed to load, force disable ReID to avoid NoneType crash
+    if tracker.model is None:
+        tracker.with_reid = False
+        _disable_reid = True
     reid_status = "DISABLED" if _disable_reid else str(reid_model_path)
     logger.info(f"ReID model initialized: {reid_status}")
     print(f"✓ ReID model initialized: {reid_status}")
