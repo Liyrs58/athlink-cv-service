@@ -242,29 +242,53 @@ for frame_data in tracking_results:
 
 COLORS = {
     "locked":      (0, 255, 0),
-    "revived":     (0, 200, 255),
-    "provisional": (255, 165, 0),
+    "revived":     (0, 220, 255),
+    "provisional": (0, 165, 255),
     "unknown":     (128, 128, 128),
+    "unassigned":  (60, 60, 60),
 }
+DASHED_SOURCES = {"provisional", "unknown", "unassigned"}
 
-frame_idx = 0
+def draw_dashed_rect(img, x1, y1, x2, y2, color, thickness=2, dash=10, gap=5):
+    pts = [(x1,y1,x2,y1),(x2,y1,x2,y2),(x2,y2,x1,y2),(x1,y2,x1,y1)]
+    for (ax,ay,bx,by) in pts:
+        length = max(abs(bx-ax)+abs(by-ay), 1)
+        seg = dash + gap
+        n = max(int(length / seg), 1)
+        for i in range(n):
+            t0 = (i*seg) / length
+            t1 = min((i*seg+dash) / length, 1.0)
+            p0 = (int(ax+t0*(bx-ax)), int(ay+t0*(by-ay)))
+            p1 = (int(ax+t1*(bx-ax)), int(ay+t1*(by-ay)))
+            cv2.line(img, p0, p1, color, thickness)
+
+fi = 0
 while True:
     ret, frame = cap.read()
     if not ret:
         break
-    players = frame_map.get(frame_idx, [])
-    for p in players:
-        pid    = p.get("playerId", p.get("pid", "?"))
-        bbox   = p.get("bbox", [])
-        src    = p.get("assignment_source", "unknown")
-        if len(bbox) == 4:
-            x1, y1, x2, y2 = [int(v) for v in bbox]
-            color = COLORS.get(src, (128, 128, 128))
-            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-            cv2.putText(frame, pid, (x1, y1 - 5),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+    for p in frame_map.get(fi, []):
+        pid   = p.get("playerId", "?")
+        disp  = p.get("displayId", pid)
+        bbox  = p.get("bbox", [])
+        src   = p.get("assignment_source", "unknown")
+        valid = p.get("identity_valid", False)
+        if len(bbox) != 4:
+            continue
+        x1,y1,x2,y2 = [int(v) for v in bbox]
+        color  = COLORS.get(src if valid else "unknown", (128,128,128))
+        dashed = (src in DASHED_SOURCES) or (not valid)
+        if dashed:
+            draw_dashed_rect(frame, x1, y1, x2, y2, color)
+        else:
+            cv2.rectangle(frame, (x1,y1), (x2,y2), color, 2)
+        label = disp
+        (tw,th),_ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)
+        cv2.rectangle(frame, (x1, y1-th-6), (x1+tw+4, y1), color, -1)
+        cv2.putText(frame, label, (x1+2, y1-4),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0,0,0), 2)
     writer.write(frame)
-    frame_idx += 1
+    fi += 1
 
 cap.release()
 writer.release()

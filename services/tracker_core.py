@@ -349,6 +349,7 @@ class TrackerCore:
         self.role_filter = RoleFilter()
         self.crop_quality = CropQualityGate()
         self.id_remap = {}  # de_tid -> int PID
+        self._switched_pids: set = set()  # PIDs that changed lock this session
         self._scene_snapshot_taken = False
         self._needs_scene_reset = False
         self._needs_scene_revival = False
@@ -968,6 +969,10 @@ class TrackerCore:
                 if m.pid is None and tid in self.id_remap:
                     del self.id_remap[tid]
 
+            # Accumulate switched PIDs from lock rebinds/takeovers this frame
+            for _, pid, _, _, _ in self.identity.locks._switch_log:
+                self._switched_pids.add(pid)
+
             # Lock-aware accounting — count provisional as normal (they should be 0 in restricted)
             locked_kept = sum(1 for m in meta_by_tid.values() if m.source == "locked")
             revived_n = sum(1 for m in meta_by_tid.values() if m.source == "revived")
@@ -1034,7 +1039,7 @@ class TrackerCore:
                     identity_valid = True
                     identity_confidence = float(meta.confidence)
                     player_id = meta.pid
-                    display_id = meta.pid
+                    display_id = ("!" + meta.pid) if meta.pid in self._switched_pids else meta.pid
                     
                     slot = self.identity.get_slot(meta.pid)
                     team_id = slot.team_id if slot else None
