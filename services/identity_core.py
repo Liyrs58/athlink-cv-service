@@ -37,6 +37,7 @@ try:
         MEMORY_UPDATE_MIN_STABLE,
     )
     from services.pitch_geometry import assignment_position_cost
+    from services.embedding_drift import DriftTracker
 except ModuleNotFoundError:
     import os as _os, sys as _sys
     _services_dir = _os.path.join(_os.path.dirname(__file__))
@@ -47,6 +48,7 @@ except ModuleNotFoundError:
         MEMORY_UPDATE_MIN_STABLE,
     )
     from pitch_geometry import assignment_position_cost  # type: ignore[no-redef]
+    from embedding_drift import DriftTracker  # type: ignore[no-redef]
 
 
 DORMANT_TTL = 180
@@ -563,6 +565,9 @@ class IdentityCore:
         self.physicality_rejects: int = 0
         self.physicality_reject_reasons: Dict[str, int] = {}
 
+        # Embedding drift tracker
+        self.drift_tracker = DriftTracker(drift_threshold=0.70)
+
     # ------------------------------------------------------------------
     # Single source of truth for restricted identity mode
     # ------------------------------------------------------------------
@@ -945,6 +950,10 @@ class IdentityCore:
                     and not restricted
                     and (memory_ok_tids is None or tid in memory_ok_tids)):
                 slot.update_embedding(emb)
+                # Update embedding drift for locked tracks
+                similarity = self.drift_tracker.update_drift(pid, emb)
+                if similarity is not None:
+                    print(f"[EmbeddingDrift] pid={pid} frame={self.frame_id} similarity={similarity:.3f}")
             elif emb is not None:
                 memory_skips += 1
 
@@ -1186,6 +1195,11 @@ class IdentityCore:
                                 print(f"[LockCreate] frame={self.frame_id} tid={tid} pid={slot.pid} cost={cst:.3f} status={status}")
                                 slot.pending_tid = None
                                 slot.pending_streak = 0
+                                # Track embedding anchor for drift monitoring
+                                emb = embeddings.get(tid)
+                                if emb is not None:
+                                    self.drift_tracker.create_anchor(slot.pid, emb)
+                                    print(f"[DriftAnchor] pid={slot.pid} frame={self.frame_id} anchor_created")
 
                 self.assigned_this_frame += 1
                 is_locked = self.locks.is_tid_locked(tid)
