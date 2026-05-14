@@ -1352,6 +1352,19 @@ def run_tracking(video_path, job_id, frame_stride=1, max_frames=None, device="cp
     except Exception as e:
         print(f"[IdentityMetrics] persist failed: {e}")
 
+    # Export drift report if tracking completed
+    if hasattr(tracker.identity, 'drift_tracker'):
+        try:
+            drift_report = tracker.identity.drift_tracker.export_report()
+            drift_report_path = Path(f"temp/{job_id}/tracking/drift_report.json")
+            drift_report_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(drift_report_path, "w") as f:
+                json.dump(drift_report, f, indent=2, default=str)
+            print(f"[DriftReport] exported to {drift_report_path}")
+            print(f"[DriftReport] players tracked: {len(drift_report.get('players', {}))}")
+        except Exception as e:
+            print(f"[DriftReport] ERROR exporting: {e}")
+
     print(f"Done. Video frames: {video_frame}, processed: {processed}")
     return tracker.results
 
