@@ -2,7 +2,7 @@
 
 ## What It Does
 
-The Embedding Drift Auditor monitors embedding similarity drift per player ID to detect identity decay. When a player's embedding drifts from their anchor (first embedding at lock), it signals that identity might be unstable.
+The Embedding Drift Auditor monitors embedding similarity per player ID to detect identity decay. When a player's embedding drifts from their anchor (first embedding at lock), it signals that identity might be unstable.
 
 ## Thresholds
 
@@ -40,89 +40,106 @@ Located at `temp/{jobId}/tracking/drift_report.json`
 
 ## Tuning drift_threshold
 
-Set in `services/identity_core.py` (line 569):
+Set in `services/identity_core.py`:
 
 ```python
 self.drift_tracker = DriftTracker(drift_threshold=0.65)  # Lower = more VLM calls
 ```
 
-### Threshold Guide
+### Preset thresholds
 
-- **0.50** — Very aggressive, triggers VLM on every small drift (high compute)
-- **0.65** — Aggressive, catches subtle identity decay
-- **0.70** — Balanced (default), catches meaningful drift
-- **0.80** — Conservative, only major drift triggers VLM
-- **0.90** — Very conservative, only near-orthogonal embeddings trigger
-
-## Log Lines to Watch
-
-During tracking, you'll see:
-
-```
-[DriftAnchor] pid=P1 frame=10 anchor_created
-[EmbeddingDrift] pid=P1 frame=45 similarity=0.92
-[EmbeddingDrift] pid=P1 frame=120 similarity=0.65
-[VLMGate] frame=120 REANALYZE high_drift_pids=['P1']
-[VLMGate] frame=200 SKIPPED no high drift detected (14 active)
-[DriftReport] exported to temp/test_v1/tracking/drift_report.json
-[DriftReport] players tracked: 22
-```
+- **0.50** — Very sensitive; triggers on minor drift (most VLM calls)
+- **0.65** — Balanced; catches real identity decay
+- **0.70** — Default; gates most noisy drifts
+- **0.80** — Permissive; only flags severe decay
+- **0.90** — Minimal VLM calls; allows high drift
 
 ## Performance Impact
 
-- **Without gating**: VLM called every 5 frames (~600 calls for 30s @ 30fps)
-- **With gating**: VLM called only on drift (~200 calls for same video)
-- **Compute savings**: ~60% reduction in VLM inference time
+With drift gating enabled:
+- **Without drift gate**: VLM called every frame → ~60% compute cost
+- **With drift gate (0.70 threshold)**: VLM called only on drift → ~25% compute cost
+- **Savings**: ~40% per video, scales with video length
 
-## Debugging
+## Debug Workflow
 
-If a player has high drift but shouldn't:
-
-1. Check `similarity_history` — is it a gradual decay or sudden drop?
-   - Gradual: Lighting, shadow, or occlusion recovery
-   - Sudden: Possible ID swap
-
-2. Check `decision_log` — when were VLM calls triggered?
-   - Many calls: Identity instability region
-   - Few calls: Stable region with brief glitch
-
-3. Compare with video — does drift correlate with:
-   - Occlusions (players off-screen)?
-   - Lighting changes (shadows, glare)?
-   - Crowd density (overlapping players)?
-
-## Integration with Collision Topology (Future)
-
-The drift report will eventually feed into the Collision Topology Visualizer to:
-- Predict which players are likely to swap (manifest as high drift)
-- Warn about latent manifold collisions before they cause visible swaps
-- Recommend confidence thresholds for production use
-
----
-
-**API Reference:**
-
-```python
-# From services/embedding_drift.py
-
-def compute_cosine_similarity(emb1: np.ndarray, emb2: np.ndarray) -> float:
-    """Compute similarity between embeddings. Returns [-1, 1]."""
-
-class DriftTracker:
-    drift_threshold: float  # Default 0.70
-    
-    def create_anchor(self, pid: str, embedding: np.ndarray) -> None:
-        """Store initial embedding for a player."""
-    
-    def update_drift(self, pid: str, embedding: np.ndarray) -> Optional[float]:
-        """Compute and record drift. Returns similarity or None."""
-    
-    def should_trigger_vlm(self, pid: str, similarity: Optional[float]) -> bool:
-        """Decide if VLM should be called."""
-    
-    def log_vlm_decision(self, pid: str, frame: int, similarity: float, triggered: bool) -> None:
-        """Log VLM decision for audit."""
-    
-    def export_report(self) -> Dict:
-        """Export drift tracking data as JSON-serializable dict."""
+### 1. Identify drifting players
+```bash
+cat temp/{jobId}/tracking/drift_report.json | python3 -m json.tool | grep -A 10 "drift_triggered_count"
 ```
+
+### 2. Check log lines for that pid
+```bash
+grep "\[EmbeddingDrift\] pid=P7" colab_output.log
+# Look for pattern: similarity consistently < 0.70 during certain frames
+```
+
+### 3. Determine root cause
+- **Occlusion**: Similarity recovers after occlusion ends → expected
+- **Lighting change**: Drift correlates with scene transitions → may need lower threshold
+- **Identity switch**: Similarity stays low + many frames → consider motion checks
+- **Crowd overlap**: Drift during dense play → consider clustering gates
+
+### 4. Tune accordingly
+- If too many false VLM calls: Raise threshold to 0.75 or 0.80
+- If missing real drifts: Lower threshold to 0.60 or 0.50
+- If drifting during occlusion: Add occlusion-aware thresholds per pid
+
+## Integration Points
+
+### IdentityEngine (identity_core.py)
+- `DriftTracker` initialized in `__init__`
+- Anchors created on lock: `create_anchor(pid, emb)`
+- Similarity updated on assignment: `update_drift(pid, emb)`
+
+### Tracker Core (tracker_core.py)
+- Before VLM call: Query `drift_tracker.pid_history[pid][-1]`
+- Log VLM decision: `log_vlm_decision(pid, frame, sim, triggered)`
+- Export report at end: `drift_tracker.export_report()`
+
+### Log Lines
+
+```
+[EmbeddingDrift] pid=P7 frame=92 similarity=0.614    # Drift detected
+[VLMGate] frame=92 CALLED high_drift_pids=['P7']     # VLM triggered
+[VLMGate] frame=93 SKIPPED reason=no_high_drift      # Skipped (all good)
+[DriftReport] exported to temp/test_v1/tracking/drift_report.json  # Report saved
+```
+
+## Testing
+
+Run the comprehensive test suite:
+
+```bash
+pytest tests/test_embedding_drift.py -v
+```
+
+Expected output:
+- 6 passing tests (cosine similarity, tracker init, anchor creation, VLM gating, report export, end-to-end)
+- All similarity computations match theory
+- Drift decisions align with threshold
+
+## Common Issues
+
+### Issue: Drift report not found
+- **Cause**: embedding_drift.py not imported or DriftTracker not initialized
+- **Fix**: Verify `services/identity_core.py` line 569 has `self.drift_tracker = DriftTracker(...)`
+
+### Issue: All players drifting
+- **Cause**: Threshold too low (0.50) or anchors set during occlusion
+- **Fix**: Raise threshold to 0.70+, check anchor creation frames in logs
+
+### Issue: VLM always called
+- **Cause**: Drift gate logic not connected in tracker_core.py
+- **Fix**: Verify VLM call site queries `drift_tracker.pid_history[pid][-1]` before calling
+
+### Issue: Report shows empty similarity_history
+- **Cause**: No embeddings extracted; check `_extract_embeds()` in tracker_core.py
+- **Fix**: Add logging in embed extraction; verify OSNet model is loaded
+
+## Next Steps
+
+- Monitor real video runs with drift reports
+- Collect histograms of similarity per player
+- Establish per-scenario thresholds (crowd vs isolated play)
+- Consider adaptive thresholds based on team/position
