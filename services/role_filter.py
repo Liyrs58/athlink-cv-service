@@ -23,16 +23,18 @@ from typing import List, Tuple, Optional, Dict
 
 # ── Neon colour thresholds (strict: only bright referee vests) ────────
 
-# Neon yellow-green referee vest (very saturated, very bright)
-_NEON_YELLOW_LO = np.array([22, 130, 150], dtype=np.uint8)
+# Neon yellow-green referee vest — STRICT: must be very saturated AND very bright
+# Raised S minimum 130→180 and V minimum 150→200 to avoid hitting keeper yellow/green kits
+_NEON_YELLOW_LO = np.array([22, 180, 200], dtype=np.uint8)
 _NEON_YELLOW_HI = np.array([38, 255, 255], dtype=np.uint8)
 
 # Neon orange (some leagues' referee kits)
-_NEON_ORANGE_LO = np.array([8, 150, 160], dtype=np.uint8)
+_NEON_ORANGE_LO = np.array([8, 180, 180], dtype=np.uint8)
 _NEON_ORANGE_HI = np.array([20, 255, 255], dtype=np.uint8)
 
-# Pure black kit (dark referee kit — low saturation + low value)
-_BLACK_KIT_V_MAX = 50
+# Dark referee kit — raised V threshold to catch dark navy/charcoal kits
+# V_MAX 50→80 catches dark grey; S_MAX stays 60 (excludes coloured kits)
+_BLACK_KIT_V_MAX = 80
 _BLACK_KIT_S_MAX = 60
 
 # Pink/magenta referee kits (used in some leagues)
@@ -58,12 +60,12 @@ class RoleFilter:
         cfg = config or {}
 
         # Thresholds
-        self.neon_ratio_thresh = cfg.get("neon_ratio_thresh", 0.25)
-        self.black_ratio_thresh = cfg.get("black_ratio_thresh", 0.55)
+        self.neon_ratio_thresh = cfg.get("neon_ratio_thresh", 0.35)   # raised: fewer false keeper hits
+        self.black_ratio_thresh = cfg.get("black_ratio_thresh", 0.45)  # lowered: catch dark ref kits
         self.team_exclusion_dist = cfg.get("team_exclusion_dist", 0.40)
         self.edge_margin_frac = cfg.get("edge_margin_frac", 0.08)
-        self.min_frames_to_filter = cfg.get("min_frames_to_filter", 2)
-        self.referee_confidence_thresh = cfg.get("referee_confidence_thresh", 0.70)
+        self.min_frames_to_filter = cfg.get("min_frames_to_filter", 4)  # raised: need more evidence
+        self.referee_confidence_thresh = cfg.get("referee_confidence_thresh", 0.75)  # stricter
         self.log_interval = cfg.get("log_interval", 30)
 
         # Per-track referee evidence accumulator

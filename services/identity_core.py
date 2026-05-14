@@ -69,7 +69,7 @@ RECOVERY_PATCH_ID = "reid-v5-first-order-motion-gated"
 LOW_CONFIDENCE_THRESHOLD = 0.55
 EMB_ALPHA = 0.25
 STABLE_PROTECT_THRESHOLD = 10
-LOCK_PROMOTE_FRAMES = 5
+LOCK_PROMOTE_FRAMES = 3
 
 # ── Shadow buffer configuration (env-configurable) ────────────────────
 _SHADOW_TTL_FRAMES   = int(os.environ.get("ATHLINK_SHADOW_TTL_FRAMES", "90"))
@@ -505,6 +505,7 @@ class IdentityCore:
 
         self.frame_id: int = -1
         self.identity_frame_seq: int = 0  # increments on each assign_tracks call
+        self._seen_tids_ever: set = set()  # all track_ids ever seen — for ghost track prevention
         self.assigned_this_frame: int = 0
         self.unmatched_tracks: int = 0
         self.unmatched_slots: int = 0
@@ -852,6 +853,10 @@ class IdentityCore:
         """
         # Increment identity frame sequence for streak continuity across frame_stride
         self.identity_frame_seq += 1
+
+        # Register all incoming track IDs for ghost track prevention
+        for _t in tracks:
+            self._seen_tids_ever.add(int(_t.track_id))
 
         # Update camera motion state for this frame
         if camera_motion is not None:
@@ -2100,6 +2105,16 @@ class IdentityCore:
         recency_cost = recency / float(DORMANT_TTL)
         lock_discount = 0.15 if slot.stability_counter >= 10 else 0.0
 
+        # Ghost track prevention: a brand-new track_id that has never been seen before
+        # should not cheaply claim a slot whose last position is far away.
+        # If the slot was absent for > 10 frames AND pos_cost is high (> 0.5),
+        # add a ghost penalty to force the assignment to win via strong embedding match only.
+        ghost_penalty = 0.0
+        if (recency > 10 and pos_cost > 0.50
+                and tid is not None
+                and tid not in self._seen_tids_ever):
+            ghost_penalty = 0.25  # expensive enough to push above COST_REJECT_THRESHOLD
+
         mode = self.reid_mode
         if mode == "OSNet":
             if recency == 0:
@@ -2107,21 +2122,21 @@ class IdentityCore:
                               + 0.05 * recency_cost - 0.10 - lock_discount)
             else:
                 final_cost = (0.55 * emb_cost + 0.20 * pos_cost
-                              + 0.10 * recency_cost - lock_discount)
+                              + 0.10 * recency_cost - lock_discount + ghost_penalty)
         elif mode == "ResNet50":
             if recency == 0:
                 final_cost = (0.45 * emb_cost + 0.25 * pos_cost
                               + 0.05 * recency_cost - 0.10 - lock_discount)
             else:
                 final_cost = (0.45 * emb_cost + 0.25 * pos_cost
-                              + 0.15 * recency_cost - lock_discount)
+                              + 0.15 * recency_cost - lock_discount + ghost_penalty)
         else:
             if recency == 0:
                 final_cost = (0.30 * emb_cost + 0.35 * pos_cost
                               + 0.05 * recency_cost - 0.10 - lock_discount)
             else:
                 final_cost = (0.30 * emb_cost + 0.35 * pos_cost
-                              + 0.20 * recency_cost - lock_discount)
+                              + 0.20 * recency_cost - lock_discount + ghost_penalty)
 
         return float(max(0.0, min(1.0, final_cost)))
 
