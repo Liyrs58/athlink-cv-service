@@ -278,6 +278,30 @@ _MIN_PATCH_DISTANCE_PX   = float(os.environ.get("ATHLINK_MIN_PATCH_DISTANCE_PX",
 _REJECT_OFFICIAL_PID     = int(os.environ.get("ATHLINK_REJECT_OFFICIAL_PID", "1")) == 1
 
 
+def _motion_compensate_center(
+    center: Tuple[float, float],
+    camera_motion: Optional[Dict],
+) -> Tuple[float, float]:
+    """Project a prior image-space center into the current frame using camera motion."""
+    if not camera_motion:
+        return center
+
+    x, y = center
+    affine = camera_motion.get("affine")
+    if affine is not None:
+        try:
+            M = np.array(affine, dtype=np.float32)
+            pt = np.array([[x, y]], dtype=np.float32).reshape(-1, 1, 2)
+            pt_comp = cv2.transform(pt, M)
+            return float(pt_comp[0, 0, 0]), float(pt_comp[0, 0, 1])
+        except Exception:
+            pass
+
+    dx = float(camera_motion.get("dx", 0.0) or 0.0)
+    dy = float(camera_motion.get("dy", 0.0) or 0.0)
+    return x + dx, y + dy
+
+
 def check_physicality(
     pid: str,
     candidate_center: Tuple[float, float],
@@ -294,6 +318,7 @@ def check_physicality(
     max_relink_pixel_jump: float = _MAX_RELINK_PIXEL_JUMP,
     min_patch_distance_px: float = _MIN_PATCH_DISTANCE_PX,
     reject_official_pid: bool = _REJECT_OFFICIAL_PID,
+    camera_motion: Optional[Dict] = None,
 ) -> Tuple[bool, str, str]:
     """
     Validate a proposed PID assignment for physical plausibility.
@@ -315,7 +340,7 @@ def check_physicality(
     # 3. Speed / pixel jump check
     if last_center is not None and last_frame is not None:
         cx, cy = candidate_center
-        lx, ly = last_center
+        lx, ly = _motion_compensate_center(last_center, camera_motion)
         dist = ((cx - lx) ** 2 + (cy - ly) ** 2) ** 0.5
         frame_gap = max(1, current_frame - last_frame)
         elapsed_sec = (frame_gap * frame_stride) / max(fps, 1.0)
@@ -576,6 +601,7 @@ class IdentityCore:
             last_team=last_team,
             is_official=is_official,
             all_current_pids=all_current_pids,
+            camera_motion=self.camera_motion,
         )
         if not ok:
             self.physicality_rejects += 1
@@ -763,6 +789,8 @@ class IdentityCore:
                 continue
             if pid in live_lock_pids:
                 continue  # still has a live lock
+            if frame_id - slot.last_seen_frame <= 1:
+                continue  # just seen; do not recapture active unlocked slots as departed shadows
             stable = slot.last_lock_stable_count
             if stable >= STABLE_PROTECT_THRESHOLD and slot.last_position is not None:
                 cx, cy = slot.last_position

@@ -765,7 +765,7 @@ class TrackerCore:
         h_frame, w_frame = frame.shape[:2]
 
         # Build inputs for identity
-        track_objs, positions, embeddings, pitch_positions, team_labels = [], {}, {}, {}, {}
+        track_objs, positions, embeddings, pitch_positions, team_labels, tid_bboxes = [], {}, {}, {}, {}, {}
         for tr in assignable_tracks:
             tid = tr.track_id
             bx = tr.bbox
@@ -773,6 +773,7 @@ class TrackerCore:
             # Use foot-point (bottom-centre) for pitch projection
             foot_y = float(bx[3])
             positions[tid] = (cx, foot_y)
+            tid_bboxes[tid] = [float(bx[0]), float(bx[1]), float(bx[2]), float(bx[3])]
             pitch_positions[tid] = self._pixel_to_pitch(w_frame, h_frame, cx, foot_y)
             if tid in embed_map:
                 embeddings[tid] = embed_map[tid]
@@ -819,7 +820,15 @@ class TrackerCore:
 
         if is_play and len(track_objs) > 0:
             present_tids = {int(tr.track_id) for tr in track_objs}
-            self.identity.begin_frame(video_frame, present_tids=present_tids)
+            self.identity.begin_frame(
+                video_frame,
+                present_tids=present_tids,
+                frame_width=w_frame,
+                frame_height=h_frame,
+            )
+            cluster_tids = self.identity.congestion_detector.detect(
+                list(tid_bboxes.items())
+            ) if tid_bboxes else set()
 
             # First match: recovery-first if snapshot exists (hard or soft)
             revived_tids = set()
@@ -836,7 +845,8 @@ class TrackerCore:
                 ]
                 if unlocked_for_revival:
                     revived, scene_meta = self.identity.revive_cost_matrix(
-                        unlocked_for_revival, embeddings, positions
+                        unlocked_for_revival, embeddings, positions,
+                        cluster_tids=cluster_tids,
                     )
                     self.id_remap.update({tid: int(pid[1:]) for tid, pid in revived.items()})
                     meta_by_tid.update(scene_meta)
@@ -854,7 +864,8 @@ class TrackerCore:
                         and not self.identity.locks.is_tid_locked(int(t.track_id))
                     ]
                     forced, force_meta = self.identity.force_commit_remaining_scene_slots(
-                        still_unlocked, embeddings, positions
+                        still_unlocked, embeddings, positions,
+                        cluster_tids=cluster_tids,
                     )
                     self.id_remap.update({tid: int(pid[1:]) for tid, pid in forced.items()})
                     meta_by_tid.update(force_meta)
@@ -873,6 +884,7 @@ class TrackerCore:
                 revived_soft, soft_meta = self.identity.revive_from_soft_snapshot(
                     track_objs, embeddings, positions,
                     is_first_recovery_frame=is_first_frame,
+                    cluster_tids=cluster_tids,
                 )
                 self.id_remap.update({tid: int(pid[1:]) for tid, pid in revived_soft.items()})
                 meta_by_tid.update(soft_meta)
@@ -903,6 +915,7 @@ class TrackerCore:
                 allow_new_assignments=not restricted,
                 camera_motion=camera_motion,
                 official_tids=getattr(self, '_official_tids_this_frame', None),
+                tid_bboxes=tid_bboxes,
             )
             meta_by_tid.update(normal_meta)
             self.identity.end_frame(video_frame)

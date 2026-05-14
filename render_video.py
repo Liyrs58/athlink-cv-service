@@ -85,15 +85,20 @@ def _draw_rect(frame, x1, y1, x2, y2, color, style, thickness):
 def _label_for(p):
     if p.get("is_official", False):
         return None  # silent — refs get a thin box only
-    pid = p.get("playerId") or p.get("displayId")
-    if pid:
-        return str(pid)
-    if p.get("identity_valid", False):
-        tid = p.get("trackId", "?")
-        return f"P{tid}"
     if p.get("assignment_pending", False):
         return "?"
-    return None
+    if not p.get("identity_valid", False):
+        return None
+
+    pid = p.get("playerId") or p.get("displayId")
+    if not pid:
+        tid = p.get("trackId", "?")
+        pid = f"P{tid}"
+
+    source = p.get("assignment_source")
+    if source:
+        return f"{pid} {source}"
+    return str(pid)
 
 
 def draw_annotations(frame, entries, frame_idx, team_map, summary_overlay=None):

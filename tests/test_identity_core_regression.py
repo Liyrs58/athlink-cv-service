@@ -515,6 +515,16 @@ class TestPhysicalityValidator:
         assert not ok
         assert code in ("IMPOSSIBLE_SPEED", "IMPOSSIBLE_PIXEL_JUMP")
 
+    def test_pan_compensated_motion_not_rejected_as_player_speed(self):
+        from services.identity_core import check_physicality
+        ok, code, detail = check_physicality(
+            pid="P5", candidate_center=(125.0, 400.0), candidate_team=0,
+            current_frame=11, last_center=(100.0, 400.0), last_frame=10,
+            last_team=0, fps=30.0, frame_stride=1, max_speed_px_per_sec=650.0,
+            camera_motion={"dx": 25.0, "dy": 0.0, "motion_class": "pan"},
+        )
+        assert ok, f"Pan-compensated movement should pass physicality; code={code} detail={detail}"
+
 
 class TestPhysicalityWired:
     """check_physicality is wired into assign_tracks."""
@@ -556,3 +566,51 @@ class TestPhysicalityWired:
             "IMPOSSIBLE_SPEED" in identity.physicality_reject_reasons or
             "IMPOSSIBLE_PIXEL_JUMP" in identity.physicality_reject_reasons
         )
+
+    def test_locked_pair_uses_camera_motion_compensation(self):
+        """Camera pan should not make a locked player fail raw pixel-speed checks."""
+        import numpy as np
+        from services.identity_core import IdentityCore
+
+        identity = IdentityCore()
+
+        emb = np.random.randn(512).astype(np.float32)
+        emb /= np.linalg.norm(emb)
+
+        identity.locks.try_create_lock(5, "P5", "hungarian", frame_id=0)
+        slot = identity._slot_by_pid("P5")
+        slot.embedding = emb.copy()
+        slot.last_position = (100.0, 400.0)
+        slot.last_seen_frame = 10
+
+        identity.begin_frame(11, present_tids={5})
+        track_to_pid, meta = identity.assign_tracks(
+            tracks=[self._make_track(5)],
+            embeddings={5: emb},
+            positions={5: (125.0, 400.0)},
+            allow_new_assignments=True,
+            camera_motion={"dx": 25.0, "dy": 0.0, "motion_class": "pan"},
+        )
+        identity.end_frame()
+
+        assert track_to_pid.get(5) == "P5"
+        assert identity.physicality_rejects == 0
+
+
+class TestShadowCaptureRegression:
+    """Shadow capture should represent departures, not every active unlocked slot."""
+
+    def test_recently_seen_active_slot_not_immediately_recaptured_as_shadow(self):
+        from services.identity_core import IdentityCore
+
+        identity = IdentityCore()
+        slot = identity._slot_by_pid("P8")
+        slot.state = "active"
+        slot.last_position = (500.0, 600.0)
+        slot.last_seen_frame = 20
+        slot.last_lock_stable_count = 80
+        slot.last_assigned_tid = 117
+
+        identity.begin_frame(21, present_tids=set())
+
+        assert not identity.shadow_buffer.has_shadow("P8")
