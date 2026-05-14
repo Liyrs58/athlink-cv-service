@@ -370,13 +370,17 @@ class IdentityLockManager:
     # Per-frame TTL decay — dormant-aware
     # ------------------------------------------------------------------
 
-    def tick(self, frame_id: int, present_tids: Set[int], restricted: bool = False) -> None:
+    def tick(self, frame_id: int, present_tids: Set[int], restricted: bool = False,
+             frozen: bool = False) -> None:
         """
         Decay TTL for absent tracks.
         In restricted mode: convert to DORMANT instead of expiring.
         Dormant locks reserve the pid — they decay on a longer timer.
+        frozen=True: bench/cutaway shot — skip all TTL decay entirely.
         """
         self._last_tick_frame = frame_id
+        if frozen:
+            return
         to_expire = []
         for tid, lk in self._tid_to_lock.items():
             if tid in present_tids:
@@ -385,9 +389,10 @@ class IdentityLockManager:
                     lk.dormant = False
                 continue
 
-            # Decay by the actual frame gap since last seen (handles skipped/strided frames)
-            frames_absent = max(1, frame_id - lk.last_seen_frame)
-            lk.ttl -= frames_absent
+            # Decay by 1 per processed tick regardless of frame_stride.
+            # TTL is in "processed-frame" units — burning it by video-frame gap
+            # kills locks in ~60 ticks at stride=5 instead of 300.
+            lk.ttl -= 1
 
             if lk.ttl <= 0:
                 # Auto-dormant for sufficiently-stable locks even in normal play.

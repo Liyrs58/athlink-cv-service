@@ -610,7 +610,7 @@ class TrackerCore:
 
         # Step A: hard freeze scene — only age, no association
         if is_freeze:
-            self.identity.begin_frame(video_frame)
+            self.identity.begin_frame(video_frame, scene_frozen=True)
             self.identity.end_frame(video_frame)
             if save:
                 self.results.append({

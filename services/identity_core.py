@@ -762,6 +762,7 @@ class IdentityCore:
         present_tids: Optional[Set[int]] = None,
         frame_width: int = 1920,
         frame_height: int = 1080,
+        scene_frozen: bool = False,
     ) -> None:
         self._frame_width = frame_width
         self._frame_height = frame_height
@@ -794,7 +795,7 @@ class IdentityCore:
                 s = self._slot_by_pid(lk.pid)
                 if s is not None:
                     s.last_lock_stable_count = lk.stable_count
-            self.locks.tick(frame_id, present_tids, restricted=restricted)
+            self.locks.tick(frame_id, present_tids, restricted=restricted, frozen=scene_frozen)
         else:
             self._present_tids = set()
         # ── Shadow capture: slots whose lock just expired enter SHADOW state ──
