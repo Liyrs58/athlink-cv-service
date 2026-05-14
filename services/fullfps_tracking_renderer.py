@@ -44,6 +44,41 @@ STATE_COLOR = {
 }
 
 
+def _pid_color_bgr(pid: str) -> tuple[int, int, int]:
+    """Return a deterministic, perceptually-distinct BGR color for a player PID.
+
+    Uses the golden-angle HSV method: hue = (player_number * 137.508) % 360.
+    This distributes 22 player colors evenly and uniquely around the hue wheel.
+    Color is always the same for a given Px, regardless of which raw track carries it.
+    Falls back to white for non-standard PID strings.
+    """
+    try:
+        n = int(pid.lstrip("P"))
+    except (ValueError, AttributeError):
+        return (255, 255, 255)
+
+    hue_deg = (n * 137.508) % 360.0
+    hue_norm = hue_deg / 360.0
+    # HSV: full saturation (0.85), high value (0.95) for visibility on dark pitch
+    h = hue_norm * 6.0
+    i = int(h)
+    f = h - i
+    p = int(0.95 * (1.0 - 0.85) * 255)
+    q = int(0.95 * (1.0 - 0.85 * f) * 255)
+    t = int(0.95 * (1.0 - 0.85 * (1.0 - f)) * 255)
+    v = int(0.95 * 255)
+    rgb_map = [
+        (v, t, p),
+        (q, v, p),
+        (p, v, t),
+        (p, q, v),
+        (t, p, v),
+        (v, p, q),
+    ]
+    r, g, b = rgb_map[i % 6]
+    return (b, g, r)  # OpenCV BGR
+
+
 # ---- Enums / sentinels ---------------------------------------------------------
 
 
@@ -850,13 +885,17 @@ def build_manifest(
 def _color_for(decision: RenderDecision, render_mode: str) -> tuple[int, int, int]:
     if render_mode == "audit":
         if decision.assignment_source == "locked":
-            return (0, 255, 0) # green
+            return (0, 255, 0)   # green — locked
         elif decision.assignment_source == "revived":
-            return (0, 165, 255) # orange
+            return (0, 165, 255) # orange — revived
         elif not decision.pid:
-            return (128, 128, 128) # gray
-    tc = TEAM_COLORS.get(decision.team_id, TEAM_COLORS[-1])
-    return tc
+            return (128, 128, 128) # gray — unknown
+    # Production: use per-PID deterministic color when identity is confirmed.
+    # This makes each player's color persistent across re-entries and track resets.
+    if decision.pid and isinstance(decision.pid, str) and decision.pid.startswith("P"):
+        return _pid_color_bgr(decision.pid)
+    # Fallback: team color for unknown/provisional boxes.
+    return TEAM_COLORS.get(decision.team_id, TEAM_COLORS[-1])
 
 
 def _draw_decision(

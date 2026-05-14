@@ -549,3 +549,73 @@ def test_observation_build_drops_officials_and_invalid():
     assert counters["unknown_suppressed_object_frames"] >= 2
     # Official suppressed counter.
     assert counters["official_suppressed_object_frames"] == 1
+
+
+# ---- Player-ID color persistence tests -----------------------------------------
+
+
+def test_different_pids_get_different_colors():
+    """Each distinct Px must map to a unique color — no two players share one."""
+    from services.fullfps_tracking_renderer import _pid_color_bgr
+    colors = [_pid_color_bgr(f"P{i}") for i in range(1, 23)]
+    color_set = set(colors)
+    assert len(color_set) == 22, (
+        f"All 22 players must have distinct colors; got {len(color_set)} unique"
+    )
+
+
+def test_same_pid_always_same_color():
+    """P7 always maps to the same color regardless of call order."""
+    from services.fullfps_tracking_renderer import _pid_color_bgr
+    assert _pid_color_bgr("P7") == _pid_color_bgr("P7")
+    assert _pid_color_bgr("P1") == _pid_color_bgr("P1")
+    assert _pid_color_bgr("P22") == _pid_color_bgr("P22")
+
+
+def test_color_for_uses_pid_color_when_pid_known():
+    """_color_for must return pid-derived color (not team color) when pid is set."""
+    from services.fullfps_tracking_renderer import _color_for, _pid_color_bgr, RenderDecision, RenderState
+    d = RenderDecision(
+        key="PID:P7",
+        pid="P7",
+        latest_tid=4,
+        team_id=0,
+        state=RenderState.VISIBLE,
+        assignment_source="locked",
+    )
+    result = _color_for(d, render_mode="production")
+    expected = _pid_color_bgr("P7")
+    assert result == expected, (
+        f"_color_for must return pid_color for P7={expected}, got {result}"
+    )
+
+
+def test_color_for_falls_back_to_team_color_when_no_pid():
+    """_color_for falls back to team color when pid is None."""
+    from services.fullfps_tracking_renderer import _color_for, TEAM_COLORS, RenderDecision, RenderState
+    d = RenderDecision(
+        key="TID:5",
+        pid=None,
+        latest_tid=5,
+        team_id=0,
+        state=RenderState.VISIBLE,
+        assignment_source="unknown",
+    )
+    result = _color_for(d, render_mode="production")
+    assert result == TEAM_COLORS[0]
+
+
+def test_p1_reentry_same_color():
+    """P1 leaving and re-entering frame must get the same color both times."""
+    from services.fullfps_tracking_renderer import _pid_color_bgr
+    color_first = _pid_color_bgr("P1")
+    color_reentry = _pid_color_bgr("P1")  # same function = deterministic
+    assert color_first == color_reentry, "P1 color must survive re-entry"
+
+
+def test_no_color_shared_between_teams():
+    """P1 on team0 and P12 on team1 must still have distinct, pid-derived colors."""
+    from services.fullfps_tracking_renderer import _pid_color_bgr
+    assert _pid_color_bgr("P1") != _pid_color_bgr("P12"), (
+        "P1 and P12 must not share colors"
+    )
