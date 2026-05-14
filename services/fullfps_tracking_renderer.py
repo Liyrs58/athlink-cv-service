@@ -1318,6 +1318,11 @@ def _draw_color_threads(
     *,
     trail_history_frames: int = 150,
 ) -> dict[str, int]:
+    """Draw color thread trails, breaking them when player identity changes.
+
+    Each point has a 'player' dict with playerId/displayId (pid). When pid changes
+    between consecutive history points in the trail, the trail breaks.
+    """
     metrics = {
         "color_thread_frames_drawn": 0,
         "color_thread_trail_segments_drawn": 0,
@@ -1346,10 +1351,24 @@ def _draw_color_threads(
             continue
         history.sort(key=lambda p: int(p.get("frame", 0)))
         for prev, cur in zip(history, history[1:]):
+            # Extract pid from player dict in each point
+            prev_player = prev.get("player") or {}
+            cur_player = cur.get("player") or {}
+            prev_pid = prev_player.get("playerId") or prev_player.get("displayId")
+            cur_pid = cur_player.get("playerId") or cur_player.get("displayId")
+
+            # Break trail if identity is None or changed between frames
+            if prev_pid is None or cur_pid is None or prev_pid != cur_pid:
+                continue
+
             start = prev["center"]
             end = cur["center"]
-            color = cur["color"]
-            gap = int(cur.get("frame", 0)) - int(prev.get("frame", 0))
+            # Use the current frame's player pid to determine color
+            color = _pid_color_bgr(cur_pid)
+
+            prev_frame = int(prev.get("frame", 0))
+            cur_frame = int(cur.get("frame", 0))
+            gap = cur_frame - prev_frame
             if gap <= 3:
                 cv2.line(overlay, start, end, color, 2, cv2.LINE_AA)
             else:
@@ -1392,9 +1411,10 @@ def _draw_color_thread_raw_boxes(
         y2 = max(0, min(h - 1, int(bbox[3])))
         if x2 <= x1 or y2 <= y1:
             continue
-        color = point["color"]
         player = point.get("player", {}) or {}
         pid = player.get("playerId") or player.get("displayId")
+        # Use pid-based color if pid available, else fallback to thread color
+        color = _pid_color_bgr(pid) if pid else point["color"]
         parts = [str(point.get("thread_id") or "CT")]
         if pid:
             parts.append(str(pid))
