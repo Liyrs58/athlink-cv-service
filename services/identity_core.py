@@ -56,14 +56,14 @@ MAX_SLOTS = 22
 DEFAULT_PLAYER_SLOT_CAP = 22
 COST_REJECT_THRESHOLD = 0.72
 REVIVAL_COST_THRESHOLD = 0.60
-SOFT_REVIVE_COST_MAX = 0.38           # was 0.30 — loosened with real OSNet embeddings
-SOFT_REVIVE_AUTO_ACCEPT_COST = 0.15
+SOFT_REVIVE_COST_MAX = 0.32           # tightened from 0.38 — require stronger embedding match
+SOFT_REVIVE_AUTO_ACCEPT_COST = 0.08  # tightened from 0.15 — auto-accept only very strong matches
 SCENE_REVIVE_WINDOW = 90
 SCENE_REVIVE_COST_MAX = 0.38
 SCENE_REVIVE_FORCE_COST_MAX = 0.42
 STRICT_COLOR_THRESHOLD = 0.45       # Threshold for hard color reject
 SPATIAL_GATE_RADIUS = 150.0         # 150px safety valve
-SOFT_REVIVE_MARGIN_MIN = 0.025      # Tightened from 0.003
+SOFT_REVIVE_MARGIN_MIN = 0.08       # tightened from 0.025 — requires clear winner
 SCENE_REVIVE_MARGIN_MIN = 0.025     # Tightened from 0.003
 RECOVERY_PATCH_ID = "reid-v5-first-order-motion-gated"
 LOW_CONFIDENCE_THRESHOLD = 0.55
@@ -427,8 +427,9 @@ class PlayerSlot:
     velocity_px: Optional[Tuple[float, float]] = None
     velocity_pitch: Optional[Tuple[float, float]] = None
     hsv_signature: Optional[np.ndarray] = None
+    _emb_last_updated_frame: int = 0  # frame when embedding was last written
 
-    def update_embedding(self, emb) -> None:
+    def update_embedding(self, emb, frame_id: int = 0) -> None:
         if isinstance(emb, dict):
             # Support dual-embedding: {"emb": ..., "hsv": ...}
             hsv = emb.get("hsv")
@@ -448,6 +449,7 @@ class PlayerSlot:
             norm2 = np.linalg.norm(self.embedding)
             if norm2 > 0:
                 self.embedding /= norm2
+        self._emb_last_updated_frame = frame_id
 
     def update_color(self, hsv: np.ndarray) -> None:
         hsv = hsv.astype(np.float32)
@@ -1318,12 +1320,15 @@ class IdentityCore:
         self._soft_snapshot = {}
         for s in self.slots:
             if s.state in ("active", "dormant") and s.embedding is not None:
+                emb_age = frame_id - s._emb_last_updated_frame
                 self._soft_snapshot[s.pid] = {
                     "embedding": s.embedding.copy(),
                     "position": s.last_position,
                     "pitch": s.last_pitch,
                     "team_id": s.team_id,
+                    "stable_count": s.last_lock_stable_count,
                     "last_seen": s.last_seen_frame,
+                    "emb_age": emb_age,
                 }
         saved = len(self._soft_snapshot)
         print(f"[Identity] SoftSnapshot: {saved} slots saved at frame {frame_id}")
@@ -1801,9 +1806,10 @@ class IdentityCore:
                 s = snap[pid]
                 slot = self._slot_by_pid(pid)
 
-                # 1. Team Gate
+                # 1. Team Gate — hard block across team boundary
                 if (t_team is not None and s.get("team_id") is not None
                         and t_team != s["team_id"]):
+                    cost[i, j] = COST_REJECT_THRESHOLD + 0.30
                     continue
 
                 # 2. Hard Color Gate (GK Protection)
@@ -1822,6 +1828,11 @@ class IdentityCore:
                     if n > 0: e /= n
                     cos = float(np.clip(np.dot(e, s["embedding"]), -1.0, 1.0))
                     emb_c = 1.0 - (cos + 1.0) * 0.5
+                    # Staleness penalty: embeddings older than 10 frames lose trust linearly.
+                    # At 30 frames stale: weight halved. Beyond 60 frames: position only.
+                    emb_age = s.get("emb_age", 0)
+                    staleness_factor = max(0.3, 1.0 - emb_age / 60.0)
+                    emb_c = emb_c * staleness_factor + 0.5 * (1.0 - staleness_factor)
 
                 # 4. First-Order Spatial Cost (Prediction)
                 if slot is not None:

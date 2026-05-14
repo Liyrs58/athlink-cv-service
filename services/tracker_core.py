@@ -86,61 +86,49 @@ class ReIDExtractor:
         ]
 
     def _find_osnet_weights(self) -> str | None:
+        """Priority order for OSNet weights:
+        1. Sports-tuned (SportsMOT, broadcast footage) — best for football
+        2. MSMT17 (pedestrian surveillance) — fallback
+        3. HF Hub download of sports model (CondadosAI/osnet-trackers)
+        """
+        repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+        # Priority 1: Sports-tuned weights (local paths)
+        sports_paths = [
+            os.environ.get("OSNET_SPORTS_WEIGHTS", ""),
+            "/content/sports_model.pth.tar-60",
+            "/content/athlink-cv-service/models/sports_model.pth.tar-60",
+            os.path.join(repo_root, "models", "sports_model.pth.tar-60"),
+        ]
+        for path in sports_paths:
+            if not path:
+                continue
+            if os.path.exists(path) and os.path.getsize(path) > 1_000_000:
+                print(f"[ReID] Using sports-tuned OSNet weights: {path}")
+                return path
+
+        # Priority 2: MSMT17 pedestrian weights (local paths)
         for path in self._candidate_osnet_paths():
             if not path:
                 continue
             if os.path.exists(path) and os.path.getsize(path) > 1_000_000:
-                print(f"[ReID] Found OSNet weights at {path}")
+                print(f"[ReID] Using MSMT17 OSNet weights (fallback): {path}")
                 return path
 
-        # HF Hub fallback 1: football-specific fine-tuned weights (Phase 2)
-        repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        football_path = os.path.join(repo_root, "models", "football_osnet_x1_0.pth.tar")
-        if not (os.path.exists(football_path) and os.path.getsize(football_path) > 1_000_000):
-            try:
-                from huggingface_hub import hf_hub_download
-                print("[ReID] Trying football-specific OSNet from Liyrs58/football-osnet-reid ...")
-                downloaded = hf_hub_download(
-                    repo_id="Liyrs58/football-osnet-reid",
-                    filename="football_osnet_x1_0.pth.tar",
-                    local_dir=os.path.join(repo_root, "models"),
-                    local_dir_use_symlinks=False,
-                )
-                if downloaded != football_path:
-                    import shutil
-                    shutil.copy2(downloaded, football_path)
-                print(f"[ReID] Football OSNet downloaded to {football_path}")
-            except Exception as e:
-                print(f"[ReID] Football OSNet download failed ({e}), falling back to generic.")
-                football_path = None
-
-        if football_path and os.path.exists(football_path) and os.path.getsize(football_path) > 1_000_000:
-            print(f"[ReID] Using football-specific OSNet weights: {football_path}")
-            return football_path
-
-        # HF Hub fallback 2: generic sports weights from CondadosAI/osnet-trackers
-        generic_path = os.path.join(repo_root, "models", "sports_model.pth.tar-60")
-        if not (os.path.exists(generic_path) and os.path.getsize(generic_path) > 1_000_000):
-            try:
-                from huggingface_hub import hf_hub_download
-                print("[ReID] Trying generic sports OSNet from CondadosAI/osnet-trackers ...")
-                downloaded = hf_hub_download(
-                    repo_id="CondadosAI/osnet-trackers",
-                    filename="sports_model.pth.tar-60",
-                    local_dir=os.path.join(repo_root, "models"),
-                    local_dir_use_symlinks=False,
-                )
-                if downloaded != generic_path:
-                    import shutil
-                    shutil.copy2(downloaded, generic_path)
-                print(f"[ReID] Generic sports OSNet downloaded to {generic_path}")
-            except Exception as e:
-                print(f"[ReID] Generic sports OSNet download also failed ({e}).")
-                generic_path = None
-
-        if generic_path and os.path.exists(generic_path) and os.path.getsize(generic_path) > 1_000_000:
-            print(f"[ReID] Using generic sports OSNet weights: {generic_path}")
-            return generic_path
+        # Priority 3: HF Hub download of sports weights
+        try:
+            from huggingface_hub import hf_hub_download
+            print("[ReID] Trying sports OSNet from CondadosAI/osnet-trackers ...")
+            dest = hf_hub_download(
+                repo_id="CondadosAI/osnet-trackers",
+                filename="sports_model.pth.tar-60",
+                local_dir=os.path.join(repo_root, "models"),
+                local_dir_use_symlinks=False,
+            )
+            print(f"[ReID] Downloaded sports OSNet from HF Hub: {dest}")
+            return dest
+        except Exception as e:
+            print(f"[ReID] HF Hub sports download failed: {e}")
 
         return None
 
