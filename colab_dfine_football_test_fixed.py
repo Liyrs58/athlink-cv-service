@@ -1,32 +1,32 @@
 #!/usr/bin/env python3
 """
-PASTE THIS ENTIRE CELL INTO COLAB (fresh runtime — do Runtime → Restart first).
-Tests rudrasinghm/dfine-football-detector on the Aston Villa vs PSG clip.
+REVISED COLAB CELL — D-FINE + Sports ReID + Phase D Fixes
 
-Classes: ball=0  goalkeeper=1  player=2  referee=3
+Paste this entire cell into Colab (after Runtime → Restart).
+Fixed: HF_TOKEN authentication with explicit validation.
 """
 
 import os, sys, shutil, subprocess, json, time
 from pathlib import Path
 
-# --- Configuration ---
+# ── Configuration ─────────────────────────────────────────────────────────────
 REPO_URL    = "https://github.com/Liyrs58/athlink-cv-service.git"
 REPO        = Path("/content/athlink-cv-service")
 VIDEO       = Path("/content/Aston villa vs Psg clip 1.mov")
 JOB_ID      = "dfine_test"
-HF_TOKEN    = os.environ.get("HF_TOKEN", "")  # set in Colab Secrets (key: HF_TOKEN)
+HF_TOKEN    = os.environ.get("HF_TOKEN", "").strip()
 DFINE_MODEL = "rudrasinghm/dfine-football-detector"
 
-os.environ["CUDA_VISIBLE_DEVICES"]        = "0"
-os.environ["ATHLINK_FORCE_DEVICE"]        = "cuda"
-os.environ["ATHLINK_YOLO_HALF"]           = "0"
-os.environ["ATHLINK_MAX_PLAYER_SLOTS"]    = "14"
+os.environ["CUDA_VISIBLE_DEVICES"]           = "0"
+os.environ["ATHLINK_FORCE_DEVICE"]           = "cuda"
+os.environ["ATHLINK_YOLO_HALF"]              = "0"
+os.environ["ATHLINK_MAX_PLAYER_SLOTS"]       = "14"
 os.environ["ATHLINK_ALLOW_NEW_PLAYER_SLOTS"] = "0"
-os.environ["PYTORCH_CUDA_ALLOC_CONF"]    = "expandable_segments:True"
-os.environ["HF_TOKEN"]                   = HF_TOKEN
+os.environ["PYTORCH_CUDA_ALLOC_CONF"]        = "expandable_segments:True"
+os.environ["HF_TOKEN"]                       = HF_TOKEN
 
 print("=" * 80)
-print("D-FINE FOOTBALL DETECTOR TEST")
+print("D-FINE FOOTBALL DETECTOR + SPORTS ReID TEST (REVISED)")
 print(f"Model: {DFINE_MODEL}")
 print("=" * 80)
 
@@ -35,7 +35,18 @@ import torch
 assert torch.cuda.is_available(), "Switch Colab runtime to T4 GPU."
 print(f"GPU: {torch.cuda.get_device_name(0)}")
 
-# ── 2. Repo ───────────────────────────────────────────────────────────────────
+# ── 2. HF Token validation (CRITICAL FIX) ─────────────────────────────────────
+if not HF_TOKEN:
+    print("\n⚠️  HF_TOKEN is empty or not set.")
+    print("   Check Colab Secrets (🔑 icon, left sidebar):")
+    print("   1. Verify secret 'HF_TOKEN' exists")
+    print("   2. Check 'Notebook access' toggle is ENABLED")
+    print("   3. Value should be: YOUR_HUGGINGFACE_TOKEN")
+    print("   4. After fix, restart runtime and re-run cell")
+    sys.exit(1)
+print(f"✓ HF_TOKEN loaded ({len(HF_TOKEN)} chars)")
+
+# ── 3. Repo ───────────────────────────────────────────────────────────────────
 if REPO.exists():
     subprocess.run(["git", "-C", str(REPO), "fetch", "--all"], check=True)
     subprocess.run(["git", "-C", str(REPO), "reset", "--hard", "origin/main"], check=True)
@@ -46,25 +57,30 @@ os.chdir(REPO)
 commit_hash = subprocess.check_output(["git", "rev-parse", "--short", "HEAD"], text=True).strip()
 print(f"HEAD: {commit_hash}")
 
-# ── 3. Dependencies ───────────────────────────────────────────────────────────
+# ── 4. Dependencies ───────────────────────────────────────────────────────────
 subprocess.run([sys.executable, "-m", "pip", "-q", "install",
                 "ultralytics", "boxmot", "huggingface_hub",
                 "transformers>=4.40", "accelerate"], check=True)
 print("✓ Dependencies OK")
 
-# ── 4. Download sports-tuned OSNet ReID weights ───────────────────────────────
+# ── 5. Download sports-tuned OSNet ReID weights ───────────────────────────────
 print("\n--- Downloading sports OSNet ReID weights ---")
 from huggingface_hub import hf_hub_download
-osnet_path = hf_hub_download(
-    repo_id="rudrasinghm/football-osnet-reid",
-    filename="football_osnet_x1_0.pth.tar",
-    token=HF_TOKEN,
-    local_dir="/content",
-)
-os.environ["OSNET_SPORTS_WEIGHTS"] = osnet_path
-print(f"✓ OSNet weights: {osnet_path}")
+try:
+    osnet_path = hf_hub_download(
+        repo_id="rudrasinghm/football-osnet-reid",
+        filename="football_osnet_x1_0.pth.tar",
+        token=HF_TOKEN,
+        local_dir="/content",
+    )
+    os.environ["OSNET_SPORTS_WEIGHTS"] = osnet_path
+    print(f"✓ OSNet weights: {osnet_path}")
+except Exception as e:
+    print(f"✗ OSNet download failed: {e}")
+    print("  Ensure HF_TOKEN secret is valid and has 'Notebook access' enabled")
+    sys.exit(1)
 
-# ── 5. Video check ────────────────────────────────────────────────────────────
+# ── 6. Video check ────────────────────────────────────────────────────────────
 if not VIDEO.exists():
     alt = Path("/content/1b16c594_villa_psg_40s_new.mp4")
     if alt.exists():
@@ -74,7 +90,7 @@ if not VIDEO.exists():
         sys.exit(1)
 print(f"Video: {VIDEO}")
 
-# ── 5. Load D-FINE football detector ─────────────────────────────────────────
+# ── 7. Load D-FINE football detector ──────────────────────────────────────────
 print(f"\n--- Loading {DFINE_MODEL} ---")
 sys.path.insert(0, str(REPO))
 
@@ -105,7 +121,7 @@ print(f"Classes: {_id2label}")
 
 # Classes to keep as players (exclude ball=0 and referee=3)
 _PLAYER_LABELS = {k for k, v in _id2label.items() if v.lower() in ("player", "goalkeeper")}
-print(f"Forwarded to tracker as 'player': {_PLAYER_LABELS} → {[_id2label[k] for k in _PLAYER_LABELS]}")
+print(f"Forwarded to tracker: {_PLAYER_LABELS} → {[_id2label[k] for k in _PLAYER_LABELS]}")
 
 
 def _dfine_detect(frame_bgr: np.ndarray, conf_threshold: float = 0.35):
@@ -153,21 +169,25 @@ def _dfine_detect(frame_bgr: np.ndarray, conf_threshold: float = 0.35):
 
 
 
-# ── 6. Patch TrackerCore._detect ─────────────────────────────────────────────
+# ── 8. Patch TrackerCore.detect() ─────────────────────────────────────────────
 for mod in list(sys.modules):
     if mod == "services" or mod.startswith("services."):
         del sys.modules[mod]
 
 import services.tracker_core as tc
 
+# Store original detect method
+_original_detect = tc.TrackerCore.detect
+
 def _patched_detect(self, frame):
-    self._last_ball_det = None
+    """Replace YOLO detection with D-FINE football detector."""
+    self._last_ball_det = None  # Clear ball detection (D-FINE provides it separately)
     return _dfine_detect(frame, conf_threshold=0.35)
 
-tc.TrackerCore._detect = _patched_detect
-print("✓ Detector patched: YOLO → D-FINE football")
+tc.TrackerCore.detect = _patched_detect
+print("✓ Detector patched: YOLO → D-FINE football (referee/ball filtered)")
 
-# ── 7. Run tracking ───────────────────────────────────────────────────────────
+# ── 9. Run tracking ───────────────────────────────────────────────────────────
 print("\n--- Running Tracking Pipeline ---")
 print("=" * 80)
 
@@ -196,7 +216,7 @@ except Exception as e:
     print(output_buffer.getvalue()[-5000:])
     sys.exit(1)
 
-# ── 8. Identity metrics ───────────────────────────────────────────────────────
+# ── 10. Identity metrics ──────────────────────────────────────────────────────
 print("\n" + "=" * 80)
 print("IDENTITY METRICS")
 print("=" * 80)
@@ -231,7 +251,7 @@ print(f"\n{'✅ ALL GATES PASS' if all_pass else '⚠️  SOME GATES FAIL'}")
 
 print(f"Time: {elapsed:.1f}s  |  Video: {VIDEO.name}")
 
-# ── 9. Render annotated video ─────────────────────────────────────────────────
+# ── 11. Render annotated video ────────────────────────────────────────────────
 print("\n--- Rendering Annotated Video ---")
 
 output_video = Path(f"/content/dfine_annotated_{VIDEO.stem}.mp4")
@@ -294,7 +314,7 @@ cap.release()
 writer.release()
 print(f"✓ Video saved: {output_video}")
 
-# ── 10. Download ──────────────────────────────────────────────────────────────
+# ── 12. Download ──────────────────────────────────────────────────────────────
 try:
     from google.colab import files
     if output_video.exists():

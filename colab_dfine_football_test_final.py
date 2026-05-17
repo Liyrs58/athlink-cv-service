@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
 """
 PASTE THIS ENTIRE CELL INTO COLAB (fresh runtime — do Runtime → Restart first).
-Tests rudrasinghm/dfine-football-detector on the Aston Villa vs PSG clip.
+
+D-FINE football detector (rudrasinghm/dfine-football-detector) with sports-tuned
+OSNet ReID on Aston Villa vs PSG clip. Validates identity metrics gates.
 
 Classes: ball=0  goalkeeper=1  player=2  referee=3
+D-FINE filters out ball(0) and referee(3) — only player/goalkeeper reach tracker.
 """
 
 import os, sys, shutil, subprocess, json, time
 from pathlib import Path
 
-# --- Configuration ---
+# ── Configuration ─────────────────────────────────────────────────────────────
 REPO_URL    = "https://github.com/Liyrs58/athlink-cv-service.git"
 REPO        = Path("/content/athlink-cv-service")
 VIDEO       = Path("/content/Aston villa vs Psg clip 1.mov")
@@ -17,16 +20,16 @@ JOB_ID      = "dfine_test"
 HF_TOKEN    = os.environ.get("HF_TOKEN", "")  # set in Colab Secrets (key: HF_TOKEN)
 DFINE_MODEL = "rudrasinghm/dfine-football-detector"
 
-os.environ["CUDA_VISIBLE_DEVICES"]        = "0"
-os.environ["ATHLINK_FORCE_DEVICE"]        = "cuda"
-os.environ["ATHLINK_YOLO_HALF"]           = "0"
-os.environ["ATHLINK_MAX_PLAYER_SLOTS"]    = "14"
+os.environ["CUDA_VISIBLE_DEVICES"]           = "0"
+os.environ["ATHLINK_FORCE_DEVICE"]           = "cuda"
+os.environ["ATHLINK_YOLO_HALF"]              = "0"
+os.environ["ATHLINK_MAX_PLAYER_SLOTS"]       = "14"
 os.environ["ATHLINK_ALLOW_NEW_PLAYER_SLOTS"] = "0"
-os.environ["PYTORCH_CUDA_ALLOC_CONF"]    = "expandable_segments:True"
-os.environ["HF_TOKEN"]                   = HF_TOKEN
+os.environ["PYTORCH_CUDA_ALLOC_CONF"]        = "expandable_segments:True"
+os.environ["HF_TOKEN"]                       = HF_TOKEN
 
 print("=" * 80)
-print("D-FINE FOOTBALL DETECTOR TEST")
+print("D-FINE FOOTBALL DETECTOR + SPORTS ReID TEST")
 print(f"Model: {DFINE_MODEL}")
 print("=" * 80)
 
@@ -74,7 +77,7 @@ if not VIDEO.exists():
         sys.exit(1)
 print(f"Video: {VIDEO}")
 
-# ── 5. Load D-FINE football detector ─────────────────────────────────────────
+# ── 6. Load D-FINE football detector ──────────────────────────────────────────
 print(f"\n--- Loading {DFINE_MODEL} ---")
 sys.path.insert(0, str(REPO))
 
@@ -153,21 +156,25 @@ def _dfine_detect(frame_bgr: np.ndarray, conf_threshold: float = 0.35):
 
 
 
-# ── 6. Patch TrackerCore._detect ─────────────────────────────────────────────
+# ── 7. Patch TrackerCore.detect() ─────────────────────────────────────────────
 for mod in list(sys.modules):
     if mod == "services" or mod.startswith("services."):
         del sys.modules[mod]
 
 import services.tracker_core as tc
 
+# Store original detect method
+_original_detect = tc.TrackerCore.detect
+
 def _patched_detect(self, frame):
-    self._last_ball_det = None
+    """Replace YOLO detection with D-FINE football detector."""
+    self._last_ball_det = None  # Clear ball detection (D-FINE provides it separately)
     return _dfine_detect(frame, conf_threshold=0.35)
 
-tc.TrackerCore._detect = _patched_detect
-print("✓ Detector patched: YOLO → D-FINE football")
+tc.TrackerCore.detect = _patched_detect
+print("✓ Detector patched: YOLO → D-FINE football (referee/ball filtered)")
 
-# ── 7. Run tracking ───────────────────────────────────────────────────────────
+# ── 8. Run tracking ───────────────────────────────────────────────────────────
 print("\n--- Running Tracking Pipeline ---")
 print("=" * 80)
 
@@ -196,7 +203,7 @@ except Exception as e:
     print(output_buffer.getvalue()[-5000:])
     sys.exit(1)
 
-# ── 8. Identity metrics ───────────────────────────────────────────────────────
+# ── 9. Identity metrics ───────────────────────────────────────────────────────
 print("\n" + "=" * 80)
 print("IDENTITY METRICS")
 print("=" * 80)
@@ -231,7 +238,7 @@ print(f"\n{'✅ ALL GATES PASS' if all_pass else '⚠️  SOME GATES FAIL'}")
 
 print(f"Time: {elapsed:.1f}s  |  Video: {VIDEO.name}")
 
-# ── 9. Render annotated video ─────────────────────────────────────────────────
+# ── 10. Render annotated video ────────────────────────────────────────────────
 print("\n--- Rendering Annotated Video ---")
 
 output_video = Path(f"/content/dfine_annotated_{VIDEO.stem}.mp4")
@@ -294,7 +301,7 @@ cap.release()
 writer.release()
 print(f"✓ Video saved: {output_video}")
 
-# ── 10. Download ──────────────────────────────────────────────────────────────
+# ── 11. Download ──────────────────────────────────────────────────────────────
 try:
     from google.colab import files
     if output_video.exists():

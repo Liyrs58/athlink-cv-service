@@ -357,10 +357,11 @@ def check_physicality(
 
         # Relink-specific: large absolute jump even if speed threshold would pass
         # Gap-scaled threshold: tight at gap=1, relaxes for longer gaps (up to gap=10)
-        scaled_max = max_relink_pixel_jump + 15.0 * min(frame_gap - 1, 10)
+        scaled_max = max_relink_pixel_jump + 15.0 * min(max(frame_gap - 1, 0), 10)
         if frame_gap > 1 and dist > scaled_max:
             return False, "IMPOSSIBLE_PIXEL_JUMP", (
-                f"pid={pid} dist={dist:.1f}px > scaled_max={scaled_max:.0f} (base={max_relink_pixel_jump} + 15*gap_bonus) gap={frame_gap}f"
+                f"pid={pid} dist={dist:.1f}px > scaled_max={scaled_max:.0f} "
+                f"(base={max_relink_pixel_jump:.0f} + 15*min(gap-1,10)={15.0 * min(max(frame_gap - 1, 0), 10):.0f}) gap={frame_gap}f"
             )
 
     # 4. Double occupancy — same PID already assigned this frame
